@@ -1,9 +1,22 @@
-"""Cut-point search and edge fades."""
+"""Cut-point search and edge fades; ducking, loudness, true peak and limiting."""
+
+import math
 
 import numpy as np
 import pytest
 
-from speech2song.audio.dsp import fade_edges, frame_levels_db, quietest_point
+from speech2song.audio.dsp import (
+    duck_gain,
+    fade_edges,
+    frame_levels_db,
+    limit,
+    loudness_lufs,
+    master,
+    oversampled_peaks,
+    quietest_point,
+    smooth_gain_db,
+    true_peak_db,
+)
 
 from .fixtures.synth import SR, noise_burst, sine
 
@@ -74,3 +87,92 @@ def test_zero_fade_and_short_blocks() -> None:
     np.testing.assert_array_equal(fade_edges(block, 0), block)
     short = fade_edges(block[:10], 441)  # fade shrinks to half the block
     assert short.shape == (10, 1)
+
+
+# --- Ducking -----------------------------------------------------------------------------
+
+
+def test_gain_smoothing_uses_attack_down_and_release_up() -> None:
+    hop = 0.001
+    target = np.concatenate([np.full(1000, -10.0), np.zeros(3000)])
+    out = smooth_gain_db(target, hop, attack_ms=30, release_ms=400)
+    assert out[29] == pytest.approx(-10 * (1 - math.exp(-1)), abs=0.2)  # one time constant
+    assert out[999] == pytest.approx(-10, abs=0.01)
+    assert out[1000 + 399] == pytest.approx(-10 * math.exp(-1), abs=0.2)  # one release
+    assert out[-1] > -0.1
+
+
+def _speech_burst(start_s: float, seconds: float, total_s: float) -> np.ndarray:
+    out = np.zeros(round(total_s * SR), dtype=np.float32)
+    a = round(start_s * SR)
+    out[a : a + round(seconds * SR)] = noise_burst(seconds, amp=0.1)
+    return out
+
+
+def test_ducking_depth_lookahead_and_recovery() -> None:
+    speech = _speech_burst(1.0, 1.0, 4.5)
+    gain = duck_gain(speech, SR, len(speech), depth_db=-9, attack_ms=30, release_ms=400,
+                     floor_db=-50, full_db=-35)  # fmt: skip
+    db = 20 * np.log10(gain)
+    assert db[round(0.5 * SR)] == pytest.approx(0, abs=0.01)  # before the speech
+    assert db[round(1.0 * SR)] < -5  # look-ahead: already ducking at the first sample
+    assert db[round(1.5 * SR)] == pytest.approx(-9, abs=0.1)  # full depth during speech
+    assert -9 < db[round(2.3 * SR)] < -1  # releasing
+    assert db[-1] > -0.2  # recovered
+
+
+def test_quiet_speech_below_the_floor_does_not_duck() -> None:
+    speech = _speech_burst(0.5, 1.0, 2.0) * np.float32(0.0005)  # about -75 dBFS
+    gain = duck_gain(speech, SR, len(speech), depth_db=-9, attack_ms=30, release_ms=400,
+                     floor_db=-50, full_db=-35)  # fmt: skip
+    assert gain.min() == pytest.approx(1.0)
+
+
+# --- Loudness, true peak, limiting --------------------------------------------------------
+
+
+def test_true_peak_finds_inter_sample_overs() -> None:
+    t = np.arange(SR) / SR
+    quarter = np.sin(2 * np.pi * SR / 4 * t + np.pi / 4).astype(np.float32)
+    assert 20 * np.log10(np.abs(quarter).max()) == pytest.approx(-3.01, abs=0.01)
+    assert true_peak_db(quarter) == pytest.approx(0.0, abs=0.2)  # samples miss the crest
+    assert len(oversampled_peaks(np.stack([quarter, quarter], axis=1))) == SR
+
+
+def test_loudness_matches_pyloudnorm() -> None:
+    import pyloudnorm
+
+    rng = np.random.default_rng(3)
+    music = rng.standard_normal((SR * 7, 2)).astype(np.float32) * 0.1
+    music[SR * 2 : SR * 4] *= 0.01  # a quiet stretch the relative gate drops
+    music[SR * 5 :] = 0  # silence the absolute gate drops
+    expected = pyloudnorm.Meter(SR).integrated_loudness(music.astype(np.float64))
+    assert loudness_lufs(music, SR) == pytest.approx(expected, abs=0.01)
+    assert loudness_lufs(music[:, 0], SR) == pytest.approx(
+        pyloudnorm.Meter(SR).integrated_loudness(music[:, 0].astype(np.float64)), abs=0.01
+    )
+
+
+def test_loudness_of_a_known_sine() -> None:
+    # BS.1770: a 997 Hz full-scale sine reads -3.01 LUFS in one channel.
+    tone = sine(997, 3.0, amp=1.0)
+    assert loudness_lufs(tone, SR) == pytest.approx(-3.01, abs=0.1)
+    assert loudness_lufs(np.zeros(SR * 2, dtype=np.float32), SR) is None
+    assert loudness_lufs(tone[:1000], SR) is None  # shorter than one block
+
+
+def test_limiter_holds_the_ceiling_and_leaves_quiet_parts_alone() -> None:
+    quiet = noise_burst(2.0, amp=0.05)
+    loud = np.concatenate([quiet, noise_burst(0.2, amp=0.9, seed=1), quiet])
+    out = limit(np.stack([loud, loud], axis=1), SR, -3.0)[:, 0]
+    assert true_peak_db(out) <= -3.0 + 0.05
+    np.testing.assert_allclose(out[:SR], loud[:SR], rtol=1e-6)  # far from the peak
+
+
+def test_master_hits_the_loudness_target_under_the_ceiling() -> None:
+    music = np.stack([noise_burst(20.0, amp=0.05), noise_burst(20.0, amp=0.05, seed=2)], axis=1)
+    music[SR * 5 : SR * 5 + 400] *= 15  # transients the limiter has to catch
+    result = master(music, SR, target_lufs=-14.0, ceiling_db=-1.0)
+    assert result.lufs == pytest.approx(-14.0, abs=0.1)
+    assert result.true_peak_db <= -1.0
+    assert true_peak_db(result.audio) <= -1.0

@@ -38,6 +38,10 @@ def test_real_preset_loads() -> None:
     assert preset.arc[0] == "intro"
     assert preset.melody.quantize_grid == "1/8"
     assert preset.clips == ClipsSpec()  # the optional block falls back to defaults
+    assert preset.arc.count("speech_bed") == 3  # the closing line can end the song
+    assert preset.role_bars("drop") == 16 and preset.role_bars("gap") == 1
+    assert preset.section_roles["build"].shape == "rise"
+    assert preset.melody.layer == "replay"
 
 
 @pytest.mark.parametrize(
@@ -50,6 +54,12 @@ def test_real_preset_loads() -> None:
         (lambda d: d["section_roles"].pop("speech_bed"), "speech_bed"),
         (lambda d: d["melody"].update(quantize_grid="1/7"), "quantize_grid"),
         (lambda d: d.update(clips={"min_seconds": 9, "max_seconds": 4}), "max_seconds"),
+        (lambda d: d["section_roles"]["speech_bed"].update(bars=4), "beds fit their clip"),
+        (lambda d: d["section_roles"]["drop"].update(bars=0), "bars"),
+        (lambda d: d["section_roles"]["drop"].update(shape="wobble"), "shape"),
+        (lambda d: d.update(arc=["intro", "drop"]), "at least one speech_bed"),
+        (lambda d: d["melody"].update(layer_roles=["chorus"]), "layer_roles"),
+        (lambda d: d["melody"].update(layer="loud"), "layer"),
     ],
 )
 def test_invalid_presets_are_rejected(tmp_path: Path, mutate: Any, message: str) -> None:

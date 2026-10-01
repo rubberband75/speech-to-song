@@ -209,7 +209,8 @@ class MelodyStage(Stage):
             for clip in kept_clips(clip_set):
                 inputs[f"clip {clip.id}"] = ctx.run.path(clip.file)
         params = {
-            "melody": preset.melody.model_dump(),
+            # The melody-layer fields only matter to the mix.
+            "melody": preset.melody.model_dump(exclude={"layer", "layer_roles"}),
             "key": preset.key.model_dump(),
             "tempo": preset.tempo.model_dump(),
             "key_override": ctx.run.manifest.options.key,

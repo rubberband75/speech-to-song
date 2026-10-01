@@ -38,38 +38,52 @@ negative_styles:
   - sung vocals or lyrics
 
 # Section roles. The arrangement builder maps each speech clip onto the timeline,
-# then picks section roles around it. "energy" is 0-1 and guides density.
+# then picks section roles around it. "energy" is 0-1 and guides density. "bars" is the
+# section length (default 8; a speech_bed is fitted to its clip). "shape" is flat, rise
+# (builds into the next section) or fall (fades out).
 section_roles:
   intro:
     energy: 0.15
+    bars: 8
     styles: [spacious ambient pads, soft granular textures, distant reversed sounds, filtered noise, sparse piano or bell fragments]
   speech_bed:           # plays under a spoken clip
     energy: 0.2
     styles: [very sparse, soft evolving pad, lots of negative space, no drums or minimal filtered percussion]
   build:
     energy: 0.6
+    bars: 8
+    shape: rise
     styles: [rising synths, filtered percussion, pitch sweeps, reverse swells, increasing stereo width and reverb]
   gap:                  # brief near-silence before a drop
     energy: 0.0
+    bars: 1
     styles: [near silence, reverb tail only]
   drop:
     energy: 1.0
+    bars: 16
     styles: [huge warm sub-bass, elastic synth bass, half-time drums, shimmering euphoric chords]
   breakdown:
     energy: 0.3
+    bars: 8
     styles: [quiet introspective, soft chords, gentle melodic motif]
   outro:
     energy: 0.1
+    bars: 8
+    shape: fall
     styles: [peaceful atmospheric resolution, fading pads]
 
-# Default arc, adapted to however many clips were selected.
-arc: [intro, speech_bed, build, gap, drop, breakdown, speech_bed, build, gap, drop, outro]
+# Default arc, adapted to however many clips were selected: the clips (in play order)
+# are shared out over the speech_bed slots. The last slot lets the closing line end the
+# song over the outro.
+arc: [intro, speech_bed, build, gap, drop, breakdown, speech_bed, build, gap, drop,
+      speech_bed, outro]
 
 # How the arrangement reacts to speech
 speech_interaction:
   music_recedes_during_clips: true
   swell_after_clip_end: true        # use the end of an idea as a launch into the next section
   align_clip_starts_to: bar         # bar | beat | free
+  tail_beats: 2                     # beats after a clip's last word before the next section
 
 # Local mix settings (pedalboard)
 mix:
@@ -80,6 +94,9 @@ mix:
   speech_reverb_send: 0.12          # increase for the psychedelic sections
   speech_delay_send: 0.06
   target_lufs: -14
+  speech_level_lu: 2                # speech loudness relative to the music's
+  melody_layer_lu: -10              # melody layer loudness relative to the music's
+  melody_under_speech_db: -6        # extra cut when the melody plays under speech
 
 # Speech-to-melody settings
 melody:
@@ -87,3 +104,6 @@ melody:
   scale_snap_strength: 0.8          # 0 = raw speech contour, 1 = fully snapped to scale
   loop_phrase_count: 3              # repetition drives the speech-to-song illusion
   render_instrument: soft_piano     # rendered and used as the audio reference
+  layer: replay                     # replay (the line just heard returns as the tune in
+                                    # layer_roles) | all (also quietly under speech) | off
+  layer_roles: [breakdown, drop]

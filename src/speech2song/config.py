@@ -54,15 +54,25 @@ class KeySpec(_Strict):
         return self
 
 
+SPEECH_ROLE = "speech_bed"  # the role a clip plays under
+DEFAULT_SECTION_BARS = 8
+
+
 class SectionRole(_Strict):
     energy: float = Field(ge=0, le=1)
     styles: list[str] = []
+    # Length in bars (default 8). A speech_bed is fitted to its clip instead.
+    bars: int | None = Field(default=None, ge=1, le=64)
+    # Energy over the section: steady, rising into the next section, or fading out.
+    shape: Literal["flat", "rise", "fall"] = "flat"
 
 
 class SpeechInteraction(_Strict):
     music_recedes_during_clips: bool = True
     swell_after_clip_end: bool = True
     align_clip_starts_to: Literal["bar", "beat", "free"] = "bar"
+    # Beats after a clip's last word before the next section may start.
+    tail_beats: float = Field(default=2.0, ge=0)
 
 
 class MixSpec(_Strict):
@@ -73,6 +83,9 @@ class MixSpec(_Strict):
     speech_reverb_send: float = Field(default=0.12, ge=0, le=1)
     speech_delay_send: float = Field(default=0.06, ge=0, le=1)
     target_lufs: float = Field(default=-14.0, lt=0)
+    speech_level_lu: float = 2.0  # speech loudness relative to the music's
+    melody_layer_lu: float = -10.0  # melody layer loudness relative to the music's
+    melody_under_speech_db: float = Field(default=-6.0, le=0)  # extra cut under speech
 
 
 class MelodySpec(_Strict):
@@ -80,6 +93,10 @@ class MelodySpec(_Strict):
     scale_snap_strength: float = Field(default=0.8, ge=0, le=1)
     loop_phrase_count: int = Field(default=3, ge=1)
     render_instrument: str = "soft_piano"
+    # The melody layer in the mix: "replay" plays the line just heard in the sections of
+    # `layer_roles`; "all" also plays each clip's melody quietly under the speech.
+    layer: Literal["replay", "all", "off"] = "replay"
+    layer_roles: list[str] = ["breakdown", "drop"]
 
     @model_validator(mode="after")
     def _check_grid(self) -> "MelodySpec":
@@ -126,12 +143,23 @@ class Preset(_Strict):
 
     @model_validator(mode="after")
     def _check_roles(self) -> "Preset":
-        if "speech_bed" not in self.section_roles:
+        if SPEECH_ROLE not in self.section_roles:
             raise ValueError("section_roles must define 'speech_bed' (it plays under each clip)")
+        if self.section_roles[SPEECH_ROLE].bars is not None:
+            raise ValueError("section_roles.speech_bed.bars is not allowed: beds fit their clip")
+        if SPEECH_ROLE not in self.arc:
+            raise ValueError("arc must contain at least one speech_bed")
         unknown = sorted({role for role in self.arc if role not in self.section_roles})
         if unknown:
             raise ValueError(f"arc uses roles missing from section_roles: {unknown}")
+        unknown = sorted(set(self.melody.layer_roles) - set(self.section_roles))
+        if unknown:
+            raise ValueError(f"melody.layer_roles uses roles missing from section_roles: {unknown}")
         return self
+
+    def role_bars(self, role: str) -> int:
+        bars = self.section_roles[role].bars
+        return DEFAULT_SECTION_BARS if bars is None else bars
 
     def digest(self) -> str:
         """Content hash, used in stage params so preset edits invalidate dependent stages."""
@@ -281,6 +309,7 @@ class AppConfig(_Strict):
     claude_fallbacks: bool = True  # server-side retry on another model if Claude declines
     music_model: str = "music_v2_5"  # unverified until the M5 ElevenLabs docs pass
     music_backend: Literal["stub", "elevenlabs"] = "stub"
+    music_takes: int = Field(default=2, ge=1, le=8)  # takes per generation
     transcribe_backend: Literal["whisper"] = "whisper"
     whisper_model: str = "large-v3-turbo"
     language: str | None = None  # None = auto-detect

@@ -148,9 +148,17 @@ def normalize_peak(audio: np.ndarray, peak_db: float) -> np.ndarray:
 
 
 def write_wav(path: Path, audio: np.ndarray, sample_rate: int) -> None:
+    """Atomically write a 32-bit float WAV with reproducible bytes.
+
+    libsndfile stamps float WAVs with a PEAK chunk holding the current time, so the
+    same samples hash differently on every write and needlessly invalidate the stages
+    downstream. scipy writes plain IEEE-float WAVs, which soundfile reads back exactly.
+    """
+    from scipy.io import wavfile
+
     tmp = temp_path_for(path)
     try:
-        sf.write(str(tmp), audio, sample_rate, subtype="FLOAT")
+        wavfile.write(str(tmp), sample_rate, np.ascontiguousarray(audio, dtype=np.float32))
         tmp.replace(path)
     finally:
         tmp.unlink(missing_ok=True)

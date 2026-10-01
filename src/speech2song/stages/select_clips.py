@@ -18,6 +18,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from speech2song.audio.dsp import fade_edges, quietest_point
+from speech2song.audio.synth import write_wav
 from speech2song.config import AppConfig, load_preset, load_secrets
 from speech2song.costs import CostLog, SpendEstimate, claude_usd
 from speech2song.errors import S2SError, StageError
@@ -94,7 +95,9 @@ class SelectStage(Stage):
             "effort": ctx.config.claude_effort,
             "fallbacks": ctx.config.claude_fallbacks,
             "targets": targets.model_dump(),
-            "preset": {"description": preset.description, "arc": preset.arc},
+            # The prompt also shows the arc, but only for orientation: the arrangement fits
+            # any clips to it, so arc edits don't invalidate a paid selection.
+            "preset": {"description": preset.description},
             "prompt": prompt_digest(),
         }
         return StagePlan({"transcript": ctx.run.path(TRANSCRIPT)}, params, [SELECTION])
@@ -256,8 +259,7 @@ class ClipsStage(Stage):
                 clip = _cut(audio, selected, transcript, number, search, fade_ms)
                 block = _read(audio, clip.start_sample, clip.end_sample)
                 fade = round(fade_ms / 1000 * rate)
-                sf.write(str(ctx.run.path(clip.file)), fade_edges(block, fade), rate,
-                         subtype="FLOAT")  # fmt: skip
+                write_wav(ctx.run.path(clip.file), fade_edges(block, fade), rate)
                 clips.append(clip)
 
         order, dropped = list(selection.suggested_order), []
@@ -413,7 +415,7 @@ def write_preview(run: Run, clip_set: ClipSet, clip_id: str) -> str:
         block = _read(audio, start, end)
     path = run.path(f"{PREVIEW_DIR}/{clip_id}.wav")
     path.parent.mkdir(exist_ok=True)
-    sf.write(str(path), fade_edges(block, round(0.01 * rate)), rate, subtype="FLOAT")
+    write_wav(path, fade_edges(block, round(0.01 * rate)), rate)
     player = shutil.which("ffplay")
     if player and sys.stdin.isatty():
         subprocess.run(

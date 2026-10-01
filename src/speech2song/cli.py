@@ -23,6 +23,7 @@ from rich.text import Text
 
 from speech2song import __version__
 from speech2song.audio.io import probe
+from speech2song.backends.music_base import backend_name
 from speech2song.config import AppConfig, list_presets, load_config, load_preset
 from speech2song.costs import CostLog, render_estimates
 from speech2song.errors import S2SError
@@ -32,8 +33,11 @@ from speech2song.pipeline import Context, Stage, check, execute
 from speech2song.review import run_review
 from speech2song.selection import clip_targets, estimate_input_tokens_from_duration
 from speech2song.stages.align import AlignStage
+from speech2song.stages.arrange import ArcStage, ArrangeStage, arc_estimates, show_arrangement
+from speech2song.stages.generate_music import GenerateStage, TakeStage
 from speech2song.stages.ingest import IngestStage, IsolateStage
 from speech2song.stages.melody import MelodyStage
+from speech2song.stages.mix import MASTER_MP3, MASTER_WAV, MELODY_STEM, MIX_REPORT, MixStage
 from speech2song.stages.select_clips import (
     CLIPS,
     ClipsStage,
@@ -47,21 +51,34 @@ from speech2song.stages.transcribe import AsrStage
 # --- Steps -----------------------------------------------------------------------------
 
 
+def _arrange_stages(options: RunOptions) -> list[Stage]:
+    return [ArcStage(), ArrangeStage()] if options.refine_arc else [ArrangeStage()]
+
+
+def _generate_unavailable(config: AppConfig, options: RunOptions) -> str | None:
+    name = backend_name(config, options)
+    if name != "stub":
+        return f"the {name} music backend is planned for M5 (use --music-backend stub)"
+    return None
+
+
 @dataclass(frozen=True)
 class Step:
     name: str
     milestone: str
-    stages: Callable[[], list[Stage]] | None  # None: not implemented yet
+    stages: Callable[[RunOptions], list[Stage]] | None  # None: not implemented yet
+    # Why the step can't run with these settings yet (None: it can).
+    unavailable: Callable[[AppConfig, RunOptions], str | None] = lambda config, options: None
 
 
 STEPS: list[Step] = [
-    Step("ingest", "M1", lambda: [IngestStage(), IsolateStage()]),
-    Step("transcribe", "M1", lambda: [AsrStage(), AlignStage()]),
-    Step("select", "M2", lambda: [SelectStage(), ClipsStage()]),
-    Step("melody", "M3", lambda: [MelodyStage()]),
-    Step("arrange", "M4", None),
-    Step("generate", "M4", None),
-    Step("mix", "M4", None),
+    Step("ingest", "M1", lambda o: [IngestStage(), IsolateStage()]),
+    Step("transcribe", "M1", lambda o: [AsrStage(), AlignStage()]),
+    Step("select", "M2", lambda o: [SelectStage(), ClipsStage()]),
+    Step("melody", "M3", lambda o: [MelodyStage()]),
+    Step("arrange", "M4", _arrange_stages),
+    Step("generate", "M4", lambda o: [GenerateStage(), TakeStage()], _generate_unavailable),
+    Step("mix", "M4", lambda o: [MixStage()]),
 ]
 STEP_BY_NAME = {step.name: step for step in STEPS}
 
@@ -79,6 +96,18 @@ class StepName(StrEnum):
 class MusicBackend(StrEnum):
     stub = "stub"
     elevenlabs = "elevenlabs"
+
+
+class MelodyLayerMode(StrEnum):
+    replay = "replay"
+    all = "all"
+    off = "off"
+
+
+MELODY_LAYER_HELP = (
+    "Melody layer: 'replay' (the line just heard returns as the tune in breakdowns and "
+    "drops), 'all' (also quietly under the speech) or 'off'. Default: the preset's."
+)
 
 
 # --- App plumbing ----------------------------------------------------------------------
@@ -235,7 +264,11 @@ def _run_steps(ctx: Context, steps: list[Step], hooks: dict[str, Hook] | None = 
         if step.stages is None:
             ctx.say(f"[yellow]Stopping before `{step.name}`: planned for {step.milestone}.[/]")
             return False
-        for stage in step.stages():
+        reason = step.unavailable(ctx.config, ctx.run.manifest.options)
+        if reason:
+            ctx.say(f"[yellow]Stopping before `{step.name}`: {escape(reason)}.[/]")
+            return False
+        for stage in step.stages(ctx.run.manifest.options):
             execute(stage, ctx)
         if hooks and step.name in hooks:
             hooks[step.name](ctx)
@@ -288,6 +321,25 @@ def _review_hook(env: Env, run: Run) -> Hook:
     return hook
 
 
+def _arrangement_hook(ctx: Context) -> None:
+    if not ctx.dry_run:
+        show_arrangement(ctx)
+
+
+def _mix_hook(ctx: Context) -> None:
+    """After `mix`: where to listen."""
+    if ctx.dry_run or not ctx.run.path(MASTER_WAV).exists():
+        return
+    ctx.console.print("Listen to:")
+    for rel in (MASTER_WAV, MASTER_MP3, "07_mix/stems/", MIX_REPORT):
+        ctx.console.print(f"  {escape(str(ctx.run.path(rel)))}")
+    if not ctx.run.path(MELODY_STEM).exists():
+        ctx.console.print("  (melody layer off)")
+
+
+STANDARD_HOOKS: dict[str, Hook] = {"arrange": _arrangement_hook, "mix": _mix_hook}
+
+
 def _spend_line(env: Env, run: Run, before: float) -> None:
     spent = CostLog(run.costs_path).totals()["total"] - before
     env.console.print(f"Spend this command: ${spent:.4f} (run total in costs.json)")
@@ -307,9 +359,15 @@ def _run_step_command(
     if step.stages is None:
         env.console.print(f"`{step.name}` is planned for {step.milestone}; not implemented yet.")
         raise typer.Exit(2)
+    reason = step.unavailable(env.config, run.manifest.options)
+    if reason:
+        run.save()  # keep option changes made by this command
+        env.console.print(f"`{step.name}` can't run yet: {escape(reason)}.")
+        raise typer.Exit(2)
     run.manifest.settings = env.config.snapshot()
     run.save()
     before = CostLog(run.costs_path).totals()["total"]
+    hooks = {**STANDARD_HOOKS, **(hooks or {})}
     with run.logging_to_file(logging.DEBUG if env.verbose else logging.INFO):
         _run_steps(_context(env, run, force=force, dry_run=dry_run, yes=yes), [step], hooks)
     _spend_line(env, run, before)
@@ -341,6 +399,11 @@ def run_cmd(
     interactive_review: Annotated[
         bool, typer.Option("--interactive-review", help="Review clips after selection.")
     ] = False,
+    refine_arc: Annotated[
+        bool | None,
+        typer.Option("--refine-arc/--no-refine-arc", help="Ask Claude to refine the arc (paid)."),
+    ] = None,
+    melody_layer: Annotated[MelodyLayerMode | None, typer.Option(help=MELODY_LAYER_HELP)] = None,
     force: Force = False,
     run_ref: RunRef = None,
 ) -> None:
@@ -354,6 +417,8 @@ def run_cmd(
         "isolate_voice": isolate_voice,
         "clips": clips,
         "music_backend": music_backend.value if music_backend else None,
+        "refine_arc": refine_arc,
+        "melody_layer": melody_layer.value if melody_layer else None,
     }
     if input_path is None:
         run = _open_run(env, run_ref)
@@ -361,7 +426,8 @@ def run_cmd(
         _set_preset(env, run, preset)
         _set_transcript(run, transcript)
     elif dry_run:
-        _dry_run_new_input(env, input_path, preset, clips, steps)
+        _dry_run_new_input(env, input_path, preset, clips, steps, RunOptions(
+            **{k: v for k, v in options.items() if v is not None}))  # fmt: skip
         return
     else:
         initial = RunOptions(**{k: v for k, v in options.items() if v is not None})
@@ -373,13 +439,20 @@ def run_cmd(
         context = _context(env, run, force=force, dry_run=dry_run, yes=yes)
         if dry_run:
             env.console.print("Dry run: nothing will be executed.")
-        hooks = {"select": _review_hook(env, run)} if interactive_review else None
+        hooks = dict(STANDARD_HOOKS)
+        if interactive_review:
+            hooks["select"] = _review_hook(env, run)
         _run_steps(context, steps, hooks)
     _spend_line(env, run, before)
 
 
 def _dry_run_new_input(
-    env: Env, input_path: Path, preset: str | None, clips: int | None, steps: list[Step]
+    env: Env,
+    input_path: Path,
+    preset: str | None,
+    clips: int | None,
+    steps: list[Step],
+    options: RunOptions,
 ) -> None:
     """Estimate a new run's spend from the input's duration (ffprobe only, no stages)."""
     if not input_path.is_file():
@@ -405,11 +478,16 @@ def _dry_run_new_input(
         targets.count,
         f"estimated from {seconds / 60:.0f} min of audio",
     )
+    if options.refine_arc and any(step.name == "arrange" for step in steps):
+        estimates += arc_estimates(env.config, env.config.claude_model)
     render_estimates(env.console, estimates)
     total = sum(e.usd or 0.0 for e in estimates)
+    music = backend_name(env.config, options)
+    note = ("The stub music backend is free." if music == "stub"
+            else f"The {music} music backend is planned for M5.")  # fmt: skip
     env.console.print(
         f"Dry run total, worst case (every retry happens): [bold]${total:.4f}[/]. "
-        "Music generation is not implemented yet (M4/M5). Nothing was executed."
+        f"{note} Nothing was executed."
     )
 
 
@@ -519,20 +597,67 @@ def melody(
     _run_step_command(env, run, "melody", force=force)
 
 
-def _stub_command(name: str) -> None:
-    step = STEP_BY_NAME[name]
+@app.command()
+@cli_errors
+def arrange(
+    ctx: typer.Context,
+    refine_arc: Annotated[
+        bool | None,
+        typer.Option("--refine-arc/--no-refine-arc", help="Ask Claude to refine the arc (paid)."),
+    ] = None,
+    model: Annotated[str | None, typer.Option(help="Claude model for this run.")] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show the estimated cost; call nothing.")
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Don't ask before paid calls.")] = False,
+    force: Force = False,
+    run_ref: RunRef = None,
+) -> None:
+    """Lay the clips and sections out on the bar grid and print the timeline."""
+    env = _env(ctx)
+    run = _open_run(env, run_ref)
+    _update_options(run, refine_arc=refine_arc, claude_model=model)
+    _run_step_command(env, run, "arrange", force=force, dry_run=dry_run, yes=yes)
 
-    @cli_errors
-    def command(ctx: typer.Context, run_ref: RunRef = None) -> None:
-        env = _env(ctx)
-        _run_step_command(env, _open_run(env, run_ref), name)
 
-    command.__doc__ = f"Pipeline step `{name}` (planned for {step.milestone})."
-    app.command(name)(command)
+@app.command()
+@cli_errors
+def generate(
+    ctx: typer.Context,
+    music_backend: Annotated[MusicBackend | None, typer.Option(help="Music backend.")] = None,
+    take: Annotated[
+        int | None, typer.Option(min=1, help="Which take to mix (1-based; sticks to the run).")
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show the estimated cost; call nothing.")
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Don't ask before paid calls.")] = False,
+    force: Force = False,
+    run_ref: RunRef = None,
+) -> None:
+    """Generate backing-track takes for the arrangement and pick one for the mix."""
+    env = _env(ctx)
+    if take is not None and take > env.config.music_takes:
+        raise S2SError(f"--take {take}: only {env.config.music_takes} take(s) are generated "
+                       "(music_takes in config.yaml)")  # fmt: skip
+    run = _open_run(env, run_ref)
+    _update_options(run, music_backend=music_backend.value if music_backend else None, take=take)
+    _run_step_command(env, run, "generate", force=force, dry_run=dry_run, yes=yes)
 
 
-for _name in ("arrange", "generate", "mix"):
-    _stub_command(_name)
+@app.command()
+@cli_errors
+def mix(
+    ctx: typer.Context,
+    melody_layer: Annotated[MelodyLayerMode | None, typer.Option(help=MELODY_LAYER_HELP)] = None,
+    force: Force = False,
+    run_ref: RunRef = None,
+) -> None:
+    """Mix speech, music and melody layer, and master to the preset's loudness."""
+    env = _env(ctx)
+    run = _open_run(env, run_ref)
+    _update_options(run, melody_layer=melody_layer.value if melody_layer else None)
+    _run_step_command(env, run, "mix", force=force)
 
 
 @app.command()
@@ -595,7 +720,11 @@ def status(ctx: typer.Context, run_ref: RunRef = None) -> None:
         if step.stages is None:
             table.add_row(step.name, "-", f"planned for {step.milestone}", "", "")
             continue
-        for stage in step.stages():
+        reason = step.unavailable(env.config, manifest.options)
+        if reason:
+            table.add_row(step.name, "-", reason, "", "")
+            continue
+        for stage in step.stages(manifest.options):
             state = check(stage, context).state
             record = manifest.stages.get(stage.name)
             finished = took = ""

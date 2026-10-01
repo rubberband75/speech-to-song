@@ -9,7 +9,6 @@ budget. One retry with feedback is allowed; after that, unusable clips are dropp
 import hashlib
 import re
 from dataclasses import dataclass
-from importlib import resources
 from string import Template
 from typing import Literal
 
@@ -17,6 +16,7 @@ from rapidfuzz.distance import Indel
 
 from speech2song.config import Preset
 from speech2song.errors import StageError
+from speech2song.llm.claude import load_prompt
 from speech2song.models import ClipSelection, ClipTargets, RunOptions, SelectedClip, Transcript
 from speech2song.text.normalize import normalize_word
 
@@ -73,10 +73,7 @@ def clip_targets(preset: Preset, options: RunOptions) -> ClipTargets:
 
 
 def _template() -> tuple[str, str]:
-    text = resources.files("speech2song.llm").joinpath("prompts/select_clips.md").read_text()
-    system = text.split("## System", 1)[1].split("## User", 1)[0].strip()
-    user = text.split("## User", 1)[1].strip()
-    return system, user
+    return load_prompt("select_clips")
 
 
 def prompt_digest() -> str:

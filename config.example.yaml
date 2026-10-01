@@ -10,7 +10,8 @@ claude_effort: high               # low | medium | high | xhigh | max
 claude_max_tokens: 16000
 claude_fallbacks: true            # if Claude declines, the API retries on a recommended model
 music_model: music_v2_5           # verified against the ElevenLabs docs in M5
-music_backend: stub               # stub | elevenlabs
+music_backend: stub               # stub | elevenlabs; per run: --music-backend
+music_takes: 2                    # takes per generation; pick one with generate --take N
 
 transcribe_backend: whisper
 whisper_model: large-v3-turbo     # e.g. small for speed; per run: --whisper-model

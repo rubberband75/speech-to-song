@@ -7,8 +7,9 @@ sample-exactly from the source.
 
 `docs/SPEC.md` is the source of truth; accepted changes are logged in `docs/DECISIONS.md`.
 
-**Status:** M3 — ingest, voice isolation, transcription, alignment, clip selection and
-the speech melody work. Arrangement, music generation and mixing (M4/M5) are stubs.
+**Status:** M4 — the whole pipeline runs offline: ingest, voice isolation,
+transcription, alignment, clip selection, the speech melody, arrangement, a placeholder
+backing track (the free `stub` music backend) and the mix. ElevenLabs music arrives in M5.
 
 ## Install
 
@@ -38,7 +39,11 @@ speech2song select --dry-run         # estimated Claude cost, no calls
 speech2song select --interactive-review   # Claude picks lines (asks first); review them
 speech2song melody                  # speech pitch -> melody, MIDI, audio reference
 uv run python scripts/melody_listen.py   # listening tests in runs/<run>/04_listen/
-speech2song run inputs/talk.mp3 --transcript inputs/talk.txt      # every implemented step
+speech2song arrange                 # sections on the bar grid; prints the timeline
+speech2song generate                # backing-track takes (stub: free), --take N to pick one
+speech2song mix                     # stems, master.wav (24-bit), master.mp3
+speech2song run inputs/talk.mp3 --transcript inputs/talk.txt      # every step
+speech2song run --run latest --stop-after arrange   # resume; stop to check the arrangement
 ```
 
 - Each run lives in `runs/<run_id>/` (`manifest.json`, `costs.json`, `log.txt`, numbered
@@ -75,6 +80,44 @@ of the main phrase, rendered with fluidsynth and a General MIDI soundfont).
 `scripts/melody_listen.py` writes, per clip, the speech, the melody, both together, and
 an "illusion" take where the speech repeats while the melody fades in.
 
+### Arrangement
+
+`arrange` fits the clips into the preset's `arc`. The arc's `speech_bed` entries are
+slots: the clips, in play order, are shared out over them in consecutive groups that
+balance speech time (a `hook` clip leans to the first slot, an `outro` clip to the last),
+and each clip gets its own speech bed, starting on a bar and long enough for the clip
+plus `speech_interaction.tail_beats`. Other sections take their `bars` from the preset.
+Beds use their clip's chords from the melody, other sections loop the main phrase's
+chords, and breakdowns and drops note which line was heard last, for the melody layer.
+`05_arrangement.json` can be edited by hand: later steps pick up the edit, and the mixer
+checks it first.
+
+`arrange --refine-arc` asks Claude to propose the arc around the clip texts instead (a
+small paid call, about $0.03 on Sonnet; it asks first). Its answer is kept in
+`05_arc.json`; if it breaks the rules (unknown roles, clips out of order, odd lengths)
+it is retried once with feedback, and the preset's arc is used if it still can't be.
+`--no-refine-arc` goes back to the preset's arc. Both flags stick to the run.
+
+### Music and mix
+
+`generate` writes `06_music/take_NNN.wav` (the free `stub` backend synthesizes chord
+pads, bass, half-time drums and risers from the arrangement, as a placeholder) and the
+free `take` stage conforms the chosen take (`--take N`, default 1) to `selected.wav`.
+`generate` re-runs only when what it would generate changes, not on every arrangement
+edit. `mix` writes `07_mix/`:
+
+- `stems/speech.wav`: the clips, sample-exact, on silence (float WAV)
+- `stems/music.wav` and `stems/melody_layer.wav`: as heard in the mix (ducked)
+- `master.wav` (24-bit) and `master.mp3` (320 kbps), at the preset's `target_lufs` with
+  true peaks at or below -1 dBTP
+- `mix.json`: clip positions, levels and final loudness
+
+The speech bus sits `mix.speech_level_lu` above the music's loudness, with a high-pass,
+gentle compression, and reverb/delay sends whose tails fade out before the next clip.
+The music ducks by `sidechain_duck_db` while speech plays. `--melody-layer` (on `mix` and
+`run`, sticky) chooses the melody layer: `replay` (default: breakdowns and drops replay
+the line just heard), `all` (also quietly under the speech) or `off`.
+
 ### Official transcripts
 
 Plain UTF-8 text, one paragraph per line (text copied from a PDF with hard line wraps is
@@ -84,7 +127,8 @@ from the ASR. `transcribe` prints both lists so you can check them.
 
 ## Spending
 
-Only `select` calls a paid API so far (Claude, about $0.05 per 13-minute talk on Sonnet).
+Only `select` (Claude, about $0.05 per 13-minute talk on Sonnet) and the optional
+`arrange --refine-arc` call paid APIs so far; the stub music backend is free.
 Every paid step estimates its cost first, supports `--dry-run` (no calls), asks before
 spending unless `--yes` is given (and refuses without a terminal), and logs each call to
 `costs.json` (`speech2song costs`). Claude list prices are built in with an `as_of` date;

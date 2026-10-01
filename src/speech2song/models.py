@@ -85,6 +85,9 @@ class RunOptions(BaseModel):
     language: str | None = None
     claude_model: str | None = None
     key: str | None = None  # e.g. "D minor": overrides key detection
+    refine_arc: bool = False  # ask Claude to refine the arrangement (a paid call)
+    melody_layer: Literal["replay", "all", "off"] | None = None  # None: the preset's
+    take: int | None = None  # which music take to mix (1-based); None: the first
 
 
 class Manifest(BaseModel):
@@ -394,3 +397,131 @@ class Melody(BaseModel):
     instrument: str
     main_clip: str  # the phrase used for the audio reference
     clips: list[ClipMelody]  # in playback order
+
+
+# --- 05_arc.json (optional: Claude refines the arc) -------------------------------------
+
+
+class ArcPart(BaseModel):
+    """One step of the song: a non-speech section of `bars`, or a speech passage that
+    plays `clips` back to back (each in its own speech_bed section)."""
+
+    role: str
+    bars: int = 0  # ignored for speech_bed parts (beds are fitted to their clips)
+    clips: list[str] = []
+
+
+class ArcPlan(BaseModel):
+    """The JSON Claude returns when asked to refine the arc."""
+
+    parts: list[ArcPart]
+    notes: str = ""
+
+
+class ArcAttempt(BaseModel):
+    attempt: int
+    model: str
+    request_id: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    usd: float | None = None
+    answer: ArcPlan | None = None
+    problems: list[str] = []
+
+
+class ArcResult(BaseModel):
+    """Claude's raw answers. The free `arrange` stage checks the chosen one again and
+    falls back to the preset's arc if it can't be used."""
+
+    schema_version: Literal[1] = 1
+    model: str
+    attempts: list[ArcAttempt]
+    chosen: int
+
+    def answer(self) -> ArcPlan | None:
+        return self.attempts[self.chosen].answer
+
+
+# --- 05_arrangement.json -----------------------------------------------------------------
+
+
+class Section(BaseModel):
+    id: str
+    role: str
+    start_bar: int
+    bars: int
+    energy: float
+    shape: Literal["flat", "rise", "fall"] = "flat"
+    styles: list[str] = []
+    chords: list[str] = []  # one chord name per bar
+    clip_id: str | None = None  # the clip this speech_bed carries
+    clip_offset_beats: float = 0.0  # where the clip starts, from the section start
+    melody_phrase: str | None = None  # clip whose melody the melody layer replays here
+    start_s: float = 0.0  # informational: start_bar at the arrangement's tempo
+    seconds: float = 0.0
+
+
+class Arrangement(BaseModel):
+    schema_version: Literal[1] = 1
+    bpm: float
+    key: str
+    time_signature: str = "4/4"
+    arc_source: Literal["preset", "claude"] = "preset"
+    sections: list[Section]
+    total_bars: int
+    total_seconds: float
+    notes: str | None = None
+    warnings: list[str] = []
+
+
+# --- 06_music ------------------------------------------------------------------------------
+
+
+class TakeMeta(BaseModel):
+    """take_NNN.meta.json: one generated backing track, kept exactly as the backend made it."""
+
+    schema_version: Literal[1] = 1
+    take: int  # 1-based
+    backend: str
+    model: str | None = None
+    file: str  # run-relative
+    sample_rate: int
+    channels: int
+    seconds: float
+    seed: int | None = None
+    usd: float = 0.0
+    song_id: str | None = None  # stored song for inpainting, when the backend keeps one
+    request_sha256: str
+    params: dict[str, Any] = {}
+
+
+# --- 07_mix/mix.json -------------------------------------------------------------------------
+
+
+class PlacedClip(BaseModel):
+    clip_id: str
+    section_id: str
+    file: str
+    start_sample: int  # in the mix; the clip's samples are copied verbatim from here
+    end_sample: int
+    start_s: float
+
+
+class MixReport(BaseModel):
+    schema_version: Literal[1] = 1
+    sample_rate: int
+    frames: int
+    seconds: float
+    take: str  # the music file used
+    clips: list[PlacedClip]
+    melody_layer: Literal["replay", "all", "off"]
+    music_lufs: float | None
+    speech_lufs: float | None  # dry speech, before its gain
+    speech_gain_db: float
+    melody_gain_db: float | None
+    duck_db: float
+    target_lufs: float
+    master_gain_db: float
+    integrated_lufs: float
+    true_peak_dbtp: float
+    warnings: list[str] = []

@@ -53,11 +53,21 @@ def test_presets_list_flags_invalid_preset(cli: Cli, tmp_path: Path) -> None:
     assert "invalid" in result.output
 
 
-@pytest.mark.parametrize(("command", "milestone"), [("arrange", "M4"), ("mix", "M4")])
-def test_unimplemented_steps_exit_2(cli: Cli, cli_run: Run, command: str, milestone: str) -> None:
+@pytest.mark.parametrize("command", ["arrange", "generate", "mix"])
+def test_steps_need_their_inputs(cli: Cli, cli_run: Run, command: str) -> None:
     result = cli(command)
+    assert result.exit_code == 1
+    assert "missing inputs" in result.output
+
+
+def test_elevenlabs_music_waits_for_m5(cli: Cli, cli_run: Run) -> None:
+    result = cli("generate", "--music-backend", "elevenlabs")
     assert result.exit_code == 2
-    assert f"planned for {milestone}" in result.output
+    assert "planned for M5" in result.output
+    assert Run.open(cli_run.root.parent, cli_run.id).manifest.options.music_backend == "elevenlabs"
+    status = cli("status")
+    assert "planned for M5" in status.output
+    assert CostLog(cli_run.costs_path).read() == []
 
 
 def test_regenerate_is_planned(cli: Cli) -> None:
@@ -113,8 +123,16 @@ def test_run_dry_run_creates_nothing(cli: Cli, tmp_path: Path, input_file: Path)
     assert result.exit_code == 0, result.output
     assert "assuming a 15-minute talk" in result.output  # the fixture is not real audio
     assert "select 5 clips" in result.output
+    assert "refine the arc" not in result.output
+    assert "stub music backend is free" in result.output
     assert "Nothing was executed" in result.output
     assert not (tmp_path / "runs").exists()
+
+
+def test_run_dry_run_with_refine_arc_estimates_it(cli: Cli, input_file: Path) -> None:
+    result = cli("run", str(input_file), "--dry-run", "--refine-arc")
+    assert result.exit_code == 0, result.output
+    assert "refine the arc" in result.output
 
 
 def test_input_and_run_are_exclusive(cli: Cli, cli_run: Run, input_file: Path) -> None:

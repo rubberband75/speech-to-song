@@ -4,6 +4,11 @@ A stage is skipped when its last run completed with the same fingerprint (stage 
 stage version, input content hashes, params) and its recorded outputs still exist.
 A stage's own outputs are not re-hashed for that decision, so hand edits to an output
 are kept; downstream stages see the edit through their input hashes.
+
+A stage can also wait for files it does not hash (`StagePlan.waits_for`). It then puts a
+digest of what it takes from them into its params instead, so edits elsewhere in those
+files don't invalidate it. Paid stages use this to repeat a call only when the request
+itself changes.
 """
 
 import hashlib
@@ -37,6 +42,7 @@ class StagePlan:
     inputs: dict[str, Path]
     params: dict[str, Any]
     outputs: list[str]  # run-relative paths
+    waits_for: dict[str, Path] = field(default_factory=dict)  # must exist; not hashed
 
 
 @dataclass
@@ -76,6 +82,10 @@ class Stage(ABC):
         """Paid stages return their expected spend; free stages spend nothing."""
         return []
 
+    def is_paid(self, ctx: Context) -> bool:
+        """Whether running this stage for this run calls a paid API (may depend on options)."""
+        return self.paid
+
 
 def fingerprint(
     name: str, version: int, input_hashes: dict[str, str], params: dict[str, Any]
@@ -107,7 +117,7 @@ class Check:
 def check(stage: Stage, ctx: Context) -> Check:
     """Evaluate a stage's cache state (hashes its inputs, memoized)."""
     plan = stage.plan(ctx)
-    missing = [str(p) for p in plan.inputs.values() if not p.exists()]
+    missing = [str(p) for p in {**plan.inputs, **plan.waits_for}.values() if not p.exists()]
     if missing:
         return Check(State.BLOCKED, plan, missing_inputs=missing)
     refs = {key: ctx.run.file_ref(path) for key, path in plan.inputs.items()}
@@ -145,7 +155,7 @@ def fmt_bytes(size: int) -> str:
 
 
 def _dry_run_estimate(stage: Stage, ctx: Context, plan: StagePlan) -> None:
-    if stage.paid:
+    if stage.is_paid(ctx):
         estimates = stage.estimate(ctx, plan)
         render_estimates(ctx.console, estimates)
         ctx.estimates.extend(estimates)
@@ -170,7 +180,7 @@ def execute(stage: Stage, ctx: Context) -> Outcome:
         ctx.say(f"  {stage.name}: would run ({reason})")
         _dry_run_estimate(stage, ctx, chk.plan)
         return Outcome(stage.name, "would run")
-    if stage.paid:
+    if stage.is_paid(ctx):
         confirm_spend(
             stage.estimate(ctx, chk.plan), console=ctx.console, yes=ctx.yes, dry_run=False
         )

@@ -315,3 +315,20 @@ def choose_chords(bars: Sequence[np.ndarray], key: Key) -> list[Triad]:
     for step_back in reversed(back):
         path.append(step_back[path[-1]])
     return [triads[i] for i in reversed(path)]
+
+
+_CHORD_PATTERN = re.compile(r"^([A-G])(#{1,2}|b{1,2})?(m|dim)?$")
+
+
+def parse_chord(name: str) -> tuple[int, int, int]:
+    """Pitch classes (root, third, fifth) of a triad written as `Triad.name` writes it:
+    "Ebm", "Cb", "F#dim"."""
+    match = _CHORD_PATTERN.match(name.strip())
+    if not match:
+        raise ValueError(f"not a chord: {name!r} (try 'C', 'Ebm', 'Bdim')")
+    letter, accidental, quality = match.groups()
+    accidental = accidental or ""
+    root = (LETTER_PC[letter] + accidental.count("#") - accidental.count("b")) % 12
+    third = 3 if quality in ("m", "dim") else 4
+    fifth = 6 if quality == "dim" else 7
+    return root, (root + third) % 12, (root + fifth) % 12

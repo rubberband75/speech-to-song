@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 from rich.console import Console
 from typer.testing import CliRunner, Result
 
@@ -110,3 +111,22 @@ def install(monkeypatch: pytest.MonkeyPatch) -> Callable[..., FakeAnthropic]:
         return fake
 
     return install_fake
+
+
+SHORT_BARS = {"intro": 1, "build": 1, "drop": 2, "breakdown": 1, "outro": 1}
+
+
+@pytest.fixture
+def short_song(cli: Callable[..., Result], tmp_path: Path) -> Path:
+    """The cinematic preset with 1-2 bar sections, and one music take, for fast mixes.
+    Rewrites the CLI's config.yaml to use it; returns the presets directory."""
+    data = yaml.safe_load((PRESETS_DIR / "cinematic_future_bass.yaml").read_text())
+    for role, bars in SHORT_BARS.items():
+        data["section_roles"][role]["bars"] = bars
+    presets = tmp_path / "short_presets"
+    presets.mkdir()
+    (presets / "cinematic_future_bass.yaml").write_text(yaml.safe_dump(data))
+    (tmp_path / "config.yaml").write_text(
+        f"presets_dir: {presets}\nruns_dir: runs\nmusic_takes: 1\n"
+    )
+    return presets

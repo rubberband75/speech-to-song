@@ -1,5 +1,8 @@
-"""Small DSP helpers: finding quiet cut points and applying edge fades."""
+"""DSP helpers: quiet cut points and edge fades (clips), and ducking, loudness, true peak
+and limiting (mix). Pure numpy/scipy; no file I/O."""
 
+import math
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -75,3 +78,232 @@ def fade_edges(block: np.ndarray, fade: int) -> np.ndarray:
     out[:n] *= ramp[:, None]
     out[len(out) - n :] *= ramp[::-1, None]
     return out
+
+
+# --- Ducking ---------------------------------------------------------------------------------
+
+
+def speech_activity(
+    mono: np.ndarray, sr: int, *, hop_s: float, frame_s: float, floor_db: float, full_db: float
+) -> np.ndarray:
+    """How strongly speech is present every `hop_s` (0-1): the RMS level of a `frame_s`
+    window, mapped linearly from `floor_db` (0) to `full_db` (1)."""
+    hop = max(1, round(hop_s * sr))
+    centers = np.arange(0, len(mono), hop)
+    if len(centers) == 0:
+        return np.zeros(0)
+    levels = frame_levels_db(mono, centers, max(2, round(frame_s * sr)))
+    return np.clip((levels - floor_db) / (full_db - floor_db), 0.0, 1.0)
+
+
+def smooth_gain_db(target_db: np.ndarray, hop_s: float, attack_ms: float, release_ms: float):
+    """One-pole smoothing of a gain curve (dB): moves toward more reduction with the
+    attack time constant and recovers with the release one."""
+    attack = math.exp(-hop_s / max(attack_ms / 1000, 1e-9))
+    release = math.exp(-hop_s / max(release_ms / 1000, 1e-9))
+    out = np.empty(len(target_db))
+    gain = 0.0
+    for i, target in enumerate(target_db.tolist()):
+        coef = attack if target < gain else release
+        gain = coef * gain + (1 - coef) * target
+        out[i] = gain
+    return out
+
+
+def duck_gain(
+    speech: np.ndarray,
+    sr: int,
+    frames: int,
+    *,
+    depth_db: float,
+    attack_ms: float,
+    release_ms: float,
+    floor_db: float,
+    full_db: float,
+    hop_s: float = 0.002,
+    frame_s: float = 0.02,
+) -> np.ndarray:
+    """Per-sample linear gain for the music bus: down by up to `depth_db` (negative)
+    while `speech` (mono) is active. The curve is moved earlier by the attack time
+    (look-ahead), so the reduction is in place when the first syllable arrives."""
+    activity = speech_activity(speech, sr, hop_s=hop_s, frame_s=frame_s, floor_db=floor_db,
+                               full_db=full_db)  # fmt: skip
+    smoothed = smooth_gain_db(depth_db * activity, hop_s, attack_ms, release_ms)
+    shift = round(attack_ms / 1000 / hop_s)
+    if shift and len(smoothed):
+        smoothed = np.concatenate([smoothed[shift:], np.full(min(shift, len(smoothed)),
+                                                             smoothed[-1])])  # fmt: skip
+    hop = max(1, round(hop_s * sr))
+    if len(smoothed) == 0:
+        return np.ones(frames, dtype=np.float32)
+    times = np.arange(len(smoothed)) * hop
+    gain_db = np.interp(np.arange(frames), times, smoothed)
+    return (10 ** (gain_db / 20)).astype(np.float32)
+
+
+# --- Loudness and peaks ----------------------------------------------------------------------
+
+OVERSAMPLE = 4
+_CHUNK = 1 << 18  # samples per oversampling chunk
+_PAD = 64  # context on each side of a chunk for the resampling filter
+
+
+def _as_2d(audio: np.ndarray) -> np.ndarray:
+    return audio[:, None] if audio.ndim == 1 else audio
+
+
+def oversampled_peaks(audio: np.ndarray) -> np.ndarray:
+    """Per input sample, the largest absolute value of the 4x-oversampled signal around
+    it, over all channels (the ITU-R BS.1770 true-peak approach). Processed in chunks."""
+    from scipy.signal import resample_poly
+
+    audio = _as_2d(audio)
+    n = len(audio)
+    peaks = np.zeros(n, dtype=np.float32)
+    for start in range(0, n, _CHUNK):
+        end = min(n, start + _CHUNK)
+        lo, hi = max(0, start - _PAD), min(n, end + _PAD)
+        up = resample_poly(audio[lo:hi].astype(np.float32), OVERSAMPLE, 1, axis=0)
+        a = (start - lo) * OVERSAMPLE
+        block = np.abs(
+            up[a : a + (end - start) * OVERSAMPLE], out=up[a : a + (end - start) * OVERSAMPLE]
+        )
+        block = block.reshape(end - start, -1).max(axis=1)  # oversampled points x channels
+        peaks[start:end] = np.maximum(block, np.abs(audio[start:end]).max(axis=1))
+    return peaks
+
+
+def true_peak_db(audio: np.ndarray) -> float:
+    peak = float(oversampled_peaks(audio).max()) if len(audio) else 0.0
+    return 20 * math.log10(peak) if peak > 0 else -math.inf
+
+
+BLOCK_S = 0.4  # BS.1770 gating block
+BLOCK_STEP = 0.25  # 75% overlap
+ABSOLUTE_GATE = -70.0
+RELATIVE_GATE = -10.0
+
+
+def _k_weighting(sr: int) -> np.ndarray:
+    """BS.1770 K-weighting (high shelf, then high-pass) as second-order sections, using
+    pyloudnorm's filter design so results match its meter at any sample rate."""
+    from pyloudnorm import IIRfilter
+    from scipy.signal import tf2sos
+
+    shelf = IIRfilter(4.0, 1 / np.sqrt(2), 1500.0, sr, "high_shelf")
+    highpass = IIRfilter(0.0, 0.5, 38.0, sr, "high_pass")
+    return np.vstack([tf2sos(shelf.b, shelf.a), tf2sos(highpass.b, highpass.a)])
+
+
+def loudness_lufs(audio: np.ndarray, sr: int) -> float | None:
+    """Integrated loudness (ITU-R BS.1770-4 / EBU R128, gated), or None for silence or
+    audio shorter than one 400 ms block. Vectorized; matches pyloudnorm's meter."""
+    from scipy.signal import sosfilt
+
+    audio = _as_2d(audio)
+    block = round(BLOCK_S * sr)
+    if len(audio) < block or not np.any(audio):
+        return None
+    # A +/-1e-12 (-240 dBFS) Nyquist-rate dither keeps the filter state out of subnormal
+    # floats, which make IIR filtering of long silences ~30x slower. Its energy is far
+    # below the -70 LUFS gate.
+    signal = audio.astype(np.float64)
+    signal[0::2] -= 1e-12
+    signal[1::2] += 1e-12
+    weighted = sosfilt(_k_weighting(sr), signal, axis=0)
+    energy = np.empty(len(audio) + 1)
+    energy[0] = 0.0
+    np.cumsum(np.einsum("ij,ij->i", weighted, weighted), out=energy[1:])  # L/R gain 1.0
+    blocks = round((len(audio) / sr - BLOCK_S) / (BLOCK_S * BLOCK_STEP)) + 1
+    starts = (BLOCK_S * BLOCK_STEP * np.arange(blocks) * sr).astype(int)
+    ends = np.minimum(starts + block, len(audio))
+    z = (energy[ends] - energy[starts]) / block
+    with np.errstate(divide="ignore"):
+        loud = -0.691 + 10 * np.log10(z)
+    gated = z[loud >= ABSOLUTE_GATE]
+    if len(gated) == 0:
+        return None
+    relative = -0.691 + 10 * math.log10(gated.mean()) + RELATIVE_GATE
+    gated = z[(loud >= ABSOLUTE_GATE) & (loud > relative)]
+    value = -0.691 + 10 * math.log10(gated.mean()) if len(gated) else -math.inf
+    return value if math.isfinite(value) else None
+
+
+def db_to_gain(db: float) -> float:
+    return 10 ** (db / 20)
+
+
+# --- Limiting and mastering --------------------------------------------------------------------
+
+
+def limit(
+    audio: np.ndarray,
+    sr: int,
+    ceiling_db: float,
+    *,
+    lookahead_ms: float = 5.0,
+    release_ms: float = 80.0,
+    block: int = 32,
+) -> np.ndarray:
+    """Look-ahead peak limiter on true (4x oversampled) peaks.
+
+    Per block of samples: the gain that keeps the block's peaks under the ceiling; a
+    minimum over the look-ahead window, then a moving average of the same length, so the
+    gain glides down before a peak but never sits above what any sample needs; then an
+    exponential release back toward unity that never exceeds that envelope.
+    """
+    audio = _as_2d(audio)
+    n = len(audio)
+    if n == 0:
+        return audio.astype(np.float32)
+    ceiling = db_to_gain(ceiling_db)
+    peaks = oversampled_peaks(audio)
+    blocks = math.ceil(n / block)
+    padded = np.concatenate([peaks, np.zeros(blocks * block - n, dtype=np.float32)])
+    block_peak = padded.reshape(blocks, block).max(axis=1)
+    need = np.minimum(1.0, ceiling / np.maximum(block_peak, 1e-12))
+    window = max(1, round(lookahead_ms / 1000 * sr / block))
+    ahead = np.lib.stride_tricks.sliding_window_view(
+        np.concatenate([need, np.ones(window)]), window + 1
+    ).min(axis=1)[:blocks]
+    behind = np.concatenate([np.full(window, ahead[0]), ahead])
+    sums = np.concatenate([[0.0], np.cumsum(behind)])
+    glide = (sums[window + 1 :] - sums[: -window - 1]) / (window + 1)
+    recover = 1 - math.exp(-block / sr / (release_ms / 1000))
+    gain = np.empty(blocks)
+    current = 1.0
+    for i, cap in enumerate(np.minimum(glide, need).tolist()):
+        current = min(cap, current + (1.0 - current) * recover)
+        gain[i] = current
+    per_sample = np.repeat(gain, block)[:n].astype(np.float32)
+    return (audio * per_sample[:, None]).astype(np.float32)
+
+
+@dataclass(frozen=True)
+class Mastered:
+    audio: np.ndarray
+    gain_db: float  # applied before the limiter
+    lufs: float | None
+    true_peak_db: float
+
+
+def master(audio: np.ndarray, sr: int, target_lufs: float, ceiling_db: float) -> Mastered:
+    """Gain to the loudness target, limit true peaks below the ceiling, and correct the
+    gain for what the limiter took (a few rounds). A final trim guarantees the ceiling."""
+    measured = loudness_lufs(audio, sr)
+    if measured is None:
+        return Mastered(_as_2d(audio).astype(np.float32), 0.0, None, true_peak_db(audio))
+    gain_db = target_lufs - measured
+    limiter_ceiling = ceiling_db - 0.3  # margin for gain changes between blocks
+    out = limit(audio * db_to_gain(gain_db), sr, limiter_ceiling)
+    for _ in range(4):
+        lufs = loudness_lufs(out, sr)
+        if lufs is None or abs(lufs - target_lufs) < 0.05:
+            break
+        gain_db += target_lufs - lufs
+        out = limit(audio * db_to_gain(gain_db), sr, limiter_ceiling)
+    peak = true_peak_db(out)
+    if peak > ceiling_db:
+        out = out * np.float32(db_to_gain(ceiling_db - peak - 0.01))
+        peak = true_peak_db(out)
+    return Mastered(out, gain_db, loudness_lufs(out, sr), peak)

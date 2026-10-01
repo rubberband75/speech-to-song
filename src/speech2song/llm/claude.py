@@ -5,11 +5,13 @@ default: if Claude's safety classifiers decline, the API re-runs the request on 
 recommended model. Every attempt is priced at the rates of the model that ran it.
 """
 
+import hashlib
 import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from importlib import resources
 from typing import Any
 
 from speech2song.config import AppConfig
@@ -30,6 +32,22 @@ def _default_client() -> Any:
 
 # Tests replace this to inject a fake client; nothing in tests may reach the network.
 client_factory: Callable[[], Any] = _default_client
+
+
+def load_prompt(name: str) -> tuple[str, str]:
+    """(system, user template) from llm/prompts/<name>.md, split at its `## System` and
+    `## User` headings."""
+    text = resources.files("speech2song.llm").joinpath(f"prompts/{name}.md").read_text()
+    system = text.split("## System", 1)[1].split("## User", 1)[0].strip()
+    user = text.split("## User", 1)[1].strip()
+    return system, user
+
+
+def request_digest(request: dict[str, Any]) -> str:
+    """Hash of a request body: a paid stage's cache key, so it re-runs only when what it
+    would send changes."""
+    canonical = json.dumps(request, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 @dataclass
