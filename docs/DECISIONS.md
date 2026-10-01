@@ -2,7 +2,7 @@
 
 ## Status (2026-10-01)
 
-M0–M4 are done and committed: scaffold `25794b6`, ingest/transcribe/align `43b48a4`, clip selection `0f23069` + `b12e1ac`, melody `31c114c`, offline end-to-end (M4) in the commit after `66ff153`. Next is **M5: ElevenLabs** (read the docs first, then composition plans, take analysis and selection, inpainting). Total paid spend so far: $0.0548 (one Claude call). M4 spent nothing.
+M0–M4 are done and committed: scaffold `25794b6`, ingest/transcribe/align `43b48a4`, clip selection `0f23069` + `b12e1ac`, melody `31c114c`, offline end-to-end `a66330b`. Next is **M5: ElevenLabs** (read the docs first, then composition plans, take analysis and selection, inpainting). Total paid spend so far: $0.0548 (one Claude call). M4 spent nothing.
 
 Runs on the sample talk (gitignored, local only):
 - `runs/20261001-004912-come-home-by-elder-clark-g-gilbe`: complete through `mix` with the stub music backend. Listen to `07_mix/master.wav` (or `master.mp3`) and the stems in `07_mix/stems/`. The melody listening files from M3 are in `04_listen/`. Its `select` stage shows **stale** because M4 changed the stage's cache key (see the open questions); its clips and everything after them are current.
