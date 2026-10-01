@@ -286,12 +286,19 @@ class SelectionAttempt(BaseModel):
 
 
 class SelectionResult(BaseModel):
-    schema_version: Literal[1] = 1
+    """Claude's raw answers. Clean-up happens in the free `clips` stage, so changing
+    those rules never repeats a paid call."""
+
+    schema_version: Literal[2] = 2
     model: str  # requested model
     targets: ClipTargets
     attempts: list[SelectionAttempt]
-    selection: ClipSelection  # validated, renumbered c1..cN in time order
-    warnings: list[str] = []
+    chosen: int  # index of the attempt whose answer is used
+
+    def answer(self) -> ClipSelection:
+        answer = self.attempts[self.chosen].answer
+        assert answer is not None
+        return answer
 
 
 class Clip(BaseModel):
@@ -324,6 +331,7 @@ class ClipSet(BaseModel):
     order: list[str]  # playback order of the kept clips
     dropped: list[str] = []  # removed during review
     notes: str | None = None
+    warnings: list[str] = []  # clips or limits the clean-up had to fix
 
 
 class ClipReview(BaseModel):

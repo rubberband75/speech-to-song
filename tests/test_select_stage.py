@@ -48,7 +48,7 @@ def install(monkeypatch: pytest.MonkeyPatch) -> Callable[..., FakeAnthropic]:
 def answer(transcript: Transcript, picks: list[tuple[int, int]] = PICKS) -> dict[str, Any]:
     clips = [
         {
-            "id": f"x{i}",
+            "id": f"c{i + 1}",
             "start_sentence": a,
             "end_sentence": b,
             "text": " ".join(s.text for s in transcript.sentences[a - 1 : b]),
@@ -97,8 +97,9 @@ def test_select_cuts_sample_exact_clips_in_the_pauses(cli: Cli, talk, install) -
     assert "Spend this command: $0.0070" in result.output
 
     selection = SelectionResult.model_validate_json(run.path("03_selection.json").read_text())
-    assert [c.id for c in selection.selection.clips] == ["c1", "c2", "c3", "c4", "c5"]
+    assert (len(selection.attempts), selection.chosen) == (1, 0)
     clip_set = _clip_set(run)
+    assert [c.id for c in clip_set.clips] == ["c1", "c2", "c3", "c4", "c5"]
     assert clip_set.order == ["c5", "c4", "c3", "c2", "c1"]
     assert (clip_set.source, clip_set.channels, clip_set.isolated) == ("01_clean.wav", 2, False)
     for clip, (first, last) in zip(clip_set.clips, PICKS, strict=True):
@@ -152,7 +153,8 @@ def test_invalid_answer_gets_one_retry_with_feedback(cli: Cli, talk, install) ->
     assert "which read" in retry_prompt
     selection = SelectionResult.model_validate_json(run.path("03_selection.json").read_text())
     assert len(selection.attempts) == 2 and selection.attempts[0].problems
-    assert len(selection.selection.clips) == 5
+    assert selection.chosen == 1
+    assert len(_clip_set(run).clips) == 5
     assert len(json.loads(run.costs_path.read_text())) == 2
 
 

@@ -28,6 +28,7 @@ from speech2song.models import (
     ClipReview,
     ClipSelection,
     ClipSet,
+    ClipTargets,
     SelectedClip,
     SelectionAttempt,
     SelectionResult,
@@ -157,24 +158,22 @@ class SelectStage(Stage):
 
         answer = ask(user)
         problems = validate(answer, transcript, targets)
-        chosen = finalize(answer, transcript, targets)
+        chosen, usable = 0, _usable(answer, transcript, targets)
         if needs_retry(problems):
             ctx.say(f"[yellow]  the answer had {len(problems)} problem(s); asking once more "
                     "with feedback[/]")  # fmt: skip
             for problem in problems:
                 ctx.say(f"    - {escape(problem.message)}")
-            second = finalize(ask(feedback_prompt(user, answer, problems)), transcript, targets)
-            if len(second[0].clips) >= len(chosen[0].clips):
-                chosen = second
-        selection, warnings = chosen
-        for warning in warnings:
-            ctx.say(f"[yellow]  {escape(warning)}[/]")
+            second = ask(feedback_prompt(user, answer, problems))
+            if _usable(second, transcript, targets) >= usable:
+                chosen = 1
+        if not _usable(attempts[chosen].answer, transcript, targets):
+            raise StageError("None of Claude's clips could be used; see 03_selection.json.")
 
-        result = SelectionResult(
-            model=claude.model, targets=targets, attempts=attempts, selection=selection,
-            warnings=warnings,
-        )  # fmt: skip
+        result = SelectionResult(model=claude.model, targets=targets, attempts=attempts,
+                                 chosen=chosen)  # fmt: skip
         write_json(ctx.run.path(SELECTION), result)
+        selection, _ = finalize(result.answer(), transcript, targets)
         ctx.console.print(_selection_table(selection, transcript))
         if selection.notes:
             ctx.say(f"  notes: {escape(selection.notes)}")
@@ -182,6 +181,16 @@ class SelectStage(Stage):
         return StageResult(
             summary={"clips": len(selection.clips), "attempts": len(attempts), "usd": spent}
         )
+
+
+def _usable(answer: ClipSelection | None, transcript: Transcript, targets: ClipTargets) -> int:
+    """How many clips survive the clean-up (0 if none)."""
+    if answer is None:
+        return 0
+    try:
+        return len(finalize(answer, transcript, targets)[0].clips)
+    except StageError:
+        return 0
 
 
 def _selection_table(selection: ClipSelection, transcript: Transcript) -> Table:
@@ -226,6 +235,9 @@ class ClipsStage(Stage):
     def run(self, ctx: Context, plan: StagePlan) -> StageResult:
         result = SelectionResult.model_validate_json(plan.inputs["selection"].read_text())
         transcript = Transcript.model_validate_json(plan.inputs["transcript"].read_text())
+        selection, warnings = finalize(result.answer(), transcript, result.targets)
+        for warning in warnings:
+            ctx.say(f"[yellow]  {escape(warning)}[/]")
         fade_ms = plan.params["fade_ms"]
         search = Search(
             lead_s=plan.params["lead_search_ms"] / 1000,
@@ -240,7 +252,7 @@ class ClipsStage(Stage):
         clips: list[Clip] = []
         with sf.SoundFile(str(plan.inputs["audio"])) as audio:
             rate, channels = audio.samplerate, audio.channels
-            for number, selected in enumerate(result.selection.clips, start=1):
+            for number, selected in enumerate(selection.clips, start=1):
                 clip = _cut(audio, selected, transcript, number, search, fade_ms)
                 block = _read(audio, clip.start_sample, clip.end_sample)
                 fade = round(fade_ms / 1000 * rate)
@@ -248,7 +260,7 @@ class ClipsStage(Stage):
                          subtype="FLOAT")  # fmt: skip
                 clips.append(clip)
 
-        order, dropped = list(result.selection.suggested_order), []
+        order, dropped = list(selection.suggested_order), []
         review = self._review(ctx, plan, {c.id for c in clips})
         if review is not None:
             order, dropped = review.order, review.dropped
@@ -261,7 +273,8 @@ class ClipsStage(Stage):
             clips=clips,
             order=order,
             dropped=dropped,
-            notes=result.selection.notes,
+            notes=selection.notes,
+            warnings=warnings,
         )
         write_json(ctx.run.path(CLIPS), clip_set)
         for clip in clips:

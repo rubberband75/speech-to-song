@@ -7,6 +7,7 @@ budget. One retry with feedback is allowed; after that, unusable clips are dropp
 """
 
 import hashlib
+import re
 from dataclasses import dataclass
 from importlib import resources
 from string import Template
@@ -21,10 +22,12 @@ from speech2song.text.normalize import normalize_word
 
 CLIP_ROLES = ("hook", "build", "payoff", "breakdown", "outro")
 TEXT_MATCH_MIN = 0.8  # normalized similarity between a clip's quote and its sentences
+CLIP_ID = re.compile(r"[A-Za-z0-9_-]{1,16}")
 
-# Rough, offline token estimates (dry runs make no API calls). Deliberately generous.
-CHARS_PER_TOKEN = 3.0
-SCHEMA_OVERHEAD_TOKENS = 400
+# Rough, offline token estimates (dry runs make no API calls). Calibrated on the sample
+# talk: timestamps and numbers tokenize densely (about 2.2 characters per token).
+CHARS_PER_TOKEN = 2.2
+SCHEMA_OVERHEAD_TOKENS = 600
 OUTPUT_TOKENS_BASE = 3000  # adaptive thinking plus JSON scaffolding
 OUTPUT_TOKENS_PER_CLIP = 250
 WORDS_PER_SECOND = 2.6  # for estimating a transcript that does not exist yet
@@ -232,8 +235,12 @@ def needs_retry(problems: list[Problem]) -> bool:
 def finalize(
     selection: ClipSelection, transcript: Transcript, targets: ClipTargets
 ) -> tuple[ClipSelection, list[str]]:
-    """Keep the usable clips, resolve overlaps and limits by score, renumber c1..cN in
-    time order, and use the transcript's own text for each clip."""
+    """Keep the usable clips, resolve overlaps and limits by score, sort them by time, and
+    use the transcript's own text for each clip.
+
+    Claude's clip IDs are kept, because its notes and reasons refer to them; they are
+    replaced by c1..cN (in time order) only if any ID is malformed.
+    """
     problems = validate(selection, transcript, targets)
     warnings = [p.message for p in problems if p.kind in ("invalid", "score")]
     invalid = {p.clip for p in problems if p.kind == "invalid"}
@@ -264,7 +271,11 @@ def finalize(
         raise StageError("None of Claude's clips could be used; see 03_selection.json attempts.")
 
     kept.sort(key=lambda item: item[0].start_sentence)
-    rename = {item[0].id: f"c{i}" for i, item in enumerate(kept, start=1)}
+    if all(CLIP_ID.fullmatch(item[0].id) for item in kept):
+        rename = {item[0].id: item[0].id for item in kept}
+    else:
+        rename = {item[0].id: f"c{i}" for i, item in enumerate(kept, start=1)}
+        warnings.append("renamed malformed clip IDs to c1..cN; the notes may use the old IDs")
     order = [rename[i] for i in dict.fromkeys(selection.suggested_order) if i in rename]
     by_score = sorted(kept, key=lambda item: -item[0].score)
     order += [rename[item[0].id] for item in by_score if rename[item[0].id] not in order]

@@ -128,7 +128,7 @@ def test_retry_only_for_problems_claude_must_fix() -> None:
     assert needs_retry(bad)
 
 
-def test_finalize_cleans_up_and_renumbers_in_time_order() -> None:
+def test_finalize_cleans_up_and_keeps_claudes_ids() -> None:
     selection = _selection(
         _clip("hook", 5, 5, score=0.9),
         _clip("bad", 2, 2, text="hallucinated words here"),
@@ -138,12 +138,22 @@ def test_finalize_cleans_up_and_renumbers_in_time_order() -> None:
         order=["hook", "early", "bad", "mid", "weak"],
     )
     final, warnings = finalize(selection, TRANSCRIPT, TARGETS)
-    assert [(c.id, c.start_sentence) for c in final.clips] == [("c1", 1), ("c2", 3), ("c3", 5)]
-    assert final.suggested_order == ["c3", "c1", "c2"]
+    assert [(c.id, c.start_sentence) for c in final.clips] == [
+        ("early", 1), ("mid", 3), ("hook", 5),
+    ]  # fmt: skip
+    assert final.suggested_order == ["hook", "early", "mid"]
     assert final.clips[1].score == 1.0
     assert final.clips[0].text == TRANSCRIPT.sentences[0].text
     assert any("bad" in w for w in warnings)
     assert any("dropped weak: it overlaps hook" in w for w in warnings)
+
+
+def test_malformed_ids_are_renumbered_in_time_order() -> None:
+    selection = _selection(_clip("third one!", 5, 5), _clip("c9", 1, 1), order=["c9", "third one!"])
+    final, warnings = finalize(selection, TRANSCRIPT, TARGETS)
+    assert [c.id for c in final.clips] == ["c1", "c2"]
+    assert final.suggested_order == ["c1", "c2"]
+    assert any("renamed malformed clip IDs" in w for w in warnings)
 
 
 def test_finalize_enforces_count_and_budget_by_score() -> None:
@@ -173,6 +183,6 @@ def test_feedback_prompt_lists_problems_and_previous_answer() -> None:
 
 
 def test_estimates_are_generous_and_offline() -> None:
-    assert estimate_input_tokens("x" * 3000, "y" * 3000) == 2000 + 400
+    assert estimate_input_tokens("x" * 1100, "y" * 1100) == 1000 + 600
     assert estimate_output_tokens(5) == 3000 + 5 * 250
     assert estimate_input_tokens_from_duration(600) > 600 * 2.6 * 1.6
