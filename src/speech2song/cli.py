@@ -98,6 +98,12 @@ class MusicBackend(StrEnum):
     elevenlabs = "elevenlabs"
 
 
+class Adherence(StrEnum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+
+
 class MelodyLayerMode(StrEnum):
     replay = "replay"
     all = "all"
@@ -679,13 +685,25 @@ def mix(
 def regenerate(
     ctx: typer.Context,
     section: Annotated[
-        list[str],
+        list[str] | None,
         typer.Option(
             help="Section ID (s5) or a range of neighbouring sections (s3-s5); repeatable."
         ),
-    ],
+    ] = None,
+    undo: Annotated[
+        bool,
+        typer.Option("--undo", help="Go back to the take's previous version instead (free)."),
+    ] = False,
     note: Annotated[
         str | None, typer.Option(help="Extra direction for the new version, e.g. 'less busy'.")
+    ] = None,
+    adherence: Annotated[
+        Adherence | None,
+        typer.Option(
+            help="How closely the new part follows the music around it (default: config's "
+            "elevenlabs.context_adherence). Lower it when a regeneration comes back too "
+            "much like the original."
+        ),
     ] = None,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Show the plan and cost; call nothing.")
@@ -694,14 +712,20 @@ def regenerate(
     run_ref: RunRef = None,
 ) -> None:
     """Regenerate sections of the current ElevenLabs take, keeping the rest (paid)."""
-    from speech2song.stages.generate_music import regenerate_sections
+    from speech2song.stages.generate_music import regenerate_sections, undo_regeneration
 
+    if bool(section) == undo:
+        raise S2SError("Give --section (to regenerate) or --undo (to go back), not both.")
     env = _env(ctx)
     run = _open_run(env, run_ref)
     before = CostLog(run.costs_path).totals()["total"]
     with run.logging_to_file(logging.DEBUG if env.verbose else logging.INFO):
         context = _context(env, run, dry_run=dry_run, yes=yes)
-        updated = regenerate_sections(context, section, note)
+        if undo:
+            updated = None if dry_run else undo_regeneration(context)
+        else:
+            updated = regenerate_sections(context, section or [], note,
+                                          adherence.value if adherence else None)  # fmt: skip
         if updated is not None:
             _update_options(run, take=updated.take)  # mix this version from now on
             run.save()

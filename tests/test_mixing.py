@@ -9,10 +9,13 @@ from speech2song.audio.mixing import (
     ENERGY_RAMP_S,
     GAP_CUT_S,
     TAIL_MAX_S,
+    apply_entry_fix,
+    bar_levels_db,
     energy_gains,
     gain_curve,
     gap_mask,
     gap_tail,
+    late_entries,
     melody_notes,
     place_clips,
     section_spans,
@@ -184,7 +187,8 @@ def test_shape_music_mutes_gaps_and_reports_levels() -> None:
     frames = spans[-1][2] + sr
     rng = np.random.default_rng(2)
     music = (0.1 * rng.standard_normal((frames, 2))).astype(np.float32)  # evenly loud
-    shaped, levels, silenced = shape_music(music, arrangement, PRESET.mix, sr)
+    shaped, levels, silenced, fixes = shape_music(music, arrangement, PRESET.mix, sr)
+    assert fixes == []  # evenly loud: nothing comes in late
     gaps = [(a, b) for s, a, b in spans if s.silent]
     assert silenced == [s.id for s, _, _ in spans if s.silent] and gaps
     start, end = gaps[0]
@@ -194,3 +198,66 @@ def test_shape_music_mutes_gaps_and_reports_levels() -> None:
     by_role = {lv.role: lv for lv in levels}
     assert by_role["drop"].gain_db > 3 and by_role["speech_bed"].gain_db <= 0  # contrast
     assert by_role["gap"].lufs is None and by_role["gap"].gain_db == 0.0
+
+
+def _late_drop_music(arrangement: Arrangement, sr: int, late: dict[str, tuple[int, int]],
+                     riser: bool = False):  # fmt: skip
+    """Noise at each section's energy; for a section ID in `late`, (n, spill): its first
+    n bars are near-silent (with `riser`, all but the first rise to 10 dB down) and its
+    sound runs `spill` bars into the next section."""
+    rng = np.random.default_rng(3)
+    spans = section_spans(arrangement, sr)
+    bar = 2.0 * sr  # 120 BPM
+    music = np.zeros((spans[-1][2] + 4 * sr, 2), dtype=np.float32)
+    for section, start, end in spans:
+        level = 0.002 if section.silent else 0.02 + 0.3 * section.energy
+        music[start:end] = level * rng.standard_normal((end - start, 2))
+    for section, start, end in spans:
+        if section.id in late:
+            n, spill = late[section.id]
+            music[start : start + round(n * bar)] *= 0.01
+            if riser and n > 1:
+                music[start + round(bar) : start + round(n * bar)] *= 30.0
+            extra = round(spill * bar)
+            music[end : end + extra] = 0.32 * rng.standard_normal((extra, 2))
+    return music
+
+
+def test_a_late_drop_after_a_gap_moves_onto_its_downbeat() -> None:
+    arrangement, _, _ = _setup()
+    sr = 4000
+    drops = [s for s in arrangement.sections if s.role == "drop"]
+    music = _late_drop_music(
+        arrangement, sr, {drops[0].id: (2, 2), drops[1].id: (1, 0)}, riser=True
+    )  # a silent bar, then a riser bar: 2 bars late
+    fixes = late_entries(music, arrangement, sr, max_bars=4)
+    assert [(f.section_id, f.bars, f.mode) for f in fixes] == [
+        (drops[0].id, 2, "shift"),  # its spill into the breakdown moves back with it
+        (drops[1].id, 1, "fill"),
+    ]  # fmt: skip
+    out = music
+    for fix in fixes:
+        out = apply_entry_fix(out, fix, sr)
+    spans = {s.id: (a, b) for s, a, b in section_spans(arrangement, sr)}
+    for drop in drops:
+        levels = bar_levels_db(out, spans[drop.id][0], drop.bars, 2.0 * sr)
+        assert max(levels) - min(levels) < 1.0  # full from the first bar
+    breakdown_start = spans[drops[0].id][1]
+    after = bar_levels_db(out, breakdown_start, 4, 2.0 * sr)
+    assert max(after) - min(after) < 1.0  # no drop-level spill over the next section
+    assert np.array_equal(out[: spans[drops[0].id][0]], music[: spans[drops[0].id][0]])
+
+
+def test_soft_openings_and_disabled_fixes_are_left_alone() -> None:
+    arrangement, _, _ = _setup()
+    sr = 4000
+    drop = next(s for s in arrangement.sections if s.role == "drop")
+    music = _late_drop_music(arrangement, sr, {drop.id: (6, 0)})  # a deliberate soft start
+    assert late_entries(music, arrangement, sr, max_bars=4) == []
+    music = _late_drop_music(arrangement, sr, {drop.id: (2, 0)})
+    assert late_entries(music, arrangement, sr, max_bars=0) == []
+    spans = {s.id: (a, b) for s, a, b in section_spans(arrangement, sr)}
+    soft = _late_drop_music(arrangement, sr, {})
+    start = spans[drop.id][0]
+    soft[start : start + 2 * sr] *= 0.3  # one bar 10 dB down: a soft start, not a late one
+    assert late_entries(soft, arrangement, sr, max_bars=4) == []

@@ -43,6 +43,7 @@ speech2song arrange                 # sections on the bar grid; prints the timel
 speech2song generate                # backing-track takes (stub: free)
 speech2song generate --music-backend elevenlabs --dry-run   # Eleven Music: estimate first
 speech2song regenerate --section s3-s5 --note "less busy"   # redo sections (paid)
+speech2song regenerate --undo       # back to the take's previous version (free)
 speech2song mix                     # pick a take, then stems, master.wav, master.mp3
 speech2song mix --take 2            # mix another take (free); --take auto: best again
 speech2song run inputs/talk.mp3 --transcript inputs/talk.txt      # every step
@@ -125,7 +126,9 @@ section, or a range of neighbouring ones (`--section s3-s5`: build, gap and drop
 together), of the current take and keeps the rest unchanged, then re-mixes. It works on
 any take whose timing fits, even one made for an older request, and never runs
 `generate`. Each result is a new version of the take (`take_NNN_v2.mp3`, ...); earlier
-versions stay on disk.
+versions stay on disk, and `regenerate --undo` (free) goes back one version. If a
+regeneration comes back too much like the original, `--adherence medium` (or `low`)
+lets it differ more from the music around it.
 
 `mix` first checks every take that fits the arrangement (tempo, allowing half time; key;
 whether section levels follow the planned energy; loudness), writes
@@ -143,7 +146,11 @@ The music is shaped toward the arrangement first: a section whose loudness stray
 than `mix.energy_tolerance_db` from a line through the sections' median
 (`energy_range_db` from energy 0 to 1) is pulled back by the excess, at most
 `energy_max_db`. Silent sections are cut, leaving a short reverb tail of the music before
-them (`gap_reverb`). The speech bus sits `mix.speech_level_lu` above the music's
+them (`gap_reverb`). Generated drops often open with a silent bar and a riser; when the
+section after a gap opens near-silent and reaches full level within
+`late_entry_max_bars` (4), its music is taken from that many bars later, so it starts
+on the downbeat (and its spill into the next section goes back with it). The speech bus
+sits `mix.speech_level_lu` above the music's
 loudness, with a high-pass, gentle compression, and reverb/delay sends whose tails fade
 out before the next clip. The music ducks by `sidechain_duck_db` while speech plays.
 `--melody-layer` (on `mix` and `run`, sticky) adds the MIDI melody: `off` (the preset's

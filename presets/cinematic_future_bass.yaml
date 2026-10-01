@@ -102,6 +102,8 @@ mix:
   energy_tolerance_db: 3            # deviations within this are left alone
   energy_max_db: 6                  # largest correction per section (0 = no shaping)
   gap_reverb: 0.5                   # reverb tail level in silent sections (0 = none)
+  late_entry_max_bars: 4            # pull a drop that opens silent after a gap onto its
+                                    # downbeat, if it is at most this late (0 = off)
 
 # Speech-to-melody settings
 melody:

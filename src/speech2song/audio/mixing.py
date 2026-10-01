@@ -178,6 +178,82 @@ GAP_SOURCE_S = 1.0  # how much music before a gap feeds its reverb tail
 GAP_ROOM = 0.9
 
 
+LATE_ENTRY_DB = 15.0  # a section after a gap that opens this far below its median bar...
+ENTRY_DB = 6.0  # ...comes in at its first bar within this of the median
+SPILL_DB = 6.0  # the next section's first bars this close to the late section's level...
+SPILL_STEP_DB = 3.0  # ...and this much louder than the rest of it carry the late section
+SPLICE_S = 0.03  # equal-power crossfade where moved music meets the original
+
+
+@dataclass(frozen=True)
+class EntryFix:
+    """Music after a gap that came in `bars` bars late, and what the mix does about it:
+    "shift" takes the section (and its spill into the next one) from `bars` bars later;
+    "fill" replaces the quiet opening bars with the bars after them."""
+
+    section_id: str
+    bars: int
+    mode: Literal["shift", "fill"]
+    start: int  # samples: the moved stretch, taken from `offset` samples later
+    end: int
+    offset: int
+
+
+def bar_levels_db(music: np.ndarray, start: int, bars: int, bar: float) -> list[float]:
+    levels = []
+    for i in range(bars):
+        block = music[start + round(i * bar) : start + round((i + 1) * bar)]
+        rms = float(np.sqrt(np.mean(np.square(block)))) if len(block) else 0.0
+        levels.append(20 * math.log10(rms) if rms > 0 else -120.0)
+    return levels
+
+
+def late_entries(
+    music: np.ndarray, arrangement: Arrangement, sr: int, max_bars: int
+) -> list[EntryFix]:
+    """Sections right after a silent one that open near-silent and reach their full
+    level within `max_bars` bars: generated drops often open with a silent bar and a
+    riser, which after the mix's own gap leaves seconds of near-silence. Soft (not
+    near-silent) or longer openings are left alone as deliberate."""
+    bar = bar_seconds(arrangement.bpm) * sr
+    spans = section_spans(arrangement, sr)
+    fixes = []
+    for i, (section, start, end) in enumerate(spans):
+        if i == 0 or not spans[i - 1][0].silent or section.silent or max_bars <= 0:
+            continue
+        levels = bar_levels_db(music, start, section.bars, bar)
+        reference = float(np.median(levels))
+        if not levels or levels[0] >= reference - LATE_ENTRY_DB:
+            continue
+        late = next(n for n, level in enumerate(levels) if level >= reference - ENTRY_DB)
+        if late > max_bars or 2 * late > section.bars:
+            continue
+        offset = round(late * bar)
+        following = spans[i + 1] if i + 1 < len(spans) else None
+        spill = False
+        if following is not None and following[0].bars >= 2 * late:
+            after = bar_levels_db(music, end, following[0].bars, bar)
+            rest = float(np.median(after[late:]))
+            spill = min(after[:late]) >= max(reference - SPILL_DB, rest + SPILL_STEP_DB)
+        stop = end + offset if spill else start + offset
+        if stop + offset + round(SPLICE_S * sr) > len(music):
+            continue
+        fixes.append(EntryFix(section.id, late, "shift" if spill else "fill", start, stop, offset))
+    return fixes
+
+
+def apply_entry_fix(music: np.ndarray, fix: EntryFix, sr: int) -> np.ndarray:
+    """The music between `fix.start` and `fix.end`, taken `fix.offset` samples later,
+    crossfaded back into the original at the end."""
+    out = music.copy()
+    out[fix.start : fix.end] = music[fix.start + fix.offset : fix.end + fix.offset]
+    fade = round(SPLICE_S * sr)
+    t = np.linspace(0, np.pi / 2, fade, dtype=np.float32)[:, None]
+    moved = music[fix.end + fix.offset : fix.end + fix.offset + fade]
+    out[fix.end : fix.end + fade] = moved * np.cos(t) + music[fix.end : fix.end + fade] * np.sin(t)
+    return out
+
+
 def section_spans(arrangement: Arrangement, sr: int) -> list[tuple[Section, int, int]]:
     """Each section's first and end sample."""
     bar = bar_seconds(arrangement.bpm)

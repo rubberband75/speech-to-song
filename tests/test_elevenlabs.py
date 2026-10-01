@@ -477,6 +477,20 @@ def test_regenerate_one_section(cli: Cli, talk: Talk, eleven: Callable) -> None:
 
     bad = cli("regenerate", "--section", "s99", "--yes")
     assert bad.exit_code == 1 and "no section 's99'" in bad.output
+    assert "not both" in cli("regenerate", "--yes").output
+
+    result = cli("regenerate", "--undo")  # free: back to the first version
+    assert result.exit_code == 0, result.output
+    path = run.path(f"06_music/take_{chosen.chosen:03d}.meta.json")
+    meta = TakeMeta.model_validate_json(path.read_text())
+    assert meta.file == f"06_music/take_{chosen.chosen:03d}.mp3" and meta.song_id == original
+    assert meta.params["history"] == [] and meta.params["undone"][0]["section"] == drop.id
+    assert "▶ mix" in result.output and len(fake.compose_calls) == 3
+    assert "no earlier version" in cli("regenerate", "--undo").output
+    assert cli("regenerate", "--section", drop.id, "--yes").exit_code == 0
+    meta = TakeMeta.model_validate_json(path.read_text())
+    assert meta.file == f"06_music/take_{chosen.chosen:03d}_v3.mp3"  # v2 stays on disk
+    assert run.path(f"06_music/take_{chosen.chosen:03d}_v2.mp3").exists()
 
 
 def test_regenerate_a_range_of_an_older_take(cli: Cli, talk: Talk, eleven: Callable) -> None:
@@ -492,12 +506,13 @@ def test_regenerate_a_range_of_an_older_take(cli: Cli, talk: Talk, eleven: Calla
     roles = [s.role for s in arrangement.sections]
     ids = [s.id for s in arrangement.sections]
     first, last = ids[roles.index("build")], ids[roles.index("drop")]
-    result = cli("regenerate", "--section", f"{first}-{last}", "--yes")
+    result = cli("regenerate", "--section", f"{first}-{last}", "--adherence", "medium", "--yes")
     assert result.exit_code == 0, result.output
     assert len(fake.compose_calls) == 3 and "▶ generate" not in result.output
-    generated = [c["text"] for c in fake.compose_calls[-1]["composition_plan"]["chunks"]
+    generated = [c for c in fake.compose_calls[-1]["composition_plan"]["chunks"]
                  if "song_id" not in c]  # fmt: skip
-    assert generated == ["[Build]", "[Drop]"]
+    assert [c["text"] for c in generated] == ["[Build]", "[Drop]"]
+    assert {c["context_adherence"] for c in generated} == {"medium"}
     meta = TakeMeta.model_validate_json(run.path("06_music/take_001.meta.json").read_text())
     assert meta.params["edits"][0]["section"] == f"{first}-{last}"
     assert "using take 1 (requested)" in result.output

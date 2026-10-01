@@ -567,4 +567,5 @@ class MixReport(BaseModel):
     true_peak_dbtp: float
     section_levels: list[SectionLevel] = []
     silenced: list[str] = []  # silent sections (gaps), muted in the mix
+    late_entries: list[dict[str, Any]] = []  # sections pulled onto their downbeat
     warnings: list[str] = []

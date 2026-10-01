@@ -316,7 +316,10 @@ class ElevenLabsBackend:
             raise StageError("the inpainting plan breaks the API limits: " + "; ".join(problems))
         output_format = meta.params.get("output_format", self.config.elevenlabs.output_format)
         version = len(meta.params.get("history", [])) + 2
-        path = out_dir / f"take_{meta.take:03d}_v{version}{audio_extension(output_format)}"
+        extension = audio_extension(output_format)
+        while (out_dir / f"take_{meta.take:03d}_v{version}{extension}").exists():
+            version += 1  # an undone version keeps its file
+        path = out_dir / f"take_{meta.take:03d}_v{version}{extension}"
         say(f"  take {meta.take}: regenerating {section} "
             f"({span_ms[0] / 1000:.1f}-{span_ms[1] / 1000:.1f} s), keeping the rest")  # fmt: skip
         response, usd = self._compose(plan, meta.model or self.config.music_model,

@@ -20,12 +20,15 @@ from speech2song.audio.dsp import db_to_gain, duck_gain, loudness_lufs, master
 from speech2song.audio.io import require_tool
 from speech2song.audio.mixing import (
     COMP_ABOVE_LU,
+    EntryFix,
     NoteEvent,
+    apply_entry_fix,
     delay_seconds,
     energy_gains,
     gain_curve,
     gap_mask,
     gap_tail,
+    late_entries,
     melody_notes,
     place_clips,
     section_spans,
@@ -93,9 +96,13 @@ def render_notes(
 
 def shape_music(
     music: np.ndarray, arrangement: Arrangement, spec: MixSpec, sr: int
-) -> tuple[np.ndarray, list[SectionLevel], list[str]]:
-    """The music pulled toward the arrangement's energy, with gaps cut to a reverb tail.
-    Returns it, each section's levels and gain, and the silenced section IDs."""
+) -> tuple[np.ndarray, list[SectionLevel], list[str], list[EntryFix]]:
+    """The music pulled toward the arrangement's energy, with late entries after gaps
+    moved onto their downbeat and gaps cut to a reverb tail. Returns it, each section's
+    levels and gain, the silenced section IDs, and the entry fixes."""
+    fixes = late_entries(music, arrangement, sr, spec.late_entry_max_bars)
+    for fix in fixes:
+        music = apply_entry_fix(music, fix, sr)
     spans = section_spans(arrangement, sr)
     energies = [(a + b) / 2 for a, b in energy_bounds(arrangement.sections)]
     levels = [None if section.silent else loudness_lufs(music[start:end], sr)
@@ -121,7 +128,8 @@ def shape_music(
         for (section, _, _), energy, level, target, gain
         in zip(spans, energies, levels, targets, gains, strict=True)
     ]  # fmt: skip
-    return shaped.astype(np.float32), report, [s.id for s, _, _ in spans if s.silent]
+    silenced = [s.id for s, _, _ in spans if s.silent]
+    return shaped.astype(np.float32), report, silenced, fixes
 
 
 def write_mp3(wav: Path, mp3: Path) -> None:
@@ -145,7 +153,7 @@ def _db(value: float | None) -> str:
 
 class MixStage(Stage):
     name: ClassVar[str] = "mix"
-    version: ClassVar[int] = 2  # 2: energy shaping and silent gaps
+    version: ClassVar[int] = 3  # 2: energy shaping and silent gaps; 3: late entries
 
     def plan(self, ctx: Context) -> StagePlan:
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
@@ -202,7 +210,7 @@ class MixStage(Stage):
                              {k: len(a) for k, a in audio.items()}, sr)  # fmt: skip
         dry = speech_stem(placed, audio, frames, clip_set.channels)
         warnings: list[str] = []
-        music, levels, silenced = shape_music(music, arrangement, spec, sr)
+        music, levels, silenced, fixes = shape_music(music, arrangement, spec, sr)
 
         # Levels: speech sits speech_level_lu above the music's loudness.
         music_lufs = loudness_lufs(music, sr)
@@ -280,12 +288,19 @@ class MixStage(Stage):
             integrated_lufs=round(mastered.lufs, 3),
             true_peak_dbtp=round(mastered.true_peak_db, 3), section_levels=levels,
             silenced=silenced, warnings=warnings,
+            late_entries=[{"section_id": f.section_id, "bars": f.bars, "mode": f.mode}
+                          for f in fixes],
         )  # fmt: skip
         write_json(ctx.run.path(MIX_REPORT), report)
         for warning in warnings:
             ctx.say(f"[yellow]  {warning}[/]")
         changed = [f"{level.section_id} {level.gain_db:+.1f} dB" for level in levels
                    if level.gain_db]  # fmt: skip
+        for fix in fixes:
+            how = ("taken from that much later, with its spill into the next section"
+                   if fix.mode == "shift" else "filled with the bars after them")  # fmt: skip
+            ctx.say(f"  {fix.section_id} came in {fix.bars} bar(s) late after the gap: "
+                    f"{how}")  # fmt: skip
         ctx.say(f"  music shaped toward the arrangement: {', '.join(changed) or 'no changes'}"
                 + (f"; silenced {', '.join(silenced)}" if silenced else ""))  # fmt: skip
         ctx.say(f"  music {_db(music_lufs)} LUFS · speech {_db(speech_lufs)} LUFS dry, "

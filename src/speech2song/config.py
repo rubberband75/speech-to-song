@@ -105,6 +105,9 @@ class MixSpec(_Strict):
     energy_tolerance_db: float = Field(default=3.0, ge=0)
     energy_max_db: float = Field(default=6.0, ge=0)
     gap_reverb: float = Field(default=0.5, ge=0, le=1)  # reverb tail level in silent sections
+    # A section after a gap whose first 1-N bars are near-silent (a generated drop that
+    # opens with a silent bar and a riser) is pulled onto its downbeat (0 turns this off).
+    late_entry_max_bars: int = Field(default=4, ge=0, le=8)
 
 
 class MelodySpec(_Strict):

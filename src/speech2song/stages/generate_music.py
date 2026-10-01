@@ -277,9 +277,13 @@ def current_take(ctx: Context) -> TakeMeta:
     return TakeMeta.model_validate_json(meta_path.read_text(encoding="utf-8"))
 
 
-def regenerate_sections(ctx: Context, specs: list[str], note: str | None) -> TakeMeta | None:
+def regenerate_sections(
+    ctx: Context, specs: list[str], note: str | None, adherence: str | None = None
+) -> TakeMeta | None:
     """Inpaint neighbouring sections of the current take (paid): estimate, confirm, call,
-    and make the result the take's new version. Returns None on a dry run."""
+    and make the result the take's new version. `adherence` overrides the config's
+    context_adherence for this call (lower lets the new part differ more from the old).
+    Returns None on a dry run."""
     from speech2song.backends.music_base import take_grid
     from speech2song.backends.music_elevenlabs import ElevenLabsBackend
     from speech2song.costs import confirm_spend
@@ -300,7 +304,7 @@ def regenerate_sections(ctx: Context, specs: list[str], note: str | None) -> Tak
                        "generate` first.")  # fmt: skip
     try:
         section_ids = expand_sections(arrangement, specs)
-        adherence = ctx.config.elevenlabs.context_adherence
+        adherence = adherence or ctx.config.elevenlabs.context_adherence
         plan, span = inpaint_plan(arrangement, preset, meta.song_id, section_ids, note,
                                   context_adherence=adherence)  # fmt: skip
     except ValueError as exc:
@@ -315,8 +319,32 @@ def regenerate_sections(ctx: Context, specs: list[str], note: str | None) -> Tak
                     f"({(span[1] - span[0]) / 1000:.1f} s new; priced as the whole song)",
     )  # fmt: skip
     ctx.say(f"Regenerating {label} ({span[0] / 1000:.1f}-{span[1] / 1000:.1f} s) of take "
-            f"{meta.take}; the rest of the take is kept as it is.")  # fmt: skip
+            f"{meta.take} (context adherence {adherence}); the rest of the take is kept as "
+            "it is.")  # fmt: skip
     if not confirm_spend([estimate], console=ctx.console, yes=ctx.yes, dry_run=ctx.dry_run):
         return None
     return backend.inpaint(plan, meta, ctx.run.path(MUSIC_DIR), ctx.run.root,
                            section=label, note=note, span_ms=span, say=ctx.say)  # fmt: skip
+
+
+def undo_regeneration(ctx: Context) -> TakeMeta:
+    """Step the current take back to its previous version (free). The undone version's
+    audio stays on disk and is listed under `undone` in the take's meta."""
+    meta = current_take(ctx)
+    history = list(meta.params.get("history") or [])
+    if not history:
+        raise S2SError(f"Take {meta.take} has no earlier version to go back to.")
+    previous = history.pop()
+    edits = list(meta.params.get("edits") or [])
+    last_edit = edits.pop() if edits else {}
+    undone = [*meta.params.get("undone", []),
+              {"file": meta.file, "song_id": meta.song_id, **last_edit}]  # fmt: skip
+    info = probe(ctx.run.path(previous["file"]))
+    updated = meta.model_copy(update={
+        "file": previous["file"], "song_id": previous["song_id"],
+        "seconds": round(info.duration_s or meta.seconds, 3),
+        "params": {**meta.params, "history": history, "edits": edits, "undone": undone},
+    })  # fmt: skip
+    write_json(ctx.run.path(take_meta_path(meta.take)), updated)
+    ctx.say(f"Take {meta.take} is back to {previous['file']} (undid {meta.file}).")
+    return updated
