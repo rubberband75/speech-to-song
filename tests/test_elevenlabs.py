@@ -157,7 +157,8 @@ def test_inpainting_a_range_follows_the_plan_chunks() -> None:
     generated = [c for c in plan["chunks"] if "song_id" not in c]
     assert [c["text"] for c in generated] == ["[Build]", "[Drop]"]  # the gap rides with the build
     assert generated[0]["duration_ms"] == bounds[ids[build + 1]][1] - bounds[ids[build]][0]
-    assert "steadily building" in generated[0]["positive_styles"]
+    assert {"steadily building", "rising energy throughout, from moderate to intense"} <= set(
+        generated[0]["positive_styles"])  # fmt: skip
     kept = [c["range"] for c in plan["chunks"] if "song_id" in c]
     assert kept[0] == {"start_ms": 0, "end_ms": start}
     assert kept[-1]["end_ms"] == section_bounds_ms(arrangement)[-1][2]

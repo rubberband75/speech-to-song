@@ -138,8 +138,8 @@ def tempo_and_key(arrangement: Arrangement, preset: Preset) -> list[str]:
 
 
 def shape_styles(section: Section) -> list[str]:
-    if section.shape == "rise":
-        return ["steadily building"]
+    if section.shape == "rise":  # "steadily building" alone gave a near-silent inpainted build
+        return ["steadily building", "rising energy throughout, from moderate to intense"]
     if section.shape == "fall":
         return ["fading out to silence at the end"]
     return []
