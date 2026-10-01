@@ -1,5 +1,31 @@
 # Decisions Log
 
+## Status (2026-10-01)
+
+M0–M3 are done and committed: scaffold `25794b6`, ingest/transcribe/align `43b48a4`, clip selection `0f23069` + `b12e1ac`, melody `31c114c`. Next is **M4: offline end-to-end** (arrangement, stub music backend, mixer). Total paid spend so far: $0.0548 (one Claude call).
+
+Runs on the sample talk (gitignored, local only):
+- `runs/20261001-004912-come-home-by-elder-clark-g-gilbe`: complete through `melody`. Official transcript aligned. Clips were selected by a live Opus 5.5 call (already paid for; it's cached, so re-running `select` costs nothing unless its inputs change). Listening files are in `04_listen/`.
+- `runs/20261001-011340-come-home-by-elder-clark-g-gilbe`: same input with `--isolate-voice` (demucs), complete through `transcribe`.
+
+## Open questions
+
+Raised in milestone summaries and not yet decided. Settle each one when the milestone it belongs to comes up.
+
+- **Clip length after cutting (M4).** Length limits are checked on the selected sentences (word timestamps), but cut points can add up to about 0.7 s around them. On the live run, `c1` is 14.4 s as selected and 15.1 s as cut, over the 15 s maximum. Should `max_seconds` apply to the final cut?
+- **Flat melodies (M6).** The speaker stays within about 4 semitones, so phrases repeat notes (F F F F). Possible fix: a `melody.contour_gain` that widens pitch movement around the median before snapping.
+- **Weak key detection.** Speech isn't tonal: the confidence is 0.25 on the sample talk, so the preset's minor-mode preference effectively picks between relative keys. `--key` overrides it. Revisit if the generated music clashes.
+- **Melody density.** Speech has about 4–5 syllables per second, but the melody has 1–2 notes per second after 1/8-grid quantizing. Whether it still sounds like the speaker's phrase hasn't been judged by ear yet.
+- **Static chords.** Notes cluster on the tonic, so chord choices lean heavily on i. This probably matters little once the generated track carries the harmony (M5).
+- **Sentences without pauses.** About 5% of sentence boundaries in the sample talk have no pause, so the cut lands on speech (around −28 dBFS). The cut level is shown per clip; review could flag those clips.
+- **Small ASR drops without a transcript.** Gap repair catches gaps of 3 s or more holding at least 1.5 s of speech. Smaller drops show up as "unspoken" only when an official transcript exists.
+- **Paths tested only with fakes:** the validation retry, the server-side refusal fallback, and audio playback during review.
+- **Cost estimates.** The input estimate (2.2 characters per token) is calibrated on one talk. The output estimate was about 3× the actual for Opus 5.5, which is conservative.
+- **demucs quality** hasn't been judged by ear. Isolation left the transcript unchanged.
+- **ElevenLabs (M5).** The model IDs (`music_v2`, `music_v2_5`), duration limits, Audio Reference support and pricing are unverified until the docs are read.
+
+## Decisions
+
 Record accepted changes to docs/SPEC.md here, newest first.
 
 | Date | Decision | Reason |
