@@ -2,7 +2,7 @@
 
 ## Status (2026-10-01)
 
-M0–M4 are done and committed: scaffold `25794b6`, ingest/transcribe/align `43b48a4`, clip selection `0f23069` + `b12e1ac`, melody `31c114c`, offline end-to-end `a66330b`. **M5 (ElevenLabs)** is built and committed in the commit after `1ca54ef`. It covers composition-plan generation, take analysis and choice, and inpainting (`regenerate`). One live run has been made. Total paid spend so far: $1.1274 (Claude $0.1089 for two Opus 5.5 selections; ElevenLabs $1.0185 estimated for two 3.4-minute takes).
+M0–M4 are done and committed: scaffold `25794b6`, ingest/transcribe/align `43b48a4`, clip selection `0f23069` + `b12e1ac`, melody `31c114c`, offline end-to-end `a66330b`. **M5 (ElevenLabs)** is built and committed (`ecb42a3`). It covers composition-plan generation, take analysis and choice, and inpainting (`regenerate`). One live run has been made. Total paid spend so far: $1.1274 (Claude $0.1089 for two Opus 5.5 selections; ElevenLabs $1.0185 estimated for two 3.4-minute takes).
 
 Runs on the sample talk (gitignored, local only):
 - `runs/20261001-004912-come-home-by-elder-clark-g-gilbe`: complete through `mix` with **ElevenLabs take 1** (music_v2_5, 119 BPM, D minor). Listen to `07_mix/master.wav` (or `.mp3`); the raw takes are `06_music/take_001.mp3` and `take_002.mp3`, and `06_music/analysis.json` has the checks. Clips were re-selected by Opus 5.5 on 2026-10-01 ($0.0541). `regenerate` has not been run live.
