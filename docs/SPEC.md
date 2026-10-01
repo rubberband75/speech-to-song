@@ -1,0 +1,299 @@
+# Speech-to-Song: Project Specification
+
+A command-line tool that takes a spoken-word recording (a lecture or conference talk), uses AI to choose the best lines, extracts a melody from the speech, generates a backing track around those lines, and mixes everything into a finished song. Reference inspiration: electronic tracks that weave philosophical lecture excerpts into cinematic future-bass music.
+
+This document is the source of truth. If implementation reveals a problem with the spec, stop and propose a change rather than silently diverging.
+
+---
+
+## 1. Goals and non-goals
+
+### Goals
+1. Input: one audio or video file, plus an optional official transcript (plain text).
+2. Claude selects the strongest self-contained lines and proposes an ordering.
+3. Selected clips are kept **bit-exact apart from short edge fades**. They are cut from the source and mixed locally. They never pass through a generative model.
+4. Extract a melody from the cadence and pitch of the spoken clips (the speech-to-song illusion), snap it to a key, and use it to inform the backing track.
+5. Generate the backing track with ElevenLabs Music, arranged so the music recedes during speech and swells between ideas.
+6. Mix locally with sidechain ducking, effects and loudness normalization.
+7. Style is driven by swappable preset files (first preset: cinematic future bass; later: soft piano, lofi).
+8. Every stage writes its outputs to disk, so any stage can be rerun alone.
+9. Paid API calls are visible, estimated before they run, and logged.
+
+### Non-goals (for now)
+- No downloading from YouTube or any other site. Input is always a local file.
+- No GUI or web app. CLI only.
+- No real-time or streaming processing.
+- No training or fine-tuning of models.
+- No generated singing vocals or lyrics. Voice in the song is the speaker only.
+
+---
+
+## 2. Principles
+
+- **Exact speech.** Clips are sample-accurate slices of the (optionally cleaned) source. Only short edge fades and level changes are allowed by default. Pitch correction is an explicit opt-in "stylize" mode, off by default.
+- **Cache everything.** Each stage reads files from a run directory and writes files back. A stage is skipped if its outputs exist and its inputs are unchanged (use content hashes in a `manifest.json`), unless `--force` is passed.
+- **Cheap before expensive.** Local and free stages come first. Paid calls happen only in the Claude steps and the ElevenLabs music step.
+- **Cost safety.** Every paid stage supports `--dry-run` (prints an estimate, makes no calls) and asks for confirmation unless `--yes` is passed. All spending is appended to `costs.json` in the run directory.
+- **Swappable backends.** Music generation sits behind an interface with at least two implementations: `elevenlabs` and `stub` (a local placeholder generator that produces simple tones/noise at the right key and tempo, so the whole pipeline can be developed and tested without spending credits).
+- **No secrets in code.** Keys come from environment variables or a `.env` file that is gitignored.
+
+---
+
+## 3. Tech stack
+
+- Python 3.11+, managed with `uv` (or `venv` + pip). Package layout under `src/`.
+- CLI: `typer`.
+- Config and presets: YAML, validated with `pydantic`.
+- Audio I/O and processing: `ffmpeg` (system), `soundfile`, `numpy`, `scipy`, `librosa`, `pyloudnorm`.
+- Transcription and alignment: `faster-whisper` or `whisperx` (local) as default. Optional ElevenLabs Scribe backend. Official-transcript alignment via fuzzy token alignment (`rapidfuzz` or `difflib`).
+- Voice cleanup (optional): `demucs` locally. Optional ElevenLabs voice isolation backend.
+- Pitch tracking: `librosa.pyin` first; `torchcrepe` as an optional upgrade.
+- Symbolic music: `pretty_midi`. Rendering: `pyfluidsynth` or the `fluidsynth` CLI with a General MIDI soundfont.
+- Mixing and effects: `pedalboard`.
+- APIs: `anthropic` SDK, `elevenlabs` SDK.
+- Tests: `pytest`. Lint/format: `ruff`.
+
+Pin versions in `pyproject.toml`. Do not add heavy dependencies without noting why.
+
+---
+
+## 4. Repository layout
+
+```
+speech-to-song/
+  CLAUDE.md                 # short rules for Claude Code
+  README.md                 # user-facing quickstart
+  pyproject.toml
+  .env.example
+  .gitignore
+  docs/
+    SPEC.md                 # this file
+    DECISIONS.md            # log of design decisions and changes to the spec
+  presets/
+    cinematic_future_bass.yaml
+    soft_piano.yaml         # later
+    lofi.yaml               # later
+  src/speech2song/
+    __init__.py
+    cli.py                  # typer app: one command per stage plus `run`
+    config.py               # settings, env loading, preset schema (pydantic)
+    manifest.py             # run dir, hashing, caching, costs.json
+    models.py               # pydantic models for all JSON artifacts
+    stages/
+      ingest.py
+      transcribe.py
+      align.py
+      select_clips.py
+      melody.py
+      arrange.py
+      generate_music.py
+      mix.py
+    backends/
+      music_base.py         # MusicBackend interface
+      music_elevenlabs.py
+      music_stub.py
+      transcribe_whisper.py
+      transcribe_scribe.py  # optional
+    audio/
+      io.py
+      pitch.py
+      theory.py             # key detection, scale snapping, chord fitting
+      dsp.py                # ducking, fades, loudness
+    llm/
+      claude.py             # thin wrapper: JSON output, retries, token/cost logging
+      prompts/
+        select_clips.md
+        arrange.md
+  tests/
+    fixtures/               # tiny synthetic audio only, no copyrighted material
+  inputs/                   # gitignored: user's source audio/video/transcripts
+  runs/                     # gitignored: one subdirectory per run
+```
+
+---
+
+## 5. Run directory and artifacts
+
+Each run lives in `runs/<run_id>/` (`run_id` = timestamp plus short source slug). Contents:
+
+```
+runs/<run_id>/
+  manifest.json          # inputs, stage status, hashes, settings snapshot
+  costs.json             # append-only log of paid calls (service, model, units, est. USD)
+  00_source.wav          # normalized mono/stereo 44.1 kHz source audio
+  01_clean.wav           # optional voice-isolated version (else symlink/copy of 00)
+  02_transcript.json
+  03_clips.json
+  clips/clip_001.wav ...
+  04_melody.json
+  04_melody.mid
+  04_melody_reference.wav
+  05_arrangement.json
+  06_music/take_001.mp3 + take_001.meta.json ...
+  06_music/selected.wav
+  07_mix/stems/{speech.wav,music.wav,melody_layer.wav}
+  07_mix/master.wav
+```
+
+---
+
+## 6. Stages in detail
+
+### Stage 1: Ingest
+- Accept audio or video. Use `ffmpeg` to extract audio and write `00_source.wav` (44.1 kHz, 24-bit or float, keep stereo if present, also make a mono analysis copy in memory).
+- Optional `--isolate-voice`: run `demucs` (or ElevenLabs isolation backend) to produce `01_clean.wav`. Pitch tracking and clip cutting use the clean version; keep the original for reference.
+- Record duration, sample rate, channels, loudness in the manifest.
+
+### Stage 2: Transcribe and align
+- Run local Whisper (default) to get word-level timestamps and confidence. Output `02_transcript.json`:
+  ```json
+  {
+    "source": "inputs/talk.mp3",
+    "duration_s": 1234.5,
+    "language": "en",
+    "words": [{"w": "Hello", "start": 0.12, "end": 0.40, "conf": 0.98}],
+    "sentences": [{"id": 1, "text": "...", "start": 0.12, "end": 4.30}],
+    "official_transcript_used": false
+  }
+  ```
+- If an official transcript is supplied: normalize both texts (case, punctuation, numerals, hyphens), align ASR tokens to official tokens with sequence alignment, and transfer timestamps to the official words. Where alignment fails, keep the ASR word and flag it. The `sentences` come from the official text when available.
+- Report an alignment quality score (fraction of official words matched).
+
+### Stage 3: Clip selection (Claude)
+- Input to Claude: sentence-level transcript with start/end times (not word-level, to save tokens), the preset's description, and target parameters (number of clips, min/max seconds, total speech seconds budget).
+- Claude must return **strict JSON** matching `models.ClipSelection`:
+  ```json
+  {
+    "clips": [
+      {"id": "c1", "start_sentence": 12, "end_sentence": 13,
+       "text": "...", "score": 0.93,
+       "role": "hook|build|payoff|breakdown|outro",
+       "reason": "why this works as a standalone line"}
+    ],
+    "suggested_order": ["c3", "c1", "c4"],
+    "notes": "optional overall guidance"
+  }
+  ```
+- Selection criteria in the prompt: self-contained, punchy, emotionally or philosophically resonant, clean start and end, avoids references that need earlier context, avoids applause/laughter/hymn segments, varied in pace and idea, total duration within budget.
+- Convert sentence ranges to time ranges, then **refine boundaries in code**: search within about +/-150 ms of each boundary for the lowest-energy frame, never cut inside a word, and apply short fades (default 15 ms, configurable, 0 allowed). Write `03_clips.json` and the WAV files in `clips/`.
+- Validate: every clip duration within bounds, no overlaps, quote text actually matches the transcript for that range (reject hallucinated ranges and retry once with feedback).
+- Support `--interactive-review`: print clips with text and timestamps; let the user drop, reorder or audition (writes preview WAVs) before continuing.
+
+### Stage 4: Melody extraction (speech-to-song)
+For each clip:
+1. Track F0 with pYIN across the clip (voiced/unvoiced), smooth with median filtering, and remove octave jumps.
+2. Segment into note events using word and syllable boundaries (word timestamps from stage 2, split further at energy/voicing dips). Each segment's pitch = duration-weighted median of voiced frames, converted to MIDI note numbers.
+3. Estimate the key across all clips (Krumhansl-Schmuckler profiles on a duration-weighted pitch-class histogram). Prefer the preset's mode (minor/major) as a prior; allow `--key` override.
+4. Snap notes to the scale using `scale_snap_strength` (0 = raw contour, 1 = fully snapped), keep octave in a sensible vocal-melody range.
+5. Quantize rhythm to the preset grid at the chosen tempo. Tempo selection: search BPM within the preset's tolerance to minimize total misalignment of clip start/end times to the bar grid (or beats), since speech clips are not time-stretched.
+6. Optionally repeat each phrase `loop_phrase_count` times in the melody layer (repetition is key to the speech-to-song illusion).
+7. Derive a simple chord progression by choosing, per bar, the diatonic triad that best covers the melody notes (with a bias toward common progressions).
+8. Outputs: `04_melody.json` (key, bpm, notes, chords per clip), `04_melody.mid`, and `04_melody_reference.wav` rendered via FluidSynth (soft piano by default). The reference WAV is intentionally short (a loop or two of the main phrase), since it will be used as an Audio Reference for generation.
+
+Optional "stylize" mode (off by default): gently pitch-correct the spoken clips toward the scale with PSOLA (`parselmouth`) or `pyrubberband`, at a configurable strength. Output to separate files, never overwrite the exact clips.
+
+### Stage 5: Arrangement
+- Place clips on a bar-aligned timeline using the order from stage 3 (or the user's edited order). Insert sections from the preset's `arc` and `section_roles`: intro, speech beds under clips, builds, gaps, drops, breakdowns, outro.
+- Claude may be asked (optional, cheap call) to refine the arc given the clip texts, e.g. place the most climactic line just before the main drop. Output must be strict JSON.
+- Output `05_arrangement.json`:
+  ```json
+  {
+    "bpm": 114, "key": "C minor", "time_signature": "4/4",
+    "sections": [
+      {"id": "s1", "role": "intro", "start_bar": 0, "bars": 8, "energy": 0.15,
+       "styles": ["..."], "clip_id": null},
+      {"id": "s2", "role": "speech_bed", "start_bar": 8, "bars": 4,
+       "energy": 0.2, "styles": ["..."], "clip_id": "c3", "clip_offset_beats": 0}
+    ],
+    "total_bars": 96, "total_seconds": 202.1
+  }
+  ```
+- Print an ASCII timeline of the arrangement for review. Support `--stop-after arrange` so the user can approve before spending on music generation.
+
+### Stage 6: Backing track generation
+- Backend interface: `generate(arrangement, preset, melody_reference) -> list[Take]`, with a `Take` containing audio path, metadata, cost and (when available) a stored-song ID for inpainting.
+- **ElevenLabs backend.** Use the official `elevenlabs` Python SDK. Models: `music_v2` and `music_v2_5` (configurable). Build a composition plan from the arrangement: one or more sections per arrangement section, with durations matching the bars, global positive/negative styles from the preset, and local styles per section role. Before writing this code, **read the current ElevenLabs Music docs** (composition plans, `compose`, `compose_detailed` with `store_for_inpainting`, `music.upload`, Audio Reference, inpainting) and use the real field names. Do not guess the schema. Note documented duration limits (single generation vs composition-plan generation) and chunk limits, and split long arrangements accordingly.
+- Attach the melody reference as Audio Reference if the API supports it for this model; treat it as a soft guide, not a guarantee.
+- Handle the copyrighted-material error: prompts must contain no artist or song names; if the API returns a suggested plan, log it and surface it.
+- Generate `n_takes` (default 2). Save every take with its metadata. Use `store_for_inpainting` so sections can be regenerated later.
+- **Analysis of each take** (librosa): estimated tempo (and half/double-time ambiguity), key, section energy contour, and loudness. Compare with targets. Flag takes whose key/tempo drift past tolerance. Optionally correct small drift locally (pitch-shift or time-stretch the music only, never the speech).
+- **Inpainting loop**: `speech2song regenerate --section s5 --note "less busy"` regenerates just that section while keeping the rest, using audio reference chunks. Keep this behind a flag until the basic flow works.
+- **Stub backend**: produces a placeholder track at the arrangement's tempo and key (chord pads, kick on beats, energy envelope per section) using numpy/pedalboard. Used for tests and for developing the mixer for free.
+
+### Stage 7: Mix and master
+- Build the speech track: clips placed on the timeline at sample-accurate positions (start of the matching speech_bed section plus offset), original audio untouched except for edge fades.
+- Music ducking: compute a speech envelope (RMS with attack/release), derive gain reduction (preset `sidechain_duck_db`, attack, release), and apply to the music bus. Also allow the arrangement's own sparse sections to do most of the work.
+- Speech processing chain (`pedalboard`): high-pass, gentle compression, optional EQ, reverb and delay sends per preset. Reverb/delay tails must not clip the next clip's start.
+- Optional melody layer: the rendered melody reference mixed low under or over the track in the matching key, per preset.
+- Master: limiter, loudness normalization to preset target (default -14 LUFS), true-peak ceiling -1 dBTP.
+- Outputs: `master.wav` (24-bit), `master.mp3`, and stems.
+
+---
+
+## 7. CLI
+
+```
+speech2song run INPUT [--transcript FILE] [--preset NAME] [--isolate-voice]
+                      [--clips N] [--music-backend elevenlabs|stub]
+                      [--dry-run] [--yes] [--stop-after STAGE] [--force]
+speech2song ingest | transcribe | select | melody | arrange | generate | mix  (each takes --run RUN_ID)
+speech2song regenerate --run RUN_ID --section SECTION_ID [--note TEXT]
+speech2song costs --run RUN_ID
+speech2song presets list
+```
+
+Every command prints what it read, what it wrote, and any estimated or actual spend.
+
+---
+
+## 8. Configuration
+
+- `.env`: `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY`. Never log keys.
+- `config.yaml` (optional, gitignored): default models and paths, e.g.
+  `claude_model: claude-sonnet-5-5` (override with `claude-opus-5-5` for harder selection tasks), `music_model: music_v2_5`, `transcribe_backend: whisper`, `whisper_model: small`.
+- Presets in `presets/*.yaml` validated by a pydantic schema (see `presets/cinematic_future_bass.yaml` for the first one).
+
+---
+
+## 9. Cost tracking
+
+- `claude.py` logs input/output tokens per call and computes USD from a configurable price table (do not hardcode prices without a config override; prices change).
+- ElevenLabs cost is estimated from minutes generated times a configurable rate, and logged as an estimate. Credits-based plans differ from per-minute API rates, so both rate and unit are configurable.
+- `--dry-run` prints: expected Claude tokens and USD, expected music minutes, takes and USD, and the total, then exits.
+- Confirmation prompt before any paid call unless `--yes`.
+- Expected scale: roughly 40-50k Claude input tokens and 8-10k output tokens per song, plus a few minutes of music generation including retries.
+
+---
+
+## 10. Testing strategy
+
+- Unit tests with synthetic fixtures only (generated sine sweeps, noise bursts, synthetic "speech-like" pitched tones). Do not commit copyrighted audio.
+- Tests for: boundary snapping, transcript alignment, key detection on known scales, scale snapping, bar-grid tempo search, arrangement timeline math, ducking envelope, LUFS targeting.
+- Mock the Anthropic and ElevenLabs clients in tests; no network in CI.
+- One end-to-end test that runs the whole pipeline with the stub backend and a mocked Claude response, asserting that the clip audio inside `speech.wav` is sample-identical to the cut clips (aside from fades).
+
+---
+
+## 11. Milestones
+
+- **M0 Scaffold:** project layout, config, manifest/caching, cost logging, CLI skeleton, preset loading, `.env` handling, tests run.
+- **M1 Ingest, transcribe, align:** working on a real talk with and without an official transcript.
+- **M2 Clip selection:** Claude JSON selection with validation, boundary snapping, review mode, `--dry-run`.
+- **M3 Melody:** pitch tracking, key detection, MIDI and reference WAV output; a small listening-test notebook or script.
+- **M4 Offline end-to-end:** arrangement, stub music backend, mixer. A full song from a talk with zero music-API spend.
+- **M5 ElevenLabs:** composition-plan generation, analysis, take selection, inpainting regeneration.
+- **M6 Styles and polish:** soft piano and lofi presets, stylize mode, README, better review UX.
+
+Work one milestone at a time. After each, summarize what was built, what was tested, and what is uncertain.
+
+---
+
+## 12. Risks and open questions
+
+- Whether Audio Reference meaningfully follows a supplied melody (likely a soft guide only). Keep the local melody layer as a fallback so the melody is guaranteed.
+- Whether preserved audio chunks in inpainting can sit under speech inside a generation. Not assumed; speech is mixed locally.
+- Pitch tracking on noisy or reverberant recordings. Voice isolation helps; expose a confidence threshold.
+- Tempo ambiguity (half-time vs double-time) in generated music. Analysis must handle both.
+- Generated tracks may not match the requested key exactly. Plan for local pitch/time correction on the music only.
+- Rights: source recordings are copyrighted. The tool is for personal experimentation; releasing a track needs permission from rights holders and compliance with ElevenLabs' music terms for the user's plan.
+- ElevenLabs API surface (model IDs, plan schema, limits, pricing) changes. Read current docs before coding stage 6 and again if calls fail.

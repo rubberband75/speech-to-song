@@ -1,0 +1,70 @@
+[project]
+name = "speech2song"
+version = "0.1.0"
+description = "Turn a spoken-word recording into a finished electronic song."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "faster-whisper==1.2.1",
+    "numpy==2.5.3",
+    "pydantic==2.13.5",
+    "python-dotenv==1.2.4",
+    "pyyaml==6.0.3",
+    "rapidfuzz==3.14.6",
+    "rich==15.0.0",
+    "soundfile==0.14.0",
+    "typer==0.27.2",
+]
+
+[project.scripts]
+speech2song = "speech2song.cli:main"
+
+[project.optional-dependencies]
+isolate = [
+    "demucs==4.1.0",
+    "torch==2.14.1",
+]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.16.9",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.21,<0.13"]
+build-backend = "uv_build"
+
+# Intel Macs are excluded from lock resolution: PyTorch no longer ships wheels for them,
+# and demucs 4.1 pins numpy<2 there, which conflicts with the numpy pin above.
+[tool.uv]
+environments = ["sys_platform != 'darwin' or platform_machine != 'x86_64'"]
+
+# torch (isolate extra) comes from the CPU-only index: the default PyPI wheel for
+# Linux pulls ~3 GB of CUDA libraries, and this project runs on CPU.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "PTH", "N", "C4"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -m 'not integration'"
+markers = [
+  "integration: uses real ML models (downloads weights on first run); run with `pytest -m integration`",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.16.9",
+]

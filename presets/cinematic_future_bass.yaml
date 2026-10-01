@@ -1,0 +1,89 @@
+# Style preset: cinematic future bass / midtempo bass with ambient + psychedelic elements
+# Derived from a written description of the reference track (not from listening to it).
+# Tempo/key values are starting points; the pipeline verifies output with librosa.
+
+name: cinematic_future_bass
+description: >
+  Meditative spoken word over spacious ambient electronica that builds into
+  warm, rubbery half-time bass drops, then recedes to give the speech room.
+
+tempo:
+  bpm: 114            # starting point; treat as adjustable
+  feel: half-time     # heavy sections feel like ~57 BPM
+  tolerance_bpm: 6    # re-generate or time-adjust if analysis lands outside this
+
+key:
+  mode: minor
+  tonic: auto         # auto = use key detected from the extracted speech melody
+  fallback: C
+
+# Global style words sent to the music generator
+positive_styles:
+  - cinematic psychedelic electronic
+  - melodic future bass
+  - midtempo bass
+  - ambient electronica
+  - warm sub-bass with rounded, elastic wobbling bass synth
+  - punchy half-time electronic drums, wide snare, trap-influenced hats
+  - lush wide synth chords, bright euphoric leads
+  - granular textures, reversed sounds, pitch bends, ear candy
+  - spoken-word-driven arrangement with large negative space during narration
+  - bittersweet, awe-filled, polished, spacious, immersive
+
+negative_styles:
+  - aggressive dubstep growls
+  - riddim
+  - harsh or metallic bass
+  - busy arpeggios or leads during narration
+  - sung vocals or lyrics
+
+# Section roles. The arrangement builder maps each speech clip onto the timeline,
+# then picks section roles around it. "energy" is 0-1 and guides density.
+section_roles:
+  intro:
+    energy: 0.15
+    styles: [spacious ambient pads, soft granular textures, distant reversed sounds, filtered noise, sparse piano or bell fragments]
+  speech_bed:           # plays under a spoken clip
+    energy: 0.2
+    styles: [very sparse, soft evolving pad, lots of negative space, no drums or minimal filtered percussion]
+  build:
+    energy: 0.6
+    styles: [rising synths, filtered percussion, pitch sweeps, reverse swells, increasing stereo width and reverb]
+  gap:                  # brief near-silence before a drop
+    energy: 0.0
+    styles: [near silence, reverb tail only]
+  drop:
+    energy: 1.0
+    styles: [huge warm sub-bass, elastic synth bass, half-time drums, shimmering euphoric chords]
+  breakdown:
+    energy: 0.3
+    styles: [quiet introspective, soft chords, gentle melodic motif]
+  outro:
+    energy: 0.1
+    styles: [peaceful atmospheric resolution, fading pads]
+
+# Default arc, adapted to however many clips were selected.
+arc: [intro, speech_bed, build, gap, drop, breakdown, speech_bed, build, gap, drop, outro]
+
+# How the arrangement reacts to speech
+speech_interaction:
+  music_recedes_during_clips: true
+  swell_after_clip_end: true        # use the end of an idea as a launch into the next section
+  align_clip_starts_to: bar         # bar | beat | free
+
+# Local mix settings (pedalboard)
+mix:
+  sidechain_duck_db: -9             # music reduction while speech is active
+  duck_attack_ms: 30
+  duck_release_ms: 400
+  speech_highpass_hz: 90
+  speech_reverb_send: 0.12          # increase for the psychedelic sections
+  speech_delay_send: 0.06
+  target_lufs: -14
+
+# Speech-to-melody settings
+melody:
+  quantize_grid: 1/8
+  scale_snap_strength: 0.8          # 0 = raw speech contour, 1 = fully snapped to scale
+  loop_phrase_count: 3              # repetition drives the speech-to-song illusion
+  render_instrument: soft_piano     # rendered and used as the audio reference

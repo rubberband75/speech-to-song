@@ -1,0 +1,49 @@
+# Copy to config.yaml (gitignored) and edit. Every key is optional; values shown are defaults.
+# Relative paths resolve against this file's directory. API keys never go here: use .env.
+
+runs_dir: runs
+presets_dir: presets
+default_preset: cinematic_future_bass
+
+claude_model: claude-sonnet-5-5   # claude-opus-5-5 for harder selection tasks (M2)
+music_model: music_v2_5           # verified against the ElevenLabs docs in M5
+music_backend: stub               # stub | elevenlabs
+
+transcribe_backend: whisper
+whisper_model: large-v3-turbo     # e.g. small for speed; per run: --whisper-model
+language: null                    # null = detect; per run: --language en
+
+whisper:
+  device: auto                    # auto | cpu | cuda
+  compute_type: auto              # auto = int8 on CPU, float16 on CUDA
+  beam_size: 5
+  vad_filter: true
+  batch_size: 0                   # >0 uses batched inference
+  cpu_threads: 0                  # 0 = number of physical cores
+  condition_on_previous_text: true
+
+demucs:                           # used by --isolate-voice (needs: uv sync --extra isolate)
+  model: htdemucs
+  device: cpu
+  shifts: 0
+  overlap: 0.25
+  window_s: 120                   # processed in windows to bound memory
+  context_s: 5
+  crossfade_s: 0.5
+  jobs: 0
+
+align:
+  fuzzy_threshold: 0.6            # min similarity for a fuzzy word match
+  unspoken_min_tokens: 3          # unmatched official runs this long are "unspoken"
+  unspoken_line_ratio: 0.25       # lines with fewer matched tokens are "unspoken"
+  asr_sentence_min_words: 4       # ASR-only runs this long become their own sentence
+  pause_split_s: 1.5
+  max_sentence_s: 30
+  min_coverage: 0.2               # below this the official transcript is ignored
+
+# Prices change: nothing is built in. Paid stages show "unknown" until these are set.
+pricing:
+  anthropic: {}
+  #  claude-sonnet-5-5: {input_usd_per_mtok: 0.0, output_usd_per_mtok: 0.0, as_of: "YYYY-MM-DD"}
+  elevenlabs: {}
+  #  music: {unit: minute, usd_per_unit: 0.0, as_of: "YYYY-MM-DD"}

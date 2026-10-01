@@ -1,0 +1,15 @@
+.env
+config.yaml
+inputs/
+runs/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.DS_Store
+outputs/
+.venv*/
+*.tmp.wav
+.coverage
