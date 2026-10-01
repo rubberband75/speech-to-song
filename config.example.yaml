@@ -5,7 +5,10 @@ runs_dir: runs
 presets_dir: presets
 default_preset: cinematic_future_bass
 
-claude_model: claude-sonnet-5-5   # claude-opus-5-5 for harder selection tasks (M2)
+claude_model: claude-sonnet-5-5   # claude-opus-5-5 for harder picks; per run: select --model
+claude_effort: high               # low | medium | high | xhigh | max
+claude_max_tokens: 16000
+claude_fallbacks: true            # if Claude declines, the API retries on a recommended model
 music_model: music_v2_5           # verified against the ElevenLabs docs in M5
 music_backend: stub               # stub | elevenlabs
 
@@ -44,9 +47,10 @@ align:
   max_sentence_s: 30
   min_coverage: 0.2               # below this the official transcript is ignored
 
-# Prices change: nothing is built in. Paid stages show "unknown" until these are set.
+# Prices change. Claude list prices (as of 2026-09-25) are built in; entries here override
+# them per model. ElevenLabs rates arrive with M5.
 pricing:
   anthropic: {}
-  #  claude-sonnet-5-5: {input_usd_per_mtok: 0.0, output_usd_per_mtok: 0.0, as_of: "YYYY-MM-DD"}
+  #  claude-sonnet-5-5: {input_usd_per_mtok: 2.0, output_usd_per_mtok: 10.0, cache_read_usd_per_mtok: 0.2, as_of: "2026-09-25"}
   elevenlabs: {}
   #  music: {unit: minute, usd_per_unit: 0.0, as_of: "YYYY-MM-DD"}

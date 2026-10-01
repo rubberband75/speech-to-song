@@ -7,8 +7,8 @@ sample-exactly from the source.
 
 `docs/SPEC.md` is the source of truth; accepted changes are logged in `docs/DECISIONS.md`.
 
-**Status:** M1 — ingest, voice isolation, transcription and transcript alignment work.
-Clip selection (M2) and later steps are stubs.
+**Status:** M2 — ingest, voice isolation, transcription, transcript alignment and clip
+selection work. Melody (M3) and later steps are stubs.
 
 ## Install
 
@@ -33,6 +33,8 @@ speech2song ingest inputs/talk.mp3 --transcript inputs/talk.txt   # new run
 speech2song transcribe              # Whisper + alignment (cached afterwards)
 speech2song status                  # what is done, stale or pending
 speech2song transcribe --no-transcript   # re-align without the transcript; ASR stays cached
+speech2song select --dry-run         # estimated Claude cost, no calls
+speech2song select --interactive-review   # Claude picks lines (asks first); review them
 speech2song run inputs/talk.mp3 --transcript inputs/talk.txt      # every implemented step
 ```
 
@@ -47,6 +49,17 @@ speech2song run inputs/talk.mp3 --transcript inputs/talk.txt      # every implem
 - Settings: copy `config.example.yaml` to `config.yaml` (gitignored). API keys go in `.env`
   (see `.env.example`), never in config files.
 
+### Clips
+
+`select` sends the sentence list (not the audio) to Claude, which picks lines by sentence
+ID. The answer is checked against the transcript (ranges exist, quotes match, durations
+fit, no overlaps, total within budget); one retry with feedback is allowed. The `clips`
+stage then cuts each line from `01_clean.wav` at the quietest point near the sentence
+edges, adds 15 ms fades, and writes `clips/clip_NNN.wav` and `03_clips.json`. Apart from
+the fades, clip audio is sample-identical to the source. Review choices (drop, reorder)
+are saved to `03_review.json` and survive re-runs. Targets (count, length, speech budget,
+fades) live in the preset's `clips:` block; `--clips N` overrides the count.
+
 ### Official transcripts
 
 Plain UTF-8 text, one paragraph per line (text copied from a PDF with hard line wraps is
@@ -56,9 +69,13 @@ from the ASR. `transcribe` prints both lists so you can check them.
 
 ## Spending
 
-No paid API is called yet. From M2 on, every paid step estimates its cost first, supports
-`--dry-run`, asks before spending unless `--yes` is given, and logs to `costs.json`
-(`speech2song costs`). Prices are not built in; set them under `pricing:` in `config.yaml`.
+Only `select` calls a paid API so far (Claude, about $0.05 per 13-minute talk on Sonnet).
+Every paid step estimates its cost first, supports `--dry-run` (no calls), asks before
+spending unless `--yes` is given (and refuses without a terminal), and logs each call to
+`costs.json` (`speech2song costs`). Claude list prices are built in with an `as_of` date;
+override them under `pricing:` in `config.yaml`. If Claude declines a request, the API
+retries it on a recommended fallback model (`claude_fallbacks: false` turns that off);
+fallback attempts are priced at the serving model's rates.
 
 ## Development
 

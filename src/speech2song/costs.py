@@ -43,15 +43,31 @@ class CostLog:
 
 
 def claude_usd(
-    pricing: PricingConfig, model: str, input_tokens: int, output_tokens: int
+    pricing: PricingConfig,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
 ) -> float | None:
     """USD for a Claude call, or None when the model has no configured price."""
     price = pricing.anthropic.get(model)
     if price is None:
         return None
-    return (
-        input_tokens * price.input_usd_per_mtok + output_tokens * price.output_usd_per_mtok
-    ) / 1_000_000
+    cache_read = price.cache_read_usd_per_mtok
+    cache_write = price.cache_write_usd_per_mtok
+    if cache_read is None:
+        cache_read = 0.1 * price.input_usd_per_mtok
+    if cache_write is None:
+        cache_write = 1.25 * price.input_usd_per_mtok
+    total = (
+        input_tokens * price.input_usd_per_mtok
+        + output_tokens * price.output_usd_per_mtok
+        + cache_read_tokens * cache_read
+        + cache_write_tokens * cache_write
+    )
+    return total / 1_000_000
 
 
 def unit_usd(pricing: PricingConfig, item: str, units: float) -> float | None:

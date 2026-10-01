@@ -53,7 +53,7 @@ def test_presets_list_flags_invalid_preset(cli: Cli, tmp_path: Path) -> None:
     assert "invalid" in result.output
 
 
-@pytest.mark.parametrize(("command", "milestone"), [("select", "M2"), ("mix", "M4")])
+@pytest.mark.parametrize(("command", "milestone"), [("melody", "M3"), ("mix", "M4")])
 def test_unimplemented_steps_exit_2(cli: Cli, cli_run: Run, command: str, milestone: str) -> None:
     result = cli(command)
     assert result.exit_code == 2
@@ -110,7 +110,9 @@ def test_bad_config_is_a_clean_error(cli: Cli, tmp_path: Path) -> None:
 
 def test_run_dry_run_creates_nothing(cli: Cli, tmp_path: Path, input_file: Path) -> None:
     result = cli("run", str(input_file), "--dry-run")
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
+    assert "assuming a 15-minute talk" in result.output  # the fixture is not real audio
+    assert "select 5 clips" in result.output
     assert "Nothing was executed" in result.output
     assert not (tmp_path / "runs").exists()
 

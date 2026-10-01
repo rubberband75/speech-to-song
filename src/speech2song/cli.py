@@ -6,6 +6,7 @@ Every command prints what it read, what it wrote, and what it spent.
 
 import functools
 import logging
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -16,18 +17,30 @@ import typer
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.markup import escape
+from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
 from speech2song import __version__
+from speech2song.audio.io import probe
 from speech2song.config import AppConfig, list_presets, load_config, load_preset
-from speech2song.costs import CostLog
+from speech2song.costs import CostLog, render_estimates
 from speech2song.errors import S2SError
 from speech2song.manifest import Run
-from speech2song.models import RunOptions
+from speech2song.models import ClipSet, RunOptions
 from speech2song.pipeline import Context, Stage, check, execute
+from speech2song.review import run_review
+from speech2song.selection import clip_targets, estimate_input_tokens_from_duration
 from speech2song.stages.align import AlignStage
 from speech2song.stages.ingest import IngestStage, IsolateStage
+from speech2song.stages.select_clips import (
+    CLIPS,
+    ClipsStage,
+    SelectStage,
+    select_estimates,
+    write_preview,
+    write_review,
+)
 from speech2song.stages.transcribe import AsrStage
 
 # --- Steps -----------------------------------------------------------------------------
@@ -43,7 +56,7 @@ class Step:
 STEPS: list[Step] = [
     Step("ingest", "M1", lambda: [IngestStage(), IsolateStage()]),
     Step("transcribe", "M1", lambda: [AsrStage(), AlignStage()]),
-    Step("select", "M2", None),
+    Step("select", "M2", lambda: [SelectStage(), ClipsStage()]),
     Step("melody", "M3", None),
     Step("arrange", "M4", None),
     Step("generate", "M4", None),
@@ -142,7 +155,8 @@ def _global(
         raise typer.Exit(1) from None
     if runs_dir is not None:
         cfg = cfg.model_copy(update={"runs_dir": runs_dir})
-    ctx.obj = Env(cfg, Console(highlight=False, soft_wrap=True), verbose)
+    width = None if sys.stdout.isatty() else 120  # wider tables in logs and pipes
+    ctx.obj = Env(cfg, Console(highlight=False, soft_wrap=True, width=width), verbose)
 
 
 def _env(ctx: typer.Context) -> Env:
@@ -210,15 +224,67 @@ def _context(env: Env, run: Run, *, force: bool = False, dry_run: bool = False, 
     return Context(run, env.config, env.console, force=force, dry_run=dry_run, yes=yes)
 
 
-def _run_steps(ctx: Context, steps: list[Step]) -> bool:
-    """Execute steps in order. Returns False if it stopped at an unimplemented step."""
+Hook = Callable[[Context], None]
+
+
+def _run_steps(ctx: Context, steps: list[Step], hooks: dict[str, Hook] | None = None) -> bool:
+    """Execute steps in order, calling a step's hook after it. Returns False if it
+    stopped at an unimplemented step."""
     for step in steps:
         if step.stages is None:
             ctx.say(f"[yellow]Stopping before `{step.name}`: planned for {step.milestone}.[/]")
             return False
         for stage in step.stages():
             execute(stage, ctx)
+        if hooks and step.name in hooks:
+            hooks[step.name](ctx)
+    _dry_run_total(ctx)
     return True
+
+
+def _dry_run_total(ctx: Context) -> None:
+    if not ctx.dry_run:
+        return
+    if not ctx.estimates:
+        ctx.console.print("Dry run: no paid calls would be made.")
+        return
+    known = sum(e.usd for e in ctx.estimates if e.usd is not None)
+    unknown = sum(1 for e in ctx.estimates if e.usd is None)
+    suffix = f" plus {unknown} unpriced item(s)" if unknown else ""
+    ctx.console.print(
+        f"Dry run total, worst case (every retry happens): [bold]${known:.4f}[/]{suffix}. "
+        "Nothing was executed."
+    )
+
+
+def _ask_review() -> str:
+    try:
+        return Prompt.ask("review")
+    except EOFError:
+        return "quit"
+
+
+def _review_hook(env: Env, run: Run) -> Hook:
+    """After `select`: let the user drop, reorder and audition clips, then re-cut."""
+
+    def hook(ctx: Context) -> None:
+        if ctx.dry_run:
+            return
+        clip_set = ClipSet.model_validate_json(run.path(CLIPS).read_text(encoding="utf-8"))
+        state = run_review(
+            env.console,
+            clip_set,
+            ask=_ask_review,
+            preview=lambda clip_id: write_preview(run, clip_set, clip_id),
+        )
+        if state is None:
+            env.console.print("Review closed without saving.")
+            return
+        path = write_review(ctx, state.order, state.dropped)
+        env.console.print(f"Saved {escape(path.name)}; applying it.")
+        execute(ClipsStage(), ctx)
+
+    return hook
 
 
 def _spend_line(env: Env, run: Run, before: float) -> None:
@@ -227,7 +293,14 @@ def _spend_line(env: Env, run: Run, before: float) -> None:
 
 
 def _run_step_command(
-    env: Env, run: Run, step_name: str, *, force: bool = False, dry_run: bool = False
+    env: Env,
+    run: Run,
+    step_name: str,
+    *,
+    force: bool = False,
+    dry_run: bool = False,
+    yes: bool = False,
+    hooks: dict[str, Hook] | None = None,
 ) -> None:
     step = STEP_BY_NAME[step_name]
     if step.stages is None:
@@ -237,7 +310,7 @@ def _run_step_command(
     run.save()
     before = CostLog(run.costs_path).totals()["total"]
     with run.logging_to_file(logging.DEBUG if env.verbose else logging.INFO):
-        _run_steps(_context(env, run, force=force, dry_run=dry_run), [step])
+        _run_steps(_context(env, run, force=force, dry_run=dry_run, yes=yes), [step], hooks)
     _spend_line(env, run, before)
 
 
@@ -264,6 +337,9 @@ def run_cmd(
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Don't ask before paid calls.")] = False,
     stop_after: Annotated[StepName | None, typer.Option(help="Last step to run.")] = None,
+    interactive_review: Annotated[
+        bool, typer.Option("--interactive-review", help="Review clips after selection.")
+    ] = False,
     force: Force = False,
     run_ref: RunRef = None,
 ) -> None:
@@ -284,9 +360,7 @@ def run_cmd(
         _set_preset(env, run, preset)
         _set_transcript(run, transcript)
     elif dry_run:
-        names = ", ".join(step.name for step in steps)
-        env.console.print(f"Dry run: would create a new run for {escape(str(input_path))}")
-        env.console.print(f"and run every stage of: {names}. Nothing was executed.")
+        _dry_run_new_input(env, input_path, preset, clips, steps)
         return
     else:
         initial = RunOptions(**{k: v for k, v in options.items() if v is not None})
@@ -298,8 +372,44 @@ def run_cmd(
         context = _context(env, run, force=force, dry_run=dry_run, yes=yes)
         if dry_run:
             env.console.print("Dry run: nothing will be executed.")
-        _run_steps(context, steps)
+        hooks = {"select": _review_hook(env, run)} if interactive_review else None
+        _run_steps(context, steps, hooks)
     _spend_line(env, run, before)
+
+
+def _dry_run_new_input(
+    env: Env, input_path: Path, preset: str | None, clips: int | None, steps: list[Step]
+) -> None:
+    """Estimate a new run's spend from the input's duration (ffprobe only, no stages)."""
+    if not input_path.is_file():
+        raise S2SError(f"Input file not found: {input_path}")
+    names = ", ".join(step.name for step in steps)
+    env.console.print(f"Dry run: would create a new run for {escape(str(input_path))}")
+    env.console.print(f"and run: {names}.")
+    if not any(step.name == "select" for step in steps):
+        env.console.print("No paid calls before the steps you asked for. Nothing was executed.")
+        return
+    preset_obj = load_preset(preset or env.config.default_preset, env.config.presets_dir)
+    targets = clip_targets(preset_obj, RunOptions(clips=clips))
+    try:
+        seconds = probe(input_path).duration_s or 900.0
+    except S2SError as exc:
+        env.console.print(f"[yellow]Could not read the input ({escape(str(exc))}); "
+                          "assuming a 15-minute talk.[/]")  # fmt: skip
+        seconds = 900.0
+    estimates = select_estimates(
+        env.config,
+        env.config.claude_model,
+        estimate_input_tokens_from_duration(seconds),
+        targets.count,
+        f"estimated from {seconds / 60:.0f} min of audio",
+    )
+    render_estimates(env.console, estimates)
+    total = sum(e.usd or 0.0 for e in estimates)
+    env.console.print(
+        f"Dry run total, worst case (every retry happens): [bold]${total:.4f}[/]. "
+        "Music generation is not implemented yet (M4/M5). Nothing was executed."
+    )
 
 
 @app.command()
@@ -360,6 +470,30 @@ def transcribe(
     _run_step_command(env, run, "transcribe", force=force)
 
 
+@app.command()
+@cli_errors
+def select(
+    ctx: typer.Context,
+    clips: Annotated[int | None, typer.Option(min=1, help="Number of clips to select.")] = None,
+    model: Annotated[str | None, typer.Option(help="Claude model for this run.")] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show the estimated cost; call nothing.")
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Don't ask before paid calls.")] = False,
+    interactive_review: Annotated[
+        bool, typer.Option("--interactive-review", help="Drop, reorder or audition clips.")
+    ] = False,
+    force: Force = False,
+    run_ref: RunRef = None,
+) -> None:
+    """Ask Claude for the best lines, then cut them as sample-exact clips."""
+    env = _env(ctx)
+    run = _open_run(env, run_ref)
+    _update_options(run, clips=clips, claude_model=model)
+    hooks = {"select": _review_hook(env, run)} if interactive_review else None
+    _run_step_command(env, run, "select", force=force, dry_run=dry_run, yes=yes, hooks=hooks)
+
+
 def _stub_command(name: str) -> None:
     step = STEP_BY_NAME[name]
 
@@ -372,7 +506,7 @@ def _stub_command(name: str) -> None:
     app.command(name)(command)
 
 
-for _name in ("select", "melody", "arrange", "generate", "mix"):
+for _name in ("melody", "arrange", "generate", "mix"):
     _stub_command(_name)
 
 

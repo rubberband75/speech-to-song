@@ -53,6 +53,7 @@ class Context:
     force: bool = False
     dry_run: bool = False
     yes: bool = False
+    estimates: list[SpendEstimate] = field(default_factory=list)  # collected by dry runs
 
     def say(self, message: str) -> None:
         """Print for the user and mirror into the run log."""
@@ -143,6 +144,13 @@ def fmt_bytes(size: int) -> str:
     raise AssertionError("unreachable")
 
 
+def _dry_run_estimate(stage: Stage, ctx: Context, plan: StagePlan) -> None:
+    if stage.paid:
+        estimates = stage.estimate(ctx, plan)
+        render_estimates(ctx.console, estimates)
+        ctx.estimates.extend(estimates)
+
+
 def execute(stage: Stage, ctx: Context) -> Outcome:
     """Run one stage unless its cached outputs are still valid."""
     run = ctx.run
@@ -150,6 +158,7 @@ def execute(stage: Stage, ctx: Context) -> Outcome:
     if chk.state is State.BLOCKED:
         if ctx.dry_run:
             ctx.say(f"  {stage.name}: would run (after earlier stages produce its inputs)")
+            _dry_run_estimate(stage, ctx, chk.plan)
             return Outcome(stage.name, "would run")
         raise StageError(f"{stage.name}: missing inputs: {', '.join(chk.missing_inputs)}")
     if chk.state is State.COMPLETE and not ctx.force:
@@ -159,8 +168,7 @@ def execute(stage: Stage, ctx: Context) -> Outcome:
     reason = "forced" if chk.state is State.COMPLETE else chk.state.value
     if ctx.dry_run:
         ctx.say(f"  {stage.name}: would run ({reason})")
-        if stage.paid:
-            render_estimates(ctx.console, stage.estimate(ctx, chk.plan))
+        _dry_run_estimate(stage, ctx, chk.plan)
         return Outcome(stage.name, "would run")
     if stage.paid:
         confirm_spend(

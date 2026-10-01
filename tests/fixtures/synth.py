@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from speech2song.models import AsrResult, AsrSegment, AsrWord
+from speech2song.models import AsrRef, AsrResult, AsrSegment, AsrWord, Sentence, Transcript, Word
 
 SR = 44100
 FIXTURES = Path(__file__).parent
@@ -109,3 +109,77 @@ def asr_result(words: list[AsrWord], duration_s: float | None = None) -> AsrResu
             )
         ],
     )
+
+
+def transcript_from(
+    sentences: list[list[tuple[str, float, float]]], duration_s: float | None = None
+) -> Transcript:
+    """A Transcript from sentences given as lists of (word, start, end)."""
+    words: list[Word] = []
+    rows: list[Sentence] = []
+    for number, spec in enumerate(sentences, start=1):
+        first = len(words)
+        words += [Word(w=w, start=a, end=b, conf=0.9, flag="matched") for w, a, b in spec]
+        rows.append(
+            Sentence(
+                id=number,
+                text=" ".join(w for w, _, _ in spec),
+                start=spec[0][1],
+                end=spec[-1][2],
+                word_start=first,
+                word_end=len(words),
+                source="official",
+                avg_conf=0.9,
+            )
+        )
+    end = duration_s if duration_s is not None else (words[-1].end + 1.0 if words else 1.0)
+    return Transcript(
+        source="talk.wav",
+        duration_s=end,
+        language="en",
+        words=words,
+        sentences=rows,
+        official_transcript_used=True,
+        asr=AsrRef(backend="fake", model="fake"),
+    )
+
+
+def synthetic_talk(
+    n_sentences: int = 8,
+    words_per_sentence: int = 8,
+    *,
+    word_s: float = 0.35,
+    gap_s: float = 0.1,
+    pause_s: float = 0.8,
+    lead_s: float = 0.6,
+    jitter_s: float = 0.04,
+    seed: int = 7,
+) -> tuple[np.ndarray, Transcript, list[tuple[float, float]]]:
+    """Mono 'speech' of syllable-words with pauses between sentences.
+
+    Returns the audio, a transcript whose word times are jittered by up to `jitter_s`
+    (like real ASR timestamps), and the true silent pauses before and after each
+    sentence as (start, end) seconds, for checking cut points.
+    """
+    rng = np.random.default_rng(seed)
+    pieces = [np.zeros(round(lead_s * SR), dtype=np.float32)]
+    t = lead_s
+    sentences = []
+    silences = [(0.0, lead_s)]
+    for s in range(n_sentences):
+        syllables = [(150 + 12 * k, 190 - 5 * k, word_s) for k in range(words_per_sentence)]
+        voice, times = speechlike(syllables, gap_s=gap_s)
+        voice = voice[: round((times[-1][1]) * SR)]  # drop the trailing gap
+        pieces.append(voice)
+        spec = []
+        for k, (a, b) in enumerate(times):
+            ja, jb = rng.uniform(-jitter_s, jitter_s, size=2)
+            word = f"s{s + 1}w{k + 1}" + ("." if k == len(times) - 1 else "")
+            spec.append((word, round(t + a + ja, 3), round(t + b + jb, 3)))
+        sentences.append(spec)
+        t += len(voice) / SR
+        pieces.append(np.zeros(round(pause_s * SR), dtype=np.float32))
+        silences.append((t, t + pause_s))
+        t += pause_s
+    audio = np.concatenate(pieces)
+    return audio, transcript_from(sentences, duration_s=len(audio) / SR), silences

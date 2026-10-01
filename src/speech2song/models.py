@@ -83,6 +83,7 @@ class RunOptions(BaseModel):
     music_backend: Literal["stub", "elevenlabs"] | None = None
     whisper_model: str | None = None
     language: str | None = None
+    claude_model: str | None = None
 
 
 class Manifest(BaseModel):
@@ -239,3 +240,95 @@ class Transcript(BaseModel):
     official_transcript_used: bool
     alignment: AlignmentReport | None = None
     asr: AsrRef
+
+
+# --- 03_selection.json, 03_clips.json, 03_review.json ---------------------------------------
+
+ClipRole = Literal["hook", "build", "payoff", "breakdown", "outro"]
+
+
+class SelectedClip(BaseModel):
+    """One clip as Claude proposes it: a range of transcript sentence IDs."""
+
+    id: str
+    start_sentence: int
+    end_sentence: int
+    text: str
+    score: float
+    role: ClipRole
+    reason: str
+
+
+class ClipSelection(BaseModel):
+    """The JSON Claude must return (spec section 6, stage 3)."""
+
+    clips: list[SelectedClip]
+    suggested_order: list[str]
+    notes: str | None = None
+
+
+class ClipTargets(BaseModel):
+    count: int
+    min_seconds: float
+    max_seconds: float
+    total_speech_seconds: float
+
+
+class SelectionAttempt(BaseModel):
+    attempt: int
+    model: str  # the model that produced the answer (differs on a refusal fallback)
+    request_id: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    usd: float | None = None
+    answer: ClipSelection | None = None
+    problems: list[str] = []
+
+
+class SelectionResult(BaseModel):
+    schema_version: Literal[1] = 1
+    model: str  # requested model
+    targets: ClipTargets
+    attempts: list[SelectionAttempt]
+    selection: ClipSelection  # validated, renumbered c1..cN in time order
+    warnings: list[str] = []
+
+
+class Clip(BaseModel):
+    id: str
+    file: str  # run-relative WAV path
+    start_sentence: int
+    end_sentence: int
+    text: str  # transcript text of the sentences
+    score: float
+    role: ClipRole
+    reason: str
+    nominal_start_s: float  # word timestamps
+    nominal_end_s: float
+    start_s: float  # refined cut points
+    end_s: float
+    start_sample: int  # in the source's sample rate; end is exclusive
+    end_sample: int
+    duration_s: float
+    cut_level_db: tuple[float, float]  # level around the start and end cuts
+
+
+class ClipSet(BaseModel):
+    schema_version: Literal[1] = 1
+    source: str  # the file clips were cut from
+    isolated: bool  # True when that file is demucs output rather than the original
+    sample_rate: int
+    channels: int
+    fade_ms: float
+    clips: list[Clip]  # every validated clip, in time order
+    order: list[str]  # playback order of the kept clips
+    dropped: list[str] = []  # removed during review
+    notes: str | None = None
+
+
+class ClipReview(BaseModel):
+    """User edits from --interactive-review, tied to the selection they were made on."""
+
+    selection_sha256: str
+    order: list[str]
+    dropped: list[str] = []

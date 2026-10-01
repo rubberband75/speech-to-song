@@ -96,7 +96,12 @@ class ClipsSpec(_Strict):
     max_seconds: float = Field(default=15.0, gt=0)
     total_speech_seconds: float = Field(default=60.0, gt=0)
     fade_ms: float = Field(default=15.0, ge=0)
-    boundary_search_ms: float = Field(default=150.0, ge=0)
+    # How far cut points may move from the word timestamps: before a clip's first word,
+    # after its last word (speech and room reverb decay well past ASR end times), and
+    # into the clip. Never past the middle of a neighbouring word.
+    lead_search_ms: float = Field(default=300.0, ge=0)
+    tail_search_ms: float = Field(default=400.0, ge=0)
+    inner_search_ms: float = Field(default=150.0, ge=0)
 
     @model_validator(mode="after")
     def _check_bounds(self) -> "ClipsSpec":
@@ -224,6 +229,8 @@ class AlignConfig(_Strict):
 class TokenPrice(_Strict):
     input_usd_per_mtok: float = Field(ge=0)
     output_usd_per_mtok: float = Field(ge=0)
+    cache_read_usd_per_mtok: float | None = Field(default=None, ge=0)  # None: 0.1x input
+    cache_write_usd_per_mtok: float | None = Field(default=None, ge=0)  # None: 1.25x input
     as_of: str | None = None
 
 
@@ -233,18 +240,45 @@ class UnitPrice(_Strict):
     as_of: str | None = None
 
 
+# Anthropic first-party list prices from the Claude API reference, as of 2026-09-25.
+# Entries under `pricing.anthropic` in config.yaml override these per model. The Opus
+# entries price server-side refusal fallbacks, which bill at the serving model's rates.
+_PRICES_AS_OF = "2026-09-25"
+DEFAULT_ANTHROPIC_PRICES = {
+    "claude-sonnet-5-5": TokenPrice(input_usd_per_mtok=2.0, output_usd_per_mtok=10.0,
+                                    cache_read_usd_per_mtok=0.2, as_of=_PRICES_AS_OF),
+    "claude-opus-5-5": TokenPrice(input_usd_per_mtok=4.0, output_usd_per_mtok=20.0,
+                                  cache_read_usd_per_mtok=0.2, as_of=_PRICES_AS_OF),
+    "claude-opus-5": TokenPrice(input_usd_per_mtok=5.0, output_usd_per_mtok=25.0,
+                                as_of=_PRICES_AS_OF),
+    "claude-opus-4-8": TokenPrice(input_usd_per_mtok=5.0, output_usd_per_mtok=25.0,
+                                  as_of=_PRICES_AS_OF),
+}  # fmt: skip
+
+
 class PricingConfig(_Strict):
-    """No built-in prices: they change, so they live in config (spec section 9)."""
+    """Prices change, so config.yaml can override every entry (spec section 9).
+
+    Claude list prices ship as defaults; ElevenLabs rates are added in M5 after the docs pass.
+    """
 
     anthropic: dict[str, TokenPrice] = {}
     elevenlabs: dict[str, UnitPrice] = {}
+
+    @model_validator(mode="after")
+    def _merge_defaults(self) -> "PricingConfig":
+        self.anthropic = {**DEFAULT_ANTHROPIC_PRICES, **self.anthropic}
+        return self
 
 
 class AppConfig(_Strict):
     runs_dir: Path = Path("runs")
     presets_dir: Path = Path("presets")
     default_preset: str = "cinematic_future_bass"
-    claude_model: str = "claude-sonnet-5-5"
+    claude_model: str = "claude-sonnet-5-5"  # spec section 8; claude-opus-5-5 for harder picks
+    claude_effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
+    claude_max_tokens: int = Field(default=16000, ge=1024)
+    claude_fallbacks: bool = True  # server-side retry on another model if Claude declines
     music_model: str = "music_v2_5"  # unverified until the M5 ElevenLabs docs pass
     music_backend: Literal["stub", "elevenlabs"] = "stub"
     transcribe_backend: Literal["whisper"] = "whisper"

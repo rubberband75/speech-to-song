@@ -249,12 +249,15 @@ def test_status_after_transcribe(cli: Cli, ingested: Run, fake_asr: type[FakeTra
     assert output.count("complete") == 4
 
 
-def test_run_command_stops_before_select(
+def test_run_command_needs_consent_before_the_paid_step(
     cli: Cli, tmp_path: Path, fake_asr: type[FakeTranscriber]
 ) -> None:
     talk = write_wav(tmp_path / "talk.wav", np.zeros(4410, dtype=np.float32))
-    result = cli("run", str(talk), "--transcript", str(OFFICIAL))
+    result = cli("run", str(talk), "--transcript", str(OFFICIAL), "--stop-after", "transcribe")
     assert result.exit_code == 0, result.output
-    assert "Stopping before `select`: planned for M2." in result.output
-    stopped = cli("run", "--run", "latest", "--stop-after", "ingest")
-    assert "asr" not in stopped.output
+    assert "align" in result.output and "select" not in result.output
+    paid = cli("run", "--run", "latest")  # no TTY and no --yes: must not spend
+    assert paid.exit_code == 1
+    assert "pass --yes" in paid.output
+    run = Run.open(tmp_path / "runs", "latest")
+    assert json.loads(run.costs_path.read_text()) == []
