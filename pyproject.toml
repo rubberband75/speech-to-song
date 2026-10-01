@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic==1.11.0",
+    "elevenlabs==2.70.0",
     "faster-whisper==1.2.1",
     "librosa==1.0.0",
     "numpy==2.5.3",

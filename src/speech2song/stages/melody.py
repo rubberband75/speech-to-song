@@ -198,7 +198,7 @@ def build_melody(
 
 class MelodyStage(Stage):
     name: ClassVar[str] = "melody"
-    version: ClassVar[int] = 3
+    version: ClassVar[int] = 4  # 4: whole-number tempos
 
     def plan(self, ctx: Context) -> StagePlan:
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)

@@ -109,6 +109,9 @@ def test_tempo_search_finds_the_fitting_tempo_and_prefers_the_preset() -> None:
     bpm, cost = search_tempo(114, 6, durations, onsets, 0.5)
     assert bpm == pytest.approx(111, abs=0.25) and cost < 0.02
     assert search_tempo(114, 6, [], [], 0.5)[0] == 114  # nothing to fit: keep the preset
+    assert float(bpm).is_integer()  # whole tempos by default
+    assert search_tempo(114.5, 0.2, [], [], 0.5)[0] in (114, 115)  # no whole tempo in range
+    assert search_tempo(114, 6, durations, onsets, 0.5, step=0.25)[0] == pytest.approx(111)
 
 
 def test_quantize() -> None:

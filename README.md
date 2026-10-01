@@ -7,9 +7,9 @@ sample-exactly from the source.
 
 `docs/SPEC.md` is the source of truth; accepted changes are logged in `docs/DECISIONS.md`.
 
-**Status:** M4 — the whole pipeline runs offline: ingest, voice isolation,
-transcription, alignment, clip selection, the speech melody, arrangement, a placeholder
-backing track (the free `stub` music backend) and the mix. ElevenLabs music arrives in M5.
+**Status:** M5 — the whole pipeline runs: ingest, voice isolation, transcription,
+alignment, clip selection, the speech melody, arrangement, the backing track (Eleven Music,
+or the free `stub` placeholder), take analysis, section regeneration and the mix.
 
 ## Install
 
@@ -41,6 +41,8 @@ speech2song melody                  # speech pitch -> melody, MIDI, audio refere
 uv run python scripts/melody_listen.py   # listening tests in runs/<run>/04_listen/
 speech2song arrange                 # sections on the bar grid; prints the timeline
 speech2song generate                # backing-track takes (stub: free), --take N to pick one
+speech2song generate --music-backend elevenlabs --dry-run   # Eleven Music: estimate first
+speech2song regenerate --section s5 --note "less busy"      # redo one section (paid)
 speech2song mix                     # stems, master.wav (24-bit), master.mp3
 speech2song run inputs/talk.mp3 --transcript inputs/talk.txt      # every step
 speech2song run --run latest --stop-after arrange   # resume; stop to check the arrangement
@@ -100,11 +102,28 @@ it is retried once with feedback, and the preset's arc is used if it still can't
 
 ### Music and mix
 
-`generate` writes `06_music/take_NNN.wav` (the free `stub` backend synthesizes chord
-pads, bass, half-time drums and risers from the arrangement, as a placeholder) and the
-free `take` stage conforms the chosen take (`--take N`, default 1) to `selected.wav`.
-`generate` re-runs only when what it would generate changes, not on every arrangement
-edit. `mix` writes `07_mix/`:
+`generate` makes `music_takes` takes (default 2) with the run's music backend
+(`--music-backend`, sticky; default `stub` from config):
+
+- **elevenlabs**: the arrangement becomes an Eleven Music composition plan (one chunk per
+  section or merged run of sections, each stating the tempo, key and "instrumental only",
+  with the section's styles). Each take is one paid call ($0.15 per generated minute at
+  API rates, about $0.51 for a 3.4-minute song); it estimates and asks first. Takes are
+  stored for inpainting and kept: a re-run reuses takes made for the same request,
+  `--force` makes new ones, and takes of an older request move to `06_music/archive/`.
+- **stub**: a free placeholder (chord pads, bass, half-time drums, risers).
+
+The free `take` stage then checks every take against the arrangement (tempo, allowing
+half time; key; whether section levels follow the planned energy; loudness), writes
+`06_music/analysis.json`, picks the best (or `--take N`) and conforms it to
+`selected.wav`. `generate` re-runs only when what it would send changes, not on every
+arrangement edit.
+
+`regenerate --section sN [--note TEXT]` (ElevenLabs takes only, paid) regenerates one
+section of the current take and keeps the rest unchanged, then re-mixes. Each result is
+a new version of the take (`take_NNN_v2.mp3`, ...); earlier versions stay on disk.
+
+`mix` writes `07_mix/`:
 
 - `stems/speech.wav`: the clips, sample-exact, on silence (float WAV)
 - `stems/music.wav` and `stems/melody_layer.wav`: as heard in the mix (ducked)
@@ -127,8 +146,9 @@ from the ASR. `transcribe` prints both lists so you can check them.
 
 ## Spending
 
-Only `select` (Claude, about $0.05 per 13-minute talk on Sonnet) and the optional
-`arrange --refine-arc` call paid APIs so far; the stub music backend is free.
+Paid calls: `select` (Claude, about $0.05 per 13-minute talk), the optional
+`arrange --refine-arc` (Claude), and with `--music-backend elevenlabs`, `generate` and
+`regenerate` (Eleven Music). Everything else is local and free.
 Every paid step estimates its cost first, supports `--dry-run` (no calls), asks before
 spending unless `--yes` is given (and refuses without a terminal), and logs each call to
 `costs.json` (`speech2song costs`). Claude list prices are built in with an `as_of` date;

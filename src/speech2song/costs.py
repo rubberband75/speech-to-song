@@ -78,6 +78,11 @@ def unit_usd(pricing: PricingConfig, item: str, units: float) -> float | None:
     return units * price.usd_per_unit
 
 
+def fmt_units(value: float) -> str:
+    """Token counts as whole numbers, small quantities (music minutes) with decimals."""
+    return f"{value:,.0f}" if float(value).is_integer() or abs(value) >= 100 else f"{value:,.2f}"
+
+
 class SpendEstimate(BaseModel):
     service: str
     model: str
@@ -93,7 +98,7 @@ def render_estimates(console: Console, estimates: list[SpendEstimate]) -> float 
         table.add_column(column)
     total: float | None = 0.0
     for est in estimates:
-        units = ", ".join(f"{k}={v:,.0f}" for k, v in est.units.items())
+        units = ", ".join(f"{k}={fmt_units(v)}" for k, v in est.units.items())
         usd = "unknown" if est.usd is None else f"${est.usd:.4f}"
         table.add_row(est.service, est.model, est.description, units, usd)
         total = None if total is None or est.usd is None else total + est.usd

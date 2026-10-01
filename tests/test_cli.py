@@ -60,20 +60,10 @@ def test_steps_need_their_inputs(cli: Cli, cli_run: Run, command: str) -> None:
     assert "missing inputs" in result.output
 
 
-def test_elevenlabs_music_waits_for_m5(cli: Cli, cli_run: Run) -> None:
-    result = cli("generate", "--music-backend", "elevenlabs")
-    assert result.exit_code == 2
-    assert "planned for M5" in result.output
-    assert Run.open(cli_run.root.parent, cli_run.id).manifest.options.music_backend == "elevenlabs"
-    status = cli("status")
-    assert "planned for M5" in status.output
-    assert CostLog(cli_run.costs_path).read() == []
-
-
-def test_regenerate_is_planned(cli: Cli) -> None:
+def test_regenerate_needs_a_take(cli: Cli, cli_run: Run) -> None:
     result = cli("regenerate", "--section", "s5")
-    assert result.exit_code == 2
-    assert "M5" in result.output
+    assert result.exit_code == 1
+    assert "run `speech2song generate` first" in result.output
 
 
 def test_costs_empty_and_with_entries(cli: Cli, cli_run: Run) -> None:

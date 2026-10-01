@@ -10,7 +10,6 @@ from speech2song.arrangement import SONG_TAIL_S
 from speech2song.backends.music_base import make_backend
 from speech2song.backends.music_stub import StubBackend, energy_curve, synthesize
 from speech2song.config import AppConfig, load_preset
-from speech2song.errors import S2SError
 from speech2song.models import Arrangement, RunOptions, Section, TakeMeta
 
 from .conftest import PRESETS_DIR
@@ -101,7 +100,6 @@ def test_float_wavs_are_byte_reproducible(tmp_path: Path) -> None:
     assert sf.info(str(tmp_path / "a.wav")).subtype == "FLOAT"
 
 
-def test_paid_backends_wait_for_m5() -> None:
+def test_backend_choice() -> None:
     assert make_backend(AppConfig(), RunOptions()).name == "stub"
-    with pytest.raises(S2SError, match="M5"):
-        make_backend(AppConfig(), RunOptions(music_backend="elevenlabs"))
+    assert make_backend(AppConfig(), RunOptions(music_backend="elevenlabs")).name == "elevenlabs"

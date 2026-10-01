@@ -8,6 +8,7 @@ voicing, drum fills, riser texture).
 """
 
 import math
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -201,7 +202,13 @@ class StubBackend:
         return []
 
     def generate(
-        self, request: dict[str, Any], out_dir: Path, takes: int, run_dir: Path
+        self,
+        request: dict[str, Any],
+        out_dir: Path,
+        takes: int,
+        run_dir: Path,
+        say: Callable[[str], None] = print,
+        fresh: bool = False,
     ) -> list[Take]:
         out_dir.mkdir(parents=True, exist_ok=True)
         digest = request_digest(request)

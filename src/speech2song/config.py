@@ -284,11 +284,16 @@ DEFAULT_ANTHROPIC_PRICES = {
 }  # fmt: skip
 
 
-class PricingConfig(_Strict):
-    """Prices change, so config.yaml can override every entry (spec section 9).
+# ElevenLabs API rate for Eleven Music (elevenlabs.io/pricing/api, 2026-10-01): $0.15 per
+# generated minute on every tier. Uploads for inpainting cost the same as generation.
+# Subscriptions spend included minutes first; override for your plan in config.yaml.
+DEFAULT_ELEVENLABS_PRICES = {
+    "music": UnitPrice(unit="minute", usd_per_unit=0.15, as_of="2026-10-01"),
+}
 
-    Claude list prices ship as defaults; ElevenLabs rates are added in M5 after the docs pass.
-    """
+
+class PricingConfig(_Strict):
+    """Prices change, so config.yaml can override every entry (spec section 9)."""
 
     anthropic: dict[str, TokenPrice] = {}
     elevenlabs: dict[str, UnitPrice] = {}
@@ -296,6 +301,26 @@ class PricingConfig(_Strict):
     @model_validator(mode="after")
     def _merge_defaults(self) -> "PricingConfig":
         self.anthropic = {**DEFAULT_ANTHROPIC_PRICES, **self.anthropic}
+        self.elevenlabs = {**DEFAULT_ELEVENLABS_PRICES, **self.elevenlabs}
+        return self
+
+
+class ElevenLabsConfig(_Strict):
+    """Eleven Music API settings (docs read 2026-10-01; see docs/DECISIONS.md)."""
+
+    output_format: str = "auto"  # the API picks mp3_48000_192 for music_v2 models
+    timeout_s: int = Field(default=900, ge=30)  # long songs take minutes; never retried
+    context_adherence: Literal["low", "medium", "high"] = "high"
+    # Condition the first chunk on 04_melody_reference.wav (uploaded, billed like a
+    # generation). Off: the docs say references carry feel and palette, not the notes.
+    melody_reference: bool = False
+    condition_strength: Literal["low", "medium", "high", "xhigh"] = "low"
+
+    @model_validator(mode="after")
+    def _check_format(self) -> "ElevenLabsConfig":
+        if not (self.output_format == "auto" or self.output_format.startswith(("mp3_", "opus_"))):
+            raise ValueError("elevenlabs.output_format must be auto, mp3_* or opus_* "
+                             "(raw PCM is not supported yet)")  # fmt: skip
         return self
 
 
@@ -307,7 +332,7 @@ class AppConfig(_Strict):
     claude_effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
     claude_max_tokens: int = Field(default=16000, ge=1024)
     claude_fallbacks: bool = True  # server-side retry on another model if Claude declines
-    music_model: str = "music_v2_5"  # unverified until the M5 ElevenLabs docs pass
+    music_model: Literal["music_v2", "music_v2_5"] = "music_v2_5"  # chunked plans need v2+
     music_backend: Literal["stub", "elevenlabs"] = "stub"
     music_takes: int = Field(default=2, ge=1, le=8)  # takes per generation
     transcribe_backend: Literal["whisper"] = "whisper"
@@ -317,6 +342,7 @@ class AppConfig(_Strict):
     whisper: WhisperConfig = WhisperConfig()
     demucs: DemucsConfig = DemucsConfig()
     align: AlignConfig = AlignConfig()
+    elevenlabs: ElevenLabsConfig = ElevenLabsConfig()
     pricing: PricingConfig = PricingConfig()
 
     def snapshot(self) -> dict[str, Any]:

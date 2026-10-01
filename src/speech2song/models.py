@@ -495,6 +495,30 @@ class TakeMeta(BaseModel):
     params: dict[str, Any] = {}
 
 
+class TakeAnalysis(BaseModel):
+    """How a take matches its arrangement (06_music/analysis.json)."""
+
+    take: int
+    seconds: float
+    tempo_bpm: float | None  # as estimated (the music may read as half or double time)
+    tempo_ratio: float | None  # 0.5, 1 or 2: the reading closest to the target
+    tempo_error: float | None  # relative error at that reading
+    key: str | None
+    key_relation: Literal["same", "relative", "other"] | None
+    energy_correlation: float | None  # section levels vs. arrangement energies
+    section_levels_db: list[float] = []
+    lufs: float | None = None
+    flags: list[str] = []
+    score: float  # higher is better; used to pick a take
+
+
+class TakeChoice(BaseModel):
+    schema_version: Literal[1] = 1
+    chosen: int
+    reason: Literal["requested", "best score", "only take"]
+    takes: list[TakeAnalysis]
+
+
 # --- 07_mix/mix.json -------------------------------------------------------------------------
 
 

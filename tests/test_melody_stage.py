@@ -88,7 +88,7 @@ def test_melody_step_end_to_end(cli: Cli, talk: Talk, install: Callable) -> None
     assert melody.loop_phrase_count == 3
 
     midi = pretty_midi.PrettyMIDI(str(run.path("04_melody.mid")))
-    assert midi.get_tempo_changes()[1][0] == pytest.approx(melody.bpm)
+    assert midi.get_tempo_changes()[1][0] == pytest.approx(melody.bpm, abs=0.01)  # MIDI: whole µs
     melody_track = next(i for i in midi.instruments if i.name == "melody")
     assert len(melody_track.notes) == 3 * sum(len(c.notes) for c in melody.clips)
     assert melody_track.program == 0  # soft piano

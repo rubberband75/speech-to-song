@@ -179,14 +179,18 @@ def search_tempo(
     durations: Sequence[float],
     onsets: Sequence[float],
     grid: float,
-    step: float = 0.25,
+    step: float = 1.0,
 ) -> tuple[float, float]:
-    """(best bpm, its alignment cost) within bpm +/- tolerance.
+    """(best bpm, its alignment cost): multiples of `step` within bpm +/- tolerance.
 
     Moving away from the preset tempo costs a little (DRIFT_PENALTY at the edge of the
-    range), so a different tempo has to fit the clips clearly better to win.
+    range), so a different tempo has to fit the clips clearly better to win. The default
+    step keeps tempos whole: music generators hold "120 BPM" more reliably than 119.5.
     """
-    candidates = np.arange(bpm - tolerance, bpm + tolerance + 1e-9, step)
+    first = math.ceil((bpm - tolerance) / step - 1e-9) * step
+    candidates = np.arange(first, bpm + tolerance + 1e-9, step)
+    if len(candidates) == 0:
+        candidates = np.array([round(bpm / step) * step])
     costs = [alignment_cost(c, durations, onsets, grid) for c in candidates]
     total = [
         cost + DRIFT_PENALTY * abs(c - bpm) / max(tolerance, 1e-9)

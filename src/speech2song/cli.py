@@ -25,7 +25,7 @@ from speech2song import __version__
 from speech2song.audio.io import probe
 from speech2song.backends.music_base import backend_name
 from speech2song.config import AppConfig, list_presets, load_config, load_preset
-from speech2song.costs import CostLog, render_estimates
+from speech2song.costs import CostLog, fmt_units, render_estimates
 from speech2song.errors import S2SError
 from speech2song.manifest import Run
 from speech2song.models import ClipSet, RunOptions
@@ -57,8 +57,8 @@ def _arrange_stages(options: RunOptions) -> list[Stage]:
 
 def _generate_unavailable(config: AppConfig, options: RunOptions) -> str | None:
     name = backend_name(config, options)
-    if name != "stub":
-        return f"the {name} music backend is planned for M5 (use --music-backend stub)"
+    if name not in ("stub", "elevenlabs"):
+        return f"unknown music backend {name!r}"
     return None
 
 
@@ -665,12 +665,30 @@ def mix(
 def regenerate(
     ctx: typer.Context,
     section: Annotated[str, typer.Option(help="Arrangement section ID, e.g. s5.")],
-    note: Annotated[str | None, typer.Option(help="Guidance for the new take.")] = None,
+    note: Annotated[
+        str | None, typer.Option(help="Extra direction for the new version, e.g. 'less busy'.")
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show the plan and cost; call nothing.")
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Don't ask before paid calls.")] = False,
     run_ref: RunRef = None,
 ) -> None:
-    """Regenerate one music section via inpainting (planned for M5)."""
-    _env(ctx).console.print("`regenerate` is planned for M5; not implemented yet.")
-    raise typer.Exit(2)
+    """Regenerate one section of the current ElevenLabs take, keeping the rest (paid)."""
+    from speech2song.stages.generate_music import regenerate_section
+
+    env = _env(ctx)
+    run = _open_run(env, run_ref)
+    before = CostLog(run.costs_path).totals()["total"]
+    with run.logging_to_file(logging.DEBUG if env.verbose else logging.INFO):
+        context = _context(env, run, dry_run=dry_run, yes=yes)
+        updated = regenerate_section(context, section, note)
+        if updated is not None:
+            _update_options(run, take=updated.take)  # mix this version from now on
+            run.save()
+            _run_steps(context, [STEP_BY_NAME["generate"], STEP_BY_NAME["mix"]],
+                       dict(STANDARD_HOOKS))  # fmt: skip
+    _spend_line(env, run, before)
 
 
 # --- Inspection commands ---------------------------------------------------------------
@@ -691,7 +709,7 @@ def costs(ctx: typer.Context, run_ref: RunRef = None) -> None:
     for column in ("Time", "Stage", "Service", "Model", "Units", "USD"):
         table.add_column(column)
     for entry in entries:
-        units = ", ".join(f"{k}={v:,.0f}" for k, v in entry.units.items())
+        units = ", ".join(f"{k}={fmt_units(v)}" for k, v in entry.units.items())
         usd = f"${entry.usd:.4f}" + (" (est.)" if entry.estimated else "")
         table.add_row(
             f"{entry.ts:%Y-%m-%d %H:%M}", entry.stage, entry.service, entry.model, units, usd
