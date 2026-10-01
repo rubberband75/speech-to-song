@@ -84,6 +84,7 @@ class RunOptions(BaseModel):
     whisper_model: str | None = None
     language: str | None = None
     claude_model: str | None = None
+    key: str | None = None  # e.g. "D minor": overrides key detection
 
 
 class Manifest(BaseModel):
@@ -340,3 +341,56 @@ class ClipReview(BaseModel):
     selection_sha256: str
     order: list[str]
     dropped: list[str] = []
+
+
+# --- 04_melody.json ----------------------------------------------------------------------
+
+
+class MelodyNote(BaseModel):
+    start_beat: float  # from the start of the clip's phrase
+    beats: float
+    midi: int  # the note played
+    pitch: float  # tuned, snapped and octave-placed pitch (fractional MIDI)
+    speech_pitch: float  # as measured in the speech (fractional MIDI)
+    start_s: float  # the syllable in the clip, before quantizing
+    end_s: float
+    velocity: int
+    word: str | None = None
+
+
+class BarChord(BaseModel):
+    bar: int  # 0-based, within the phrase
+    degree: int  # 1-7 in the key
+    name: str  # e.g. "Am"
+    pitch_classes: list[int]
+
+
+class ClipMelody(BaseModel):
+    clip_id: str
+    file: str
+    duration_s: float
+    bars: int  # phrase length (whole bars, so loops line up)
+    voiced_ratio: float  # share of frames with a pitch (a confidence hint)
+    median_speech_pitch: float | None
+    notes: list[MelodyNote]
+    chords: list[BarChord]
+
+
+class Melody(BaseModel):
+    schema_version: Literal[1] = 1
+    key: str  # e.g. "C minor"
+    tonic: int
+    mode: Literal["major", "minor"]
+    key_source: Literal["detected", "preset", "override", "fallback"]
+    key_confidence: float | None = None  # Krumhansl-Schmuckler correlation (detected keys)
+    tuning_offset: float  # the speaker's offset from the semitone grid, removed first
+    bpm: float
+    tempo_cost: float  # grid misalignment at that tempo (0 = perfect)
+    time_signature: str = "4/4"
+    grid: str
+    snap_strength: float
+    octave_shift: int  # semitones added to every note to reach a melody range
+    loop_phrase_count: int
+    instrument: str
+    main_clip: str  # the phrase used for the audio reference
+    clips: list[ClipMelody]  # in playback order

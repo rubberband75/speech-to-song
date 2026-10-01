@@ -7,12 +7,13 @@ sample-exactly from the source.
 
 `docs/SPEC.md` is the source of truth; accepted changes are logged in `docs/DECISIONS.md`.
 
-**Status:** M2 — ingest, voice isolation, transcription, transcript alignment and clip
-selection work. Melody (M3) and later steps are stubs.
+**Status:** M3 — ingest, voice isolation, transcription, alignment, clip selection and
+the speech melody work. Arrangement, music generation and mixing (M4/M5) are stubs.
 
 ## Install
 
-Needs Python 3.12+, [uv](https://docs.astral.sh/uv/), and `ffmpeg`/`ffprobe` on `PATH`.
+Needs Python 3.12+, [uv](https://docs.astral.sh/uv/), `ffmpeg`/`ffprobe`, and `fluidsynth`
+with a General MIDI soundfont (Ubuntu: `fluidsynth fluid-soundfont-gm`).
 
 ```bash
 uv sync                    # app + dev tools (pytest, ruff)
@@ -35,6 +36,8 @@ speech2song status                  # what is done, stale or pending
 speech2song transcribe --no-transcript   # re-align without the transcript; ASR stays cached
 speech2song select --dry-run         # estimated Claude cost, no calls
 speech2song select --interactive-review   # Claude picks lines (asks first); review them
+speech2song melody                  # speech pitch -> melody, MIDI, audio reference
+uv run python scripts/melody_listen.py   # listening tests in runs/<run>/04_listen/
 speech2song run inputs/talk.mp3 --transcript inputs/talk.txt      # every implemented step
 ```
 
@@ -59,6 +62,18 @@ edges, adds 15 ms fades, and writes `clips/clip_NNN.wav` and `03_clips.json`. Ap
 the fades, clip audio is sample-identical to the source. Review choices (drop, reorder)
 are saved to `03_review.json` and survive re-runs. Targets (count, length, speech budget,
 fades) live in the preset's `clips:` block; `--clips N` overrides the count.
+
+### Melody
+
+`melody` tracks each clip's pitch (pYIN), turns syllables into notes, removes the
+speaker's tuning offset, finds the key (`--key "D minor"` overrides it), snaps notes
+toward the scale (`melody.scale_snap_strength`), moves them up into a melody register,
+picks the tempo within the preset's tolerance that best fits the clips, quantizes to the
+preset grid, and chooses one chord per bar. It writes `04_melody.json`, `04_melody.mid`
+(each phrase looped `loop_phrase_count` times) and `04_melody_reference.wav` (two loops
+of the main phrase, rendered with fluidsynth and a General MIDI soundfont).
+`scripts/melody_listen.py` writes, per clip, the speech, the melody, both together, and
+an "illusion" take where the speech repeats while the melody fades in.
 
 ### Official transcripts
 

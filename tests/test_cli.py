@@ -53,7 +53,7 @@ def test_presets_list_flags_invalid_preset(cli: Cli, tmp_path: Path) -> None:
     assert "invalid" in result.output
 
 
-@pytest.mark.parametrize(("command", "milestone"), [("melody", "M3"), ("mix", "M4")])
+@pytest.mark.parametrize(("command", "milestone"), [("arrange", "M4"), ("mix", "M4")])
 def test_unimplemented_steps_exit_2(cli: Cli, cli_run: Run, command: str, milestone: str) -> None:
     result = cli(command)
     assert result.exit_code == 2

@@ -7,7 +7,9 @@ requires-python = ">=3.12"
 dependencies = [
     "anthropic==1.11.0",
     "faster-whisper==1.2.1",
+    "librosa==1.0.0",
     "numpy==2.5.3",
+    "pretty-midi==0.2.11.post0",
     "pydantic==2.13.5",
     "python-dotenv==1.2.4",
     "pyyaml==6.0.3",

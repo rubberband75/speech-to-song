@@ -284,6 +284,7 @@ class AppConfig(_Strict):
     transcribe_backend: Literal["whisper"] = "whisper"
     whisper_model: str = "large-v3-turbo"
     language: str | None = None  # None = auto-detect
+    soundfont: Path | None = None  # General MIDI .sf2 for rendering; None = find a system one
     whisper: WhisperConfig = WhisperConfig()
     demucs: DemucsConfig = DemucsConfig()
     align: AlignConfig = AlignConfig()

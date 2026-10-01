@@ -3,14 +3,20 @@ import socket
 from collections.abc import Callable
 from pathlib import Path
 
+import numpy as np
 import pytest
 from rich.console import Console
 from typer.testing import CliRunner, Result
 
 from speech2song.cli import app
 from speech2song.config import AppConfig
-from speech2song.manifest import Run
+from speech2song.llm import claude
+from speech2song.manifest import Run, write_json
+from speech2song.models import Transcript
 from speech2song.pipeline import Context
+
+from .fixtures.fake_claude import FakeAnthropic
+from .fixtures.synth import synthetic_talk, write_wav
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PRESETS_DIR = REPO_ROOT / "presets"
@@ -76,3 +82,31 @@ def cli(tmp_path: Path) -> Callable[..., Result]:
         return runner.invoke(app, list(args), input=input, catch_exceptions=False)
 
     return invoke
+
+
+Talk = tuple[Run, Transcript, list[tuple[float, float]], np.ndarray]
+
+
+@pytest.fixture
+def talk(cli: Callable[..., Result], tmp_path: Path) -> Talk:
+    """A run (in the CLI's runs dir) holding a synthetic talk: 01_clean.wav (stereo) and
+    02_transcript.json with jittered word times, plus the true pauses."""
+    audio, transcript, silences = synthetic_talk()
+    stereo = np.stack([audio, 0.8 * audio], axis=1)
+    source = write_wav(tmp_path / "talk.wav", stereo)
+    run = Run.create(tmp_path / "runs", source, preset="cinematic_future_bass")
+    write_wav(run.path("01_clean.wav"), stereo)
+    write_json(run.path("02_transcript.json"), transcript)
+    return run, transcript, silences, stereo
+
+
+@pytest.fixture
+def install(monkeypatch: pytest.MonkeyPatch) -> Callable[..., FakeAnthropic]:
+    """Install a fake Anthropic client with scripted responses."""
+
+    def install_fake(*responses: object) -> FakeAnthropic:
+        fake = FakeAnthropic(*responses)
+        monkeypatch.setattr(claude, "client_factory", lambda: fake)
+        return fake
+
+    return install_fake

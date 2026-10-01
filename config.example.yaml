@@ -15,6 +15,7 @@ music_backend: stub               # stub | elevenlabs
 transcribe_backend: whisper
 whisper_model: large-v3-turbo     # e.g. small for speed; per run: --whisper-model
 language: null                    # null = detect; per run: --language en
+soundfont: null                   # General MIDI .sf2; null = /usr/share/sounds/sf2/FluidR3_GM.sf2 etc.
 
 whisper:
   device: auto                    # auto | cpu | cuda

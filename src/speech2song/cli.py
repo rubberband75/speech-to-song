@@ -33,6 +33,7 @@ from speech2song.review import run_review
 from speech2song.selection import clip_targets, estimate_input_tokens_from_duration
 from speech2song.stages.align import AlignStage
 from speech2song.stages.ingest import IngestStage, IsolateStage
+from speech2song.stages.melody import MelodyStage
 from speech2song.stages.select_clips import (
     CLIPS,
     ClipsStage,
@@ -57,7 +58,7 @@ STEPS: list[Step] = [
     Step("ingest", "M1", lambda: [IngestStage(), IsolateStage()]),
     Step("transcribe", "M1", lambda: [AsrStage(), AlignStage()]),
     Step("select", "M2", lambda: [SelectStage(), ClipsStage()]),
-    Step("melody", "M3", None),
+    Step("melody", "M3", lambda: [MelodyStage()]),
     Step("arrange", "M4", None),
     Step("generate", "M4", None),
     Step("mix", "M4", None),
@@ -494,6 +495,30 @@ def select(
     _run_step_command(env, run, "select", force=force, dry_run=dry_run, yes=yes, hooks=hooks)
 
 
+@app.command()
+@cli_errors
+def melody(
+    ctx: typer.Context,
+    key: Annotated[
+        str | None, typer.Option(help="Use this key instead of detecting one, e.g. 'D minor'.")
+    ] = None,
+    force: Force = False,
+    run_ref: RunRef = None,
+) -> None:
+    """Turn the clips' speech pitch into a melody, MIDI and a short audio reference."""
+    env = _env(ctx)
+    run = _open_run(env, run_ref)
+    if key is not None:
+        from speech2song.audio.theory import parse_key
+
+        try:
+            key = parse_key(key).name
+        except ValueError as exc:
+            raise S2SError(str(exc)) from exc
+    _update_options(run, key=key)
+    _run_step_command(env, run, "melody", force=force)
+
+
 def _stub_command(name: str) -> None:
     step = STEP_BY_NAME[name]
 
@@ -506,7 +531,7 @@ def _stub_command(name: str) -> None:
     app.command(name)(command)
 
 
-for _name in ("melody", "arrange", "generate", "mix"):
+for _name in ("arrange", "generate", "mix"):
     _stub_command(_name)
 
 
