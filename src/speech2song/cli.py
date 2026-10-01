@@ -26,6 +26,9 @@ from speech2song.errors import S2SError
 from speech2song.manifest import Run
 from speech2song.models import RunOptions
 from speech2song.pipeline import Context, Stage, check, execute
+from speech2song.stages.align import AlignStage
+from speech2song.stages.ingest import IngestStage, IsolateStage
+from speech2song.stages.transcribe import AsrStage
 
 # --- Steps -----------------------------------------------------------------------------
 
@@ -38,8 +41,8 @@ class Step:
 
 
 STEPS: list[Step] = [
-    Step("ingest", "M1", None),
-    Step("transcribe", "M1", None),
+    Step("ingest", "M1", lambda: [IngestStage(), IsolateStage()]),
+    Step("transcribe", "M1", lambda: [AsrStage(), AlignStage()]),
     Step("select", "M2", None),
     Step("melody", "M3", None),
     Step("arrange", "M4", None),
@@ -84,7 +87,8 @@ class Env:
 
 
 def _print_error(exc: Exception) -> None:
-    Console(stderr=True, highlight=False).print(Text.assemble(("Error: ", "bold red"), str(exc)))
+    console = Console(stderr=True, highlight=False, soft_wrap=True)
+    console.print(Text.assemble(("Error: ", "bold red"), str(exc)))
 
 
 def cli_errors[**P, R](func: Callable[P, R]) -> Callable[P, R]:
@@ -138,7 +142,7 @@ def _global(
         raise typer.Exit(1) from None
     if runs_dir is not None:
         cfg = cfg.model_copy(update={"runs_dir": runs_dir})
-    ctx.obj = Env(cfg, Console(highlight=False), verbose)
+    ctx.obj = Env(cfg, Console(highlight=False, soft_wrap=True), verbose)
 
 
 def _env(ctx: typer.Context) -> Env:

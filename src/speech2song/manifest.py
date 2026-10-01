@@ -5,8 +5,8 @@ import json
 import logging
 import os
 import re
-import tempfile
 import unicodedata
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
@@ -39,15 +39,16 @@ def make_run_id(input_path: Path, now: datetime) -> str:
 def atomic_write_text(path: Path, text: str) -> None:
     """Write through a temp file in the same directory, then rename over the target."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    # Exclusive create of a unique name (not mkstemp, whose files are always 0600).
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with tmp.open("x", encoding="utf-8") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-        Path(tmp).replace(path)
+        tmp.replace(path)
     except BaseException:
-        Path(tmp).unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
         raise
 
 

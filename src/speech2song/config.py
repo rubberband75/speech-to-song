@@ -183,9 +183,13 @@ class WhisperConfig(_Strict):
     compute_type: str = "auto"  # auto: int8 on CPU, float16 on CUDA
     beam_size: int = Field(default=5, ge=1)
     vad_filter: bool = True
-    batch_size: int = Field(default=0, ge=0)  # 0 = sequential decoding
+    batch_size: int = Field(default=8, ge=0)  # 0 = sequential decoding (slower here)
     cpu_threads: int = Field(default=0, ge=0)  # 0 = number of physical cores (estimated)
     condition_on_previous_text: bool = True
+    # Re-transcribe gaps between words that contain speech (decoders can drop chunks).
+    repair_gaps: bool = True
+    repair_min_gap_s: float = Field(default=3.0, gt=0)
+    repair_min_speech_s: float = Field(default=1.5, gt=0)
 
 
 class DemucsConfig(_Strict):

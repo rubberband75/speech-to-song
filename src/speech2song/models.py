@@ -118,3 +118,124 @@ class CostEntry(BaseModel):
     price_ref: str | None = None
     request_id: str | None = None
     note: str | None = None
+
+
+# --- 02_asr.json -------------------------------------------------------------------------
+
+
+class AsrWord(BaseModel):
+    w: str
+    start: float
+    end: float
+    conf: float
+
+
+class AsrSegment(BaseModel):
+    id: int
+    start: float
+    end: float
+    text: str
+    avg_logprob: float | None = None
+    no_speech_prob: float | None = None
+    compression_ratio: float | None = None
+    words: list[AsrWord] = []
+    repaired: bool = False  # produced by the gap-repair pass
+
+
+class AsrRepair(BaseModel):
+    """A gap with speech but no words. The window around it (the gap plus the
+    segments touching it) was re-transcribed and its words replaced."""
+
+    gap_start: float
+    gap_end: float
+    speech_s: float  # seconds of detected speech inside the gap
+    start: float  # re-transcribed window
+    end: float
+    words_before: int = 0  # words the window held before the repair
+    words_after: int = 0
+
+
+class AsrResult(BaseModel):
+    """Raw speech recognition output, cached so re-aligning never re-runs ASR."""
+
+    schema_version: Literal[1] = 1
+    backend: str
+    model: str
+    params: dict[str, Any] = {}
+    audio: str
+    language: str
+    language_probability: float | None = None
+    duration_s: float
+    segments: list[AsrSegment] = []
+    repairs: list[AsrRepair] = []
+
+    def words(self) -> list[AsrWord]:
+        return [word for segment in self.segments for word in segment.words]
+
+
+# --- 02_transcript.json ------------------------------------------------------------------
+
+# asr: no official transcript. matched/fuzzy: official word timed by ASR. interpolated:
+# official word ASR missed (time estimated). asr_only: spoken but not in the official text.
+WordFlag = Literal["asr", "matched", "fuzzy", "interpolated", "asr_only"]
+
+
+class Word(BaseModel):
+    w: str
+    start: float
+    end: float
+    conf: float | None = None
+    flag: WordFlag = "asr"
+    asr: str | None = None  # what ASR heard, when it differs from `w`
+
+
+class Sentence(BaseModel):
+    id: int
+    text: str
+    start: float
+    end: float
+    word_start: int  # index into Transcript.words (inclusive)
+    word_end: int  # exclusive
+    source: Literal["official", "asr"]
+    avg_conf: float | None = None
+
+
+class Span(BaseModel):
+    text: str
+    start: float | None = None
+    end: float | None = None
+    line: int | None = None  # 1-based line in the official transcript
+
+
+class AlignmentReport(BaseModel):
+    official_words: int
+    matched: int
+    fuzzy: int
+    interpolated: int
+    unspoken: int
+    asr_words: int
+    asr_only: int
+    quality: float  # (matched + fuzzy) / official words, as in the spec
+    quality_spoken: float  # same, ignoring official words judged unspoken
+    coverage: float  # fraction of ASR words tied to official text
+    anchor_coverage: float  # fraction of ASR tokens in runs of 3+ consecutive pairs
+    unspoken_spans: list[Span] = []
+    asr_only_spans: list[Span] = []
+    fallback: bool = False  # official text ignored because it barely matched
+
+
+class AsrRef(BaseModel):
+    backend: str
+    model: str
+
+
+class Transcript(BaseModel):
+    schema_version: Literal[1] = 1
+    source: str
+    duration_s: float
+    language: str
+    words: list[Word]
+    sentences: list[Sentence]
+    official_transcript_used: bool
+    alignment: AlignmentReport | None = None
+    asr: AsrRef
