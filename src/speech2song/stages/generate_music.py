@@ -4,7 +4,8 @@ ElevenLabs, free with the stub); `take` picks one and conforms it for the mixer 
 `generate` keeps takes exactly as the backend returned them. Its cache key is the
 backend's request (built from the arrangement), not the arrangement file's bytes, so
 edits that don't change what would be generated (clip offsets, melody-layer choices)
-never repeat it.
+never repeat it. Takes of older requests stay available while their timing fits; `take`
+picks among the newest by default, and `--take N` can pick any of them.
 """
 
 import tempfile
@@ -14,20 +15,26 @@ from typing import ClassVar
 import numpy as np
 import soundfile as sf
 
-from speech2song.arrangement import SONG_TAIL_S, bar_seconds
+from speech2song.arrangement import SONG_TAIL_S, bar_seconds, energy_bounds
 from speech2song.audio.analysis import analyze_take
 from speech2song.audio.io import extract_audio, probe
 from speech2song.audio.synth import write_wav
-from speech2song.backends.music_base import MusicBackend, backend_name, make_backend
+from speech2song.backends.music_base import (
+    MusicBackend,
+    backend_name,
+    make_backend,
+    take_fits,
+    take_metas,
+)
 from speech2song.config import SAMPLE_RATE, load_preset
 from speech2song.costs import CostLog, SpendEstimate, unit_usd
 from speech2song.errors import S2SError, StageError
 from speech2song.llm.claude import request_digest
 from speech2song.manifest import write_json
 from speech2song.models import Arrangement, TakeAnalysis, TakeChoice, TakeMeta
-from speech2song.music_plan import plan_minutes
+from speech2song.music_plan import grid_ms, plan_minutes
 from speech2song.pipeline import Context, Stage, StagePlan, StageResult
-from speech2song.stages.arrange import ARRANGEMENT
+from speech2song.stages.arrange import ARRANGEMENT, usable_arrangement
 from speech2song.stages.melody import REFERENCE
 
 MUSIC_DIR = "06_music"
@@ -75,8 +82,8 @@ class GenerateStage(Stage):
             "takes": takes,
             "request": request_digest(request) if request is not None else None,
         }
-        outputs = [take_meta_path(n) for n in range(1, takes + 1)]
-        return StagePlan({}, params, outputs, waits_for={"arrangement": ctx.run.path(ARRANGEMENT)})
+        # The take numbers are known only after running (see StageResult.outputs).
+        return StagePlan({}, params, [], waits_for={"arrangement": ctx.run.path(ARRANGEMENT)})
 
     def estimate(self, ctx: Context, plan: StagePlan) -> list[SpendEstimate]:
         request = self._request(ctx)
@@ -85,6 +92,7 @@ class GenerateStage(Stage):
         return self._backend(ctx).estimate(request, ctx.config.music_takes)
 
     def run(self, ctx: Context, plan: StagePlan) -> StageResult:
+        usable_arrangement(ctx)  # never pay for music for a broken arrangement
         backend = self._backend(ctx)
         request = self._request(ctx)
         if request is None:
@@ -98,6 +106,10 @@ class GenerateStage(Stage):
         for take in takes:
             outputs += [take.meta.file, take_meta_path(take.meta.take)]
             ctx.say(f"  take {take.meta.take}: {take.meta.seconds:.1f} s -> {take.meta.file}")
+        pinned = ctx.run.manifest.options.take
+        if pinned is not None and pinned not in {take.meta.take for take in takes}:
+            ctx.say(f"[yellow]  take {pinned} is still the one mixed (--take); use "
+                    "`mix --take auto` for the best of these[/]")  # fmt: skip
         return StageResult(
             outputs=outputs,
             summary={"backend": backend.name, "takes": len(takes),
@@ -137,14 +149,19 @@ def read_take(path: Path, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
 
 
 def analysis_targets(arrangement: Arrangement) -> dict:
-    """What a take is measured against (also the take stage's cache key)."""
+    """What a take is measured against (also the take stage's cache key). Silent
+    sections are left out: the mix mutes them, whatever the music does there."""
     bar = bar_seconds(arrangement.bpm)
+    measured = [(s, (a + b) / 2) for s, (a, b)
+                in zip(arrangement.sections, energy_bounds(arrangement.sections), strict=True)
+                if not s.silent]  # fmt: skip
     return {
         "bpm": arrangement.bpm,
         "key": arrangement.key,
+        "sections": [s.id for s, _ in measured],
         "spans_s": [[round(s.start_bar * bar, 4), round((s.start_bar + s.bars) * bar, 4)]
-                    for s in arrangement.sections],
-        "energies": [s.energy for s in arrangement.sections],
+                    for s, _ in measured],
+        "energies": [round(energy, 4) for _, energy in measured],
         "expected_s": arrangement.total_seconds,
     }  # fmt: skip
 
@@ -159,24 +176,26 @@ def choose_take(analyses: list[TakeAnalysis], requested: int | None) -> tuple[in
 
 
 class TakeStage(Stage):
-    """Analyses every take against the arrangement (tempo, key, energy contour, loudness),
-    picks one (`--take N`, else the best score) and conforms it to the song. Free."""
+    """Analyses every take that fits the arrangement (tempo, key, energy contour,
+    loudness), picks one (`--take N`, else the best score among the takes made for the
+    current request) and conforms it to the song. Free."""
 
     name: ClassVar[str] = "take"
-    version: ClassVar[int] = 2  # 2: analysis and automatic choice
-    analysis_version: ClassVar[int] = 3  # 3: tempogram guess refined by autocorrelation
+    version: ClassVar[int] = 3  # 3: takes of older requests that still fit
+    analysis_version: ClassVar[int] = 4  # 4: silent sections left out, mean energies
 
     def plan(self, ctx: Context) -> StagePlan:
         inputs: dict[str, Path] = {}
-        for number in range(1, ctx.config.music_takes + 1):
-            meta_path = ctx.run.path(take_meta_path(number))
-            inputs[f"take {number} meta"] = meta_path
-            if meta_path.exists():
-                meta = TakeMeta.model_validate_json(meta_path.read_text(encoding="utf-8"))
-                inputs[f"take {number}"] = ctx.run.path(meta.file)
+        for meta in take_metas(ctx.run.path(MUSIC_DIR)):
+            inputs[f"take {meta.take} meta"] = ctx.run.path(take_meta_path(meta.take))
+            inputs[f"take {meta.take}"] = ctx.run.path(meta.file)
         arrangement = _arrangement(ctx)
+        request = GenerateStage()._request(ctx)
         params = {
             "take": ctx.run.manifest.options.take,
+            "backend": backend_name(ctx.config, ctx.run.manifest.options),
+            "request": request_digest(request) if request is not None else None,
+            "grid_ms": grid_ms(arrangement) if arrangement is not None else None,
             "sample_rate": SAMPLE_RATE,
             "frames": song_frames(arrangement) if arrangement is not None else None,
             "targets": analysis_targets(arrangement) if arrangement is not None else None,
@@ -188,34 +207,47 @@ class TakeStage(Stage):
                          waits_for={"arrangement": ctx.run.path(ARRANGEMENT)})  # fmt: skip
 
     def run(self, ctx: Context, plan: StagePlan) -> StageResult:
-        requested = plan.params["take"]
-        takes = ctx.config.music_takes
-        if requested is not None and requested > takes:
-            raise StageError(f"take {requested} does not exist (music_takes is {takes})")
-        targets = plan.params["targets"]
-        frames = plan.params["frames"]
+        usable_arrangement(ctx)
+        params = plan.params
+        grid, digest = params["grid_ms"], params["request"]
+        metas = [
+            m
+            for m in take_metas(ctx.run.path(MUSIC_DIR))
+            if m.backend == params["backend"] and take_fits(m, ctx.run.root, grid, digest)
+        ]
+        if not metas:
+            raise StageError("no take fits the arrangement; run `speech2song generate`")
+        requested = params["take"]
+        if requested is not None and requested not in {meta.take for meta in metas}:
+            raise StageError(f"take {requested} is not available; takes that fit the "
+                             f"arrangement: {', '.join(str(m.take) for m in metas)}")  # fmt: skip
+        targets = params["targets"]
+        frames = params["frames"]
         audio_by_take: dict[int, np.ndarray] = {}
         analyses = []
-        for number in range(1, takes + 1):
-            path = plan.inputs[f"take {number}"]
-            audio = read_take(path)
-            audio_by_take[number] = audio
+        for meta in metas:
+            audio = read_take(ctx.run.path(meta.file))
+            audio_by_take[meta.take] = audio
             analysis = analyze_take(
-                audio, SAMPLE_RATE, take=number, bpm=targets["bpm"], key=targets["key"],
+                audio, SAMPLE_RATE, take=meta.take, bpm=targets["bpm"], key=targets["key"],
                 spans_s=[tuple(span) for span in targets["spans_s"]],
-                energies=targets["energies"], tolerance_bpm=plan.params["tolerance_bpm"],
+                energies=targets["energies"], tolerance_bpm=params["tolerance_bpm"],
                 expected_s=targets["expected_s"],
-            )  # fmt: skip
+            ).model_copy(update={"sections": targets["sections"],
+                                 "current": meta.request_sha256 == digest})  # fmt: skip
             analyses.append(analysis)
             tempo = (f"{analysis.tempo_bpm:.1f} BPM (x{analysis.tempo_ratio:g})"
                      if analysis.tempo_bpm else "tempo n/a")  # fmt: skip
-            corr = analysis.energy_correlation
-            ctx.say(f"  take {number}: {tempo}, key {analysis.key} ({analysis.key_relation}), "
-                    f"energy r={'n/a' if corr is None else f'{corr:.2f}'}, "
-                    f"{analysis.lufs} LUFS, score {analysis.score:.2f}")  # fmt: skip
+            corr = "n/a" if analysis.energy_correlation is None else \
+                f"{analysis.energy_correlation:.2f}"  # fmt: skip
+            older = "" if analysis.current else " (older request)"
+            ctx.say(f"  take {meta.take}{older}: {tempo}, key {analysis.key} "
+                    f"({analysis.key_relation}), energy r={corr}, {analysis.lufs} LUFS, "
+                    f"score {analysis.score:.2f}")  # fmt: skip
             for flag in analysis.flags:
                 ctx.say(f"[yellow]    {flag}[/]")
-        number, reason = choose_take(analyses, requested)
+        newest = [a for a in analyses if a.current]
+        number, reason = choose_take(newest or analyses, requested)
         write_json(ctx.run.path(ANALYSIS), TakeChoice(chosen=number, reason=reason,
                                                       takes=analyses))  # fmt: skip
         audio = audio_by_take[number]
@@ -245,12 +277,13 @@ def current_take(ctx: Context) -> TakeMeta:
     return TakeMeta.model_validate_json(meta_path.read_text(encoding="utf-8"))
 
 
-def regenerate_section(ctx: Context, section_id: str, note: str | None) -> TakeMeta | None:
-    """Inpaint one section of the current take (paid): estimate, confirm, call, and
-    make the result the take's new version. Returns None on a dry run."""
+def regenerate_sections(ctx: Context, specs: list[str], note: str | None) -> TakeMeta | None:
+    """Inpaint neighbouring sections of the current take (paid): estimate, confirm, call,
+    and make the result the take's new version. Returns None on a dry run."""
+    from speech2song.backends.music_base import take_grid
     from speech2song.backends.music_elevenlabs import ElevenLabsBackend
     from speech2song.costs import confirm_spend
-    from speech2song.music_plan import inpaint_plan
+    from speech2song.music_plan import expand_sections, inpaint_plan
 
     meta = current_take(ctx)
     if meta.backend != "elevenlabs" or not meta.song_id:
@@ -261,34 +294,29 @@ def regenerate_section(ctx: Context, section_id: str, note: str | None) -> TakeM
         raise S2SError("No arrangement; run `speech2song arrange` first.")
     preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
     backend = ElevenLabsBackend(ctx.config, CostLog(ctx.run.costs_path), ctx.run.id)
-    reference = ctx.run.path(REFERENCE)
-    request = backend.request(arrangement, preset, reference if reference.exists() else None)
-    if request_digest(request) != meta.request_sha256:
-        raise S2SError(f"The arrangement or music settings changed since take {meta.take} was "
+    if take_grid(meta, ctx.run.root) != grid_ms(arrangement):
+        raise S2SError(f"The arrangement's timing changed since take {meta.take} was "
                        "generated, so its sections no longer line up. Run `speech2song "
                        "generate` first.")  # fmt: skip
     try:
-        plan, span = inpaint_plan(
-            arrangement,
-            preset,
-            meta.song_id,
-            section_id,
-            note,
-            context_adherence=ctx.config.elevenlabs.context_adherence,
-        )
+        section_ids = expand_sections(arrangement, specs)
+        adherence = ctx.config.elevenlabs.context_adherence
+        plan, span = inpaint_plan(arrangement, preset, meta.song_id, section_ids, note,
+                                  context_adherence=adherence)  # fmt: skip
     except ValueError as exc:
-        raise S2SError(str(exc)) from exc  # fmt: skip
+        raise S2SError(str(exc)) from exc
+    label = section_ids[0] if len(section_ids) == 1 else f"{section_ids[0]}-{section_ids[-1]}"
     minutes = plan_minutes(plan)
     estimate = SpendEstimate(
         service="elevenlabs", model=meta.model or ctx.config.music_model,
         units={"minutes": round(minutes, 3)},
         usd=unit_usd(ctx.config.pricing, "music", minutes),
-        description=f"regenerate {section_id} of take {meta.take} "
+        description=f"regenerate {label} of take {meta.take} "
                     f"({(span[1] - span[0]) / 1000:.1f} s new; priced as the whole song)",
     )  # fmt: skip
-    ctx.say(f"Regenerating {section_id} ({span[0] / 1000:.1f}-{span[1] / 1000:.1f} s) of take "
+    ctx.say(f"Regenerating {label} ({span[0] / 1000:.1f}-{span[1] / 1000:.1f} s) of take "
             f"{meta.take}; the rest of the take is kept as it is.")  # fmt: skip
     if not confirm_spend([estimate], console=ctx.console, yes=ctx.yes, dry_run=ctx.dry_run):
         return None
     return backend.inpaint(plan, meta, ctx.run.path(MUSIC_DIR), ctx.run.root,
-                           section=section_id, note=note, span_ms=span, say=ctx.say)  # fmt: skip
+                           section=label, note=note, span_ms=span, say=ctx.say)  # fmt: skip

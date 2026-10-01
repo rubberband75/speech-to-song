@@ -457,6 +457,7 @@ class Section(BaseModel):
     clip_id: str | None = None  # the clip this speech_bed carries
     clip_offset_beats: float = 0.0  # where the clip starts, from the section start
     melody_phrase: str | None = None  # clip whose melody the melody layer replays here
+    silent: bool = False  # the mix mutes the music here (a gap); nothing is generated for it
     start_s: float = 0.0  # informational: start_bar at the arrangement's tempo
     seconds: float = 0.0
 
@@ -492,6 +493,9 @@ class TakeMeta(BaseModel):
     usd: float = 0.0
     song_id: str | None = None  # stored song for inpainting, when the backend keeps one
     request_sha256: str
+    # Chunk lengths (ms) the music was generated with. The take fits any arrangement with
+    # the same grid, so it stays usable when only styles or the plan's wording change.
+    grid_ms: list[int] | None = None
     params: dict[str, Any] = {}
 
 
@@ -506,10 +510,12 @@ class TakeAnalysis(BaseModel):
     key: str | None
     key_relation: Literal["same", "relative", "other"] | None
     energy_correlation: float | None  # section levels vs. arrangement energies
+    sections: list[str] = []  # the sections measured (silent ones are left out)
     section_levels_db: list[float] = []
     lufs: float | None = None
     flags: list[str] = []
     score: float  # higher is better; used to pick a take
+    current: bool = True  # made for the current music request (else an older one that fits)
 
 
 class TakeChoice(BaseModel):
@@ -531,6 +537,17 @@ class PlacedClip(BaseModel):
     start_s: float
 
 
+class SectionLevel(BaseModel):
+    """Energy shaping of one section of the music (07_mix/mix.json)."""
+
+    section_id: str
+    role: str
+    energy: float  # mean over the section (a build rises through it)
+    lufs: float | None  # as generated; None when silent or too short to measure
+    target_lufs: float | None
+    gain_db: float  # applied in the mix
+
+
 class MixReport(BaseModel):
     schema_version: Literal[1] = 1
     sample_rate: int
@@ -548,4 +565,6 @@ class MixReport(BaseModel):
     master_gain_db: float
     integrated_lufs: float
     true_peak_dbtp: float
+    section_levels: list[SectionLevel] = []
+    silenced: list[str] = []  # silent sections (gaps), muted in the mix
     warnings: list[str] = []

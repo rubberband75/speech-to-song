@@ -48,6 +48,19 @@ def _clips(ctx: Context) -> tuple[ClipSet, list[ClipInfo]]:
     return clip_set, [clip_info(clip) for clip in kept_clips(clip_set)]
 
 
+def usable_arrangement(ctx: Context) -> Arrangement:
+    """05_arrangement.json, checked for hand-edit mistakes before music is generated,
+    chosen or mixed for it."""
+    arrangement = Arrangement.model_validate_json(
+        ctx.run.path(ARRANGEMENT).read_text(encoding="utf-8")
+    )
+    clip_set = ClipSet.model_validate_json(ctx.run.path(CLIPS).read_text(encoding="utf-8"))
+    problems = validate_arrangement(arrangement, {c.id: clip_info(c) for c in clip_set.clips})
+    if problems:
+        raise StageError(f"{ARRANGEMENT} can't be used: " + "; ".join(problems))
+    return arrangement
+
+
 def _melody(ctx: Context) -> Melody:
     return Melody.model_validate_json(ctx.run.path(MELODY).read_text(encoding="utf-8"))
 
@@ -160,7 +173,7 @@ class ArcStage(Stage):
 
 class ArrangeStage(Stage):
     name: ClassVar[str] = "arrange"
-    version: ClassVar[int] = 1
+    version: ClassVar[int] = 2  # 2: sections carry `silent`
 
     def plan(self, ctx: Context) -> StagePlan:
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
@@ -230,7 +243,9 @@ def show_arrangement(ctx: Context) -> None:
                         f"(arc from the {arrangement.arc_source})")  # fmt: skip
     for column in ("", "Bar", "Bars", "Time", "Role", "Energy", "Clip / melody layer"):
         table.add_column(column)
-    for row in timeline_rows(arrangement, texts):
+    preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
+    layer = (ctx.run.manifest.options.melody_layer or preset.melody.layer) != "off"
+    for row in timeline_rows(arrangement, texts, melody_layer=layer):
         table.add_row(*(escape(cell) for cell in row))
     ctx.console.print(table)
     for line in timeline_strip(arrangement):

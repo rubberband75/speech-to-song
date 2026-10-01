@@ -66,14 +66,19 @@ def test_arrange_generate_mix(cli: Cli, talk: Talk, install: Callable, short_son
     assert result.exit_code == 0, result.output
     assert run.path("06_music/take_001.wav").exists()
     assert not run.path("06_music/take_002.wav").exists()  # music_takes: 1
-    selected = sf.info(str(run.path("06_music/selected.wav")))
-    assert selected.duration == pytest.approx(arrangement.total_seconds + 2.0, abs=1e-3)
 
     result = cli("mix")
     assert result.exit_code == 0, result.output
     assert "Listen to:" in result.output
+    selected = sf.info(str(run.path("06_music/selected.wav")))
+    assert selected.duration == pytest.approx(arrangement.total_seconds + 2.0, abs=1e-3)
     report = MixReport.model_validate_json(run.path("07_mix/mix.json").read_text())
-    assert report.melody_layer == "replay"
+    assert report.melody_layer == "off"  # the preset's default: no MIDI in the song
+    assert not run.path("07_mix/stems/melody_layer.wav").exists()
+    gaps = [s.id for s in arrangement.sections if s.silent]
+    assert gaps and report.silenced == gaps
+    assert [level.section_id for level in report.section_levels] == [
+        s.id for s in arrangement.sections]  # fmt: skip
     assert report.integrated_lufs == pytest.approx(-14.0, abs=0.2)
     assert report.true_peak_dbtp <= -1.0
     ffmpeg = measure_loudness(run.path("07_mix/master.wav"))
@@ -87,18 +92,19 @@ def test_arrange_generate_mix(cli: Cli, talk: Talk, install: Callable, short_son
     for placed in report.clips:
         clip, _ = sf.read(str(run.path(files[placed.clip_id])), dtype="float32", always_2d=True)
         assert np.array_equal(speech[placed.start_sample : placed.end_sample], clip)
-    layer, _ = sf.read(str(run.path("07_mix/stems/melody_layer.wav")), dtype="float32")
-    assert np.abs(layer).max() > 0
 
     # Everything is cached now; the melody layer is a mix setting only.
     assert _m4(cli) == []
-    result = cli("mix", "--melody-layer", "off")
+    result = cli("mix", "--melody-layer", "replay")
     assert _ran(result.output) == ["mix"]
-    assert not run.path("07_mix/stems/melody_layer.wav").exists()
-    assert "melody layer off" in result.output
+    layer, _ = sf.read(str(run.path("07_mix/stems/melody_layer.wav")), dtype="float32")
+    assert np.abs(layer).max() > 0
     assert _m4(cli, "--melody-layer", "all") == ["mix"]
     report = MixReport.model_validate_json(run.path("07_mix/mix.json").read_text())
     assert report.melody_layer == "all"
+    result = cli("mix", "--melody-layer", "off")
+    assert not run.path("07_mix/stems/melody_layer.wav").exists()
+    assert "melody layer off" in result.output
 
 
 def test_generate_reruns_only_when_the_music_request_changes(
@@ -122,7 +128,8 @@ def test_generate_reruns_only_when_the_music_request_changes(
     path.write_text(json.dumps(data))
     result = cli("mix")
     assert result.exit_code == 1
-    assert "can't be mixed" in result.output and "starts at bar" in result.output
+    assert "can't be used" in result.output and "starts at bar" in result.output
+    assert "can't be used" in cli("generate").output  # nothing is generated for it either
 
 
 def _arc_answer(parts: list[tuple[str, int, list[str]]]) -> dict:
@@ -210,7 +217,13 @@ def test_arc_edits_keep_the_paid_selection(
     assert "Arrangement" in cli("arrange").output
 
 
-def test_take_must_exist(cli: Cli, talk: Talk) -> None:
-    result = cli("generate", "--take", "3")
+def test_take_must_exist(cli: Cli, talk: Talk, install: Callable, short_song: Path) -> None:
+    _prepare(cli, talk, install, TWO_CLIPS)
+    assert _m4(cli) == ["arrange", "generate", "take", "mix"]
+    result = cli("mix", "--take", "3")
     assert result.exit_code == 1
-    assert "only 2 take(s)" in result.output
+    assert "take 3 is not available; takes that fit the arrangement: 1" in result.output
+    assert "give a take number" in cli("mix", "--take", "0").output
+    result = cli("mix", "--take", "auto")
+    assert result.exit_code == 0, result.output
+    assert "using take 1 (only take)" in result.output

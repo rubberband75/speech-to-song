@@ -17,12 +17,13 @@ import numpy as np
 from speech2song.arrangement import BEATS_PER_BAR, SONG_TAIL_S, beat_seconds, energy_bounds
 from speech2song.audio.synth import write_wav
 from speech2song.audio.theory import parse_chord
-from speech2song.backends.music_base import Take
+from speech2song.backends.music_base import Take, next_take_number, remove_stub_takes
 from speech2song.config import SAMPLE_RATE, Preset
 from speech2song.costs import SpendEstimate
 from speech2song.llm.claude import request_digest
 from speech2song.manifest import write_json
 from speech2song.models import Arrangement, TakeMeta
+from speech2song.music_plan import grid_ms
 
 STUB_VERSION = 1  # bump when the sound changes
 BASE_SEED = 1234
@@ -191,6 +192,7 @@ class StubBackend:
             "bpm": arrangement.bpm,
             "key": arrangement.key,
             "total_bars": arrangement.total_bars,
+            "grid_ms": grid_ms(arrangement),
             "sections": [
                 {"role": s.role, "start_bar": s.start_bar, "bars": s.bars, "shape": s.shape,
                  "energy_start": a, "energy_end": b, "chords": s.chords}
@@ -212,8 +214,10 @@ class StubBackend:
     ) -> list[Take]:
         out_dir.mkdir(parents=True, exist_ok=True)
         digest = request_digest(request)
+        remove_stub_takes(out_dir, run_dir)
+        first = next_take_number(out_dir)
         results = []
-        for number in range(1, takes + 1):
+        for number in range(first, first + takes):
             seed = BASE_SEED + number
             audio = synthesize(request, seed)
             path = out_dir / f"take_{number:03d}.wav"
@@ -227,6 +231,7 @@ class StubBackend:
                 seconds=round(len(audio) / SAMPLE_RATE, 4),
                 seed=seed,
                 request_sha256=digest,
+                grid_ms=request["grid_ms"],
             )
             write_json(path.with_suffix(".meta.json"), meta)
             results.append(Take(path, meta))

@@ -40,7 +40,8 @@ negative_styles:
 # Section roles. The arrangement builder maps each speech clip onto the timeline,
 # then picks section roles around it. "energy" is 0-1 and guides density. "bars" is the
 # section length (default 8; a speech_bed is fitted to its clip). "shape" is flat, rise
-# (builds into the next section) or fall (fades out).
+# (builds into the next section) or fall (fades out). "silent" sections are muted in the
+# mix; nothing is generated for them.
 section_roles:
   intro:
     energy: 0.15
@@ -54,10 +55,10 @@ section_roles:
     bars: 8
     shape: rise
     styles: [rising synths, filtered percussion, pitch sweeps, reverse swells, increasing stereo width and reverb]
-  gap:                  # brief near-silence before a drop
+  gap:                  # a bar of silence before a drop: the build's reverb tail only
     energy: 0.0
     bars: 1
-    styles: [near silence, reverb tail only]
+    silent: true
   drop:
     energy: 1.0
     bars: 16
@@ -97,13 +98,18 @@ mix:
   speech_level_lu: 2                # speech loudness relative to the music's
   melody_layer_lu: -10              # melody layer loudness relative to the music's
   melody_under_speech_db: -6        # extra cut when the melody plays under speech
+  energy_range_db: 10               # level from energy 0 to 1 when shaping the music
+  energy_tolerance_db: 3            # deviations within this are left alone
+  energy_max_db: 6                  # largest correction per section (0 = no shaping)
+  gap_reverb: 0.5                   # reverb tail level in silent sections (0 = none)
 
 # Speech-to-melody settings
 melody:
   quantize_grid: 1/8
   scale_snap_strength: 0.8          # 0 = raw speech contour, 1 = fully snapped to scale
   loop_phrase_count: 3              # repetition drives the speech-to-song illusion
-  render_instrument: soft_piano     # rendered and used as the audio reference
-  layer: replay                     # replay (the line just heard returns as the tune in
-                                    # layer_roles) | all (also quietly under speech) | off
+  render_instrument: soft_piano     # rendered for the (optional) audio reference
+  layer: "off"                      # MIDI melody in the mix: off | replay (the line just
+                                    # heard returns as the tune in layer_roles) | all
+                                    # (also quietly under speech)
   layer_roles: [breakdown, drop]

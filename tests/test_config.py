@@ -41,7 +41,8 @@ def test_real_preset_loads() -> None:
     assert preset.arc.count("speech_bed") == 3  # the closing line can end the song
     assert preset.role_bars("drop") == 16 and preset.role_bars("gap") == 1
     assert preset.section_roles["build"].shape == "rise"
-    assert preset.melody.layer == "replay"
+    assert preset.melody.layer == "off"  # no MIDI in the song unless asked for
+    assert preset.section_roles["gap"].silent and not preset.section_roles["build"].silent
 
 
 @pytest.mark.parametrize(
@@ -60,6 +61,8 @@ def test_real_preset_loads() -> None:
         (lambda d: d.update(arc=["intro", "drop"]), "at least one speech_bed"),
         (lambda d: d["melody"].update(layer_roles=["chorus"]), "layer_roles"),
         (lambda d: d["melody"].update(layer="loud"), "layer"),
+        (lambda d: d["section_roles"]["speech_bed"].update(silent=True), "beds carry music"),
+        (lambda d: d["mix"].update(energy_max_db=-1), "energy_max_db"),
     ],
 )
 def test_invalid_presets_are_rejected(tmp_path: Path, mutate: Any, message: str) -> None:
@@ -68,6 +71,13 @@ def test_invalid_presets_are_rejected(tmp_path: Path, mutate: Any, message: str)
     _write_preset(tmp_path, data)
     with pytest.raises(ConfigError, match=message):
         load_preset(data["name"], tmp_path)
+
+
+def test_a_bare_yaml_off_turns_the_melody_layer_off(tmp_path: Path) -> None:
+    text = yaml.safe_dump(_preset_data()).replace("layer: 'off'", "layer: off")
+    assert "layer: off" in text
+    (tmp_path / "cinematic_future_bass.yaml").write_text(text)
+    assert load_preset("cinematic_future_bass", tmp_path).melody.layer == "off"
 
 
 def test_sharp_tonic_is_accepted(tmp_path: Path) -> None:

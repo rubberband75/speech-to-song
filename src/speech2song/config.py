@@ -9,7 +9,15 @@ from typing import Any, Literal
 
 import yaml
 from dotenv import find_dotenv, load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from speech2song.errors import ConfigError
 
@@ -65,6 +73,9 @@ class SectionRole(_Strict):
     bars: int | None = Field(default=None, ge=1, le=64)
     # Energy over the section: steady, rising into the next section, or fading out.
     shape: Literal["flat", "rise", "fall"] = "flat"
+    # The mix silences the music here (a gap before a drop). Nothing is generated for
+    # it: the music of the section before runs on underneath and is muted locally.
+    silent: bool = False
 
 
 class SpeechInteraction(_Strict):
@@ -86,6 +97,14 @@ class MixSpec(_Strict):
     speech_level_lu: float = 2.0  # speech loudness relative to the music's
     melody_layer_lu: float = -10.0  # melody layer loudness relative to the music's
     melody_under_speech_db: float = Field(default=-6.0, le=0)  # extra cut under speech
+    # Energy shaping: each section's level is pulled toward a line through the sections'
+    # median, `energy_range_db` louder at energy 1 than at energy 0. Only the part of a
+    # deviation beyond `energy_tolerance_db` is corrected, by at most `energy_max_db`
+    # (0 turns shaping off).
+    energy_range_db: float = Field(default=10.0, ge=0)
+    energy_tolerance_db: float = Field(default=3.0, ge=0)
+    energy_max_db: float = Field(default=6.0, ge=0)
+    gap_reverb: float = Field(default=0.5, ge=0, le=1)  # reverb tail level in silent sections
 
 
 class MelodySpec(_Strict):
@@ -95,8 +114,13 @@ class MelodySpec(_Strict):
     render_instrument: str = "soft_piano"
     # The melody layer in the mix: "replay" plays the line just heard in the sections of
     # `layer_roles`; "all" also plays each clip's melody quietly under the speech.
-    layer: Literal["replay", "all", "off"] = "replay"
+    layer: Literal["replay", "all", "off"] = "off"
     layer_roles: list[str] = ["breakdown", "drop"]
+
+    @field_validator("layer", mode="before")
+    @classmethod
+    def _yaml_off(cls, value: object) -> object:
+        return "off" if value is False else value  # YAML reads a bare `off` as false
 
     @model_validator(mode="after")
     def _check_grid(self) -> "MelodySpec":
@@ -147,6 +171,8 @@ class Preset(_Strict):
             raise ValueError("section_roles must define 'speech_bed' (it plays under each clip)")
         if self.section_roles[SPEECH_ROLE].bars is not None:
             raise ValueError("section_roles.speech_bed.bars is not allowed: beds fit their clip")
+        if self.section_roles[SPEECH_ROLE].silent:
+            raise ValueError("section_roles.speech_bed.silent is not allowed: beds carry music")
         if SPEECH_ROLE not in self.arc:
             raise ValueError("arc must contain at least one speech_bed")
         unknown = sorted({role for role in self.arc if role not in self.section_roles})

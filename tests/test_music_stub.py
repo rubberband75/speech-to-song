@@ -88,6 +88,25 @@ def test_takes_are_deterministic_and_differ(tmp_path: Path) -> None:
     assert meta.backend == "stub" and meta.usd == 0.0
 
 
+def test_stub_takes_are_replaced_and_numbered_after_paid_ones(tmp_path: Path) -> None:
+    from speech2song.manifest import write_json
+
+    backend = StubBackend()
+    request = backend.request(ARRANGEMENT, PRESET, None)
+    music = tmp_path / "06_music"
+    backend.generate(request, music, 2, tmp_path)
+    again = backend.generate(request, music, 2, tmp_path)  # free: remade, not added
+    assert [t.meta.take for t in again] == [1, 2]
+    assert again[0].meta.grid_ms == request["grid_ms"]
+    paid = TakeMeta(take=5, backend="elevenlabs", file="06_music/take_005.mp3", sample_rate=1,
+                    channels=2, seconds=1, request_sha256="x")  # fmt: skip
+    write_json(music / "take_005.meta.json", paid)
+    takes = backend.generate(request, music, 1, tmp_path)
+    assert [t.meta.take for t in takes] == [6]
+    assert sorted(p.name for p in music.glob("*.meta.json")) == [
+        "take_005.meta.json", "take_006.meta.json"]  # fmt: skip
+
+
 def test_float_wavs_are_byte_reproducible(tmp_path: Path) -> None:
     from speech2song.audio.synth import write_wav
 

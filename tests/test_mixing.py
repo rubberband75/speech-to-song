@@ -1,13 +1,21 @@
-"""Mixing on arrays: clip placement, the exact speech stem, tails, the melody layer."""
+"""Mixing on arrays: clip placement, the exact speech stem, tails, the music's shaping
+and gaps, the melody layer."""
 
 import numpy as np
 import pytest
 
 from speech2song.arrangement import ClipInfo, build_arrangement, default_parts
 from speech2song.audio.mixing import (
+    ENERGY_RAMP_S,
+    GAP_CUT_S,
     TAIL_MAX_S,
+    energy_gains,
+    gain_curve,
+    gap_mask,
+    gap_tail,
     melody_notes,
     place_clips,
+    section_spans,
     speech_bus,
     speech_stem,
     tail_limits,
@@ -114,3 +122,75 @@ def test_melody_layer_modes() -> None:
     first = [n for n in under if bed.start_bar * 2.0 <= n.start_s < (bed.start_bar + bed.bars) * 2]
     assert len(first) == 3  # played once under its clip
     assert first[0].start_s == pytest.approx(bed.start_bar * 2.0)
+
+
+# --- The music's shaping ------------------------------------------------------------------
+
+
+def test_energy_gains_fix_only_large_deviations() -> None:
+    levels = [-16.0, -13.0, -26.0, None, -11.0, -10.7, -12.0]  # a near-silent build, a gap
+    energies = [0.15, 0.2, 0.8, 0.0, 1.0, 0.3, 0.2]
+    gains, targets = energy_gains(levels, energies, range_db=10, tolerance_db=3, max_db=6)
+    anchor = float(np.median([-17.5, -15.0, -34.0, -21.0, -13.7, -14.0]))
+    assert targets[0] == pytest.approx(anchor + 1.5)
+    assert gains[2] == 6.0  # 15 dB too quiet: capped
+    assert gains[3] == 0.0 and targets[3] is None  # silent: left to the gap mute
+    assert gains[4] == pytest.approx((anchor + 10) - (-11.0) - 3)  # beyond the tolerance only
+    assert gains[0] == 0.0 and gains[1] == 0.0  # close enough: untouched
+    assert energy_gains(levels, energies, range_db=10, tolerance_db=3, max_db=0)[0] == [0.0] * 7
+    flat, _ = energy_gains([-12.0] * 3, [0.2, 0.6, 1.0], range_db=10, tolerance_db=1, max_db=6)
+    assert flat[0] < 0 < flat[2] and flat[1] == 0.0  # an even take gets contrast
+
+
+def test_gain_curve_ramps_into_each_section() -> None:
+    sr = 1000
+    curve = gain_curve([(0, 2000), (2000, 4000)], [0.0, 6.0], 4500, sr)
+    ramp = round(ENERGY_RAMP_S * sr)
+    assert curve[0] == 1.0 and curve[2000 - ramp - 1] == 1.0
+    assert curve[2000] == pytest.approx(10 ** (6 / 20)) and curve[-1] == curve[2000]
+    assert np.all(np.diff(curve[2000 - ramp : 2001]) >= 0)  # a smooth climb to the downbeat
+
+
+def test_gaps_are_cut_and_come_back_on_the_downbeat() -> None:
+    sr = 1000
+    mask = gap_mask([(1000, 2000)], 3000, sr)
+    cut = round(GAP_CUT_S * sr)
+    assert mask[999] == 1.0 and mask[1000] == 1.0 and mask[1000 + cut] == 0.0
+    assert np.all(mask[1000 + cut : 1995] == 0.0)
+    assert mask[2000] == 1.0 and mask[1999] > 0  # back by the next section's first sample
+    assert np.all(mask[2000:] == 1.0)
+
+
+def test_gap_tail_rings_on_and_dies_away() -> None:
+    sr = SR
+    rng = np.random.default_rng(1)
+    music = (0.3 * rng.standard_normal((2 * sr, 2))).astype(np.float32)
+    tail = gap_tail(music, sr, sr, sr, 0.5)
+    assert tail.shape == (sr, 2)
+    rms = [
+        float(np.sqrt(np.mean(np.square(tail[i : i + sr // 10])))) for i in range(0, sr, sr // 10)
+    ]
+    assert rms[0] > 0.01 and rms[-1] < rms[0] / 20  # rings on, then gone before the drop
+    assert np.abs(tail[-1]).max() < 1e-3
+    assert not gap_tail(music, sr, sr, sr, 0.0).any()
+
+
+def test_shape_music_mutes_gaps_and_reports_levels() -> None:
+    from speech2song.stages.mix import shape_music
+
+    arrangement, _, _ = _setup()
+    sr = 8000
+    spans = section_spans(arrangement, sr)
+    frames = spans[-1][2] + sr
+    rng = np.random.default_rng(2)
+    music = (0.1 * rng.standard_normal((frames, 2))).astype(np.float32)  # evenly loud
+    shaped, levels, silenced = shape_music(music, arrangement, PRESET.mix, sr)
+    gaps = [(a, b) for s, a, b in spans if s.silent]
+    assert silenced == [s.id for s, _, _ in spans if s.silent] and gaps
+    start, end = gaps[0]
+    music_rms = float(np.sqrt(np.mean(np.square(music[start:end]))))
+    gap_rms = float(np.sqrt(np.mean(np.square(shaped[start + end >> 1 : end]))))
+    assert gap_rms < music_rms / 10  # only a dying reverb tail is left
+    by_role = {lv.role: lv for lv in levels}
+    assert by_role["drop"].gain_db > 3 and by_role["speech_bed"].gain_db <= 0  # contrast
+    assert by_role["gap"].lufs is None and by_role["gap"].gain_db == 0.0

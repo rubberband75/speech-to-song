@@ -77,8 +77,8 @@ STEPS: list[Step] = [
     Step("select", "M2", lambda o: [SelectStage(), ClipsStage()]),
     Step("melody", "M3", lambda o: [MelodyStage()]),
     Step("arrange", "M4", _arrange_stages),
-    Step("generate", "M4", lambda o: [GenerateStage(), TakeStage()], _generate_unavailable),
-    Step("mix", "M4", lambda o: [MixStage()]),
+    Step("generate", "M4", lambda o: [GenerateStage()], _generate_unavailable),
+    Step("mix", "M4", lambda o: [TakeStage(), MixStage()]),  # choosing a take is free
 ]
 STEP_BY_NAME = {step.name: step for step in STEPS}
 
@@ -625,9 +625,6 @@ def arrange(
 def generate(
     ctx: typer.Context,
     music_backend: Annotated[MusicBackend | None, typer.Option(help="Music backend.")] = None,
-    take: Annotated[
-        int | None, typer.Option(min=1, help="Which take to mix (1-based; sticks to the run).")
-    ] = None,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Show the estimated cost; call nothing.")
     ] = False,
@@ -635,27 +632,44 @@ def generate(
     force: Force = False,
     run_ref: RunRef = None,
 ) -> None:
-    """Generate backing-track takes for the arrangement and pick one for the mix."""
+    """Generate backing-track takes for the arrangement (`mix` picks one)."""
     env = _env(ctx)
-    if take is not None and take > env.config.music_takes:
-        raise S2SError(f"--take {take}: only {env.config.music_takes} take(s) are generated "
-                       "(music_takes in config.yaml)")  # fmt: skip
     run = _open_run(env, run_ref)
-    _update_options(run, music_backend=music_backend.value if music_backend else None, take=take)
+    _update_options(run, music_backend=music_backend.value if music_backend else None)
     _run_step_command(env, run, "generate", force=force, dry_run=dry_run, yes=yes)
+
+
+def _set_take(run: Run, take: str | None) -> None:
+    """`--take N` pins a take to the run; `--take auto` goes back to the best score."""
+    if take is None:
+        return
+    if take != "auto" and not (take.isdigit() and int(take) >= 1):
+        raise S2SError(f"--take {take}: give a take number (1, 2, ...) or 'auto'")
+    run.manifest.options = run.manifest.options.model_copy(
+        update={"take": None if take == "auto" else int(take)}
+    )
 
 
 @app.command()
 @cli_errors
 def mix(
     ctx: typer.Context,
+    take: Annotated[
+        str | None,
+        typer.Option(
+            help="Which take to mix: its number (sticks to the run), or 'auto' for the best "
+            "of the newest takes."
+        ),
+    ] = None,
     melody_layer: Annotated[MelodyLayerMode | None, typer.Option(help=MELODY_LAYER_HELP)] = None,
     force: Force = False,
     run_ref: RunRef = None,
 ) -> None:
-    """Mix speech, music and melody layer, and master to the preset's loudness."""
+    """Pick a take, then mix speech, music and melody layer and master to the preset's
+    loudness. Free."""
     env = _env(ctx)
     run = _open_run(env, run_ref)
+    _set_take(run, take)
     _update_options(run, melody_layer=melody_layer.value if melody_layer else None)
     _run_step_command(env, run, "mix", force=force)
 
@@ -664,7 +678,12 @@ def mix(
 @cli_errors
 def regenerate(
     ctx: typer.Context,
-    section: Annotated[str, typer.Option(help="Arrangement section ID, e.g. s5.")],
+    section: Annotated[
+        list[str],
+        typer.Option(
+            help="Section ID (s5) or a range of neighbouring sections (s3-s5); repeatable."
+        ),
+    ],
     note: Annotated[
         str | None, typer.Option(help="Extra direction for the new version, e.g. 'less busy'.")
     ] = None,
@@ -674,20 +693,19 @@ def regenerate(
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Don't ask before paid calls.")] = False,
     run_ref: RunRef = None,
 ) -> None:
-    """Regenerate one section of the current ElevenLabs take, keeping the rest (paid)."""
-    from speech2song.stages.generate_music import regenerate_section
+    """Regenerate sections of the current ElevenLabs take, keeping the rest (paid)."""
+    from speech2song.stages.generate_music import regenerate_sections
 
     env = _env(ctx)
     run = _open_run(env, run_ref)
     before = CostLog(run.costs_path).totals()["total"]
     with run.logging_to_file(logging.DEBUG if env.verbose else logging.INFO):
         context = _context(env, run, dry_run=dry_run, yes=yes)
-        updated = regenerate_section(context, section, note)
+        updated = regenerate_sections(context, section, note)
         if updated is not None:
             _update_options(run, take=updated.take)  # mix this version from now on
             run.save()
-            _run_steps(context, [STEP_BY_NAME["generate"], STEP_BY_NAME["mix"]],
-                       dict(STANDARD_HOOKS))  # fmt: skip
+            _run_steps(context, [STEP_BY_NAME["mix"]], dict(STANDARD_HOOKS))
     _spend_line(env, run, before)
 
 

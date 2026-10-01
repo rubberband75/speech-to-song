@@ -1,10 +1,14 @@
 """Mixing logic on arrays: where clips go, the exact speech stem, the processed speech
-bus, and the melody layer's notes. No file I/O.
+bus, the music's shaping, and the melody layer's notes. No file I/O.
 
 The speech stem is the clips copied verbatim onto silence (the exactness invariant).
 Everything else (gain, high-pass, compression, reverb and delay sends) happens on the
 speech bus, which only the mix hears. Each clip's sends are rendered on their own and
 faded out before the next clip starts, so tails never run into the next line.
+
+The music is shaped toward the arrangement: sections whose level strays far from their
+energy are pulled back toward it, and silent sections (gaps) are cut, leaving only a
+reverb tail of the music before them.
 """
 
 import math
@@ -14,8 +18,9 @@ from typing import Literal
 
 import numpy as np
 
-from speech2song.arrangement import BEATS_PER_BAR, beat_seconds, clip_start_s
-from speech2song.models import Arrangement, ClipMelody, Melody, PlacedClip
+from speech2song.arrangement import BEATS_PER_BAR, bar_seconds, beat_seconds, clip_start_s
+from speech2song.audio.dsp import db_to_gain
+from speech2song.models import Arrangement, ClipMelody, Melody, PlacedClip, Section
 
 TAIL_MAX_S = 6.0  # longest reverb/delay tail after a clip
 TAIL_FADE_S = 0.3  # tails fade out over this long before they are cut
@@ -162,6 +167,115 @@ def speech_bus(
 
 def delay_seconds(bpm: float) -> float:
     return DELAY_BEATS * beat_seconds(bpm)
+
+
+# --- Music shaping ----------------------------------------------------------------------------
+
+ENERGY_RAMP_S = 0.5  # gain changes finish where the next section starts
+GAP_CUT_S = 0.02  # the fade into a silent section
+GAP_RETURN_S = 0.005  # the fade back in, ending where the next section starts
+GAP_SOURCE_S = 1.0  # how much music before a gap feeds its reverb tail
+GAP_ROOM = 0.9
+
+
+def section_spans(arrangement: Arrangement, sr: int) -> list[tuple[Section, int, int]]:
+    """Each section's first and end sample."""
+    bar = bar_seconds(arrangement.bpm)
+    return [(s, round(s.start_bar * bar * sr), round((s.start_bar + s.bars) * bar * sr))
+            for s in arrangement.sections]  # fmt: skip
+
+
+def energy_gains(
+    levels: Sequence[float | None],
+    energies: Sequence[float],
+    *,
+    range_db: float,
+    tolerance_db: float,
+    max_db: float,
+) -> tuple[list[float], list[float | None]]:
+    """(gain dB, target level) per section. The targets lie on a line `range_db` steeper
+    from energy 0 to 1, through the median section. Only the part of a deviation beyond
+    `tolerance_db` is corrected, by at most `max_db`. Sections without a level (silent,
+    or too short to measure) get no target and no gain."""
+    offsets = [lv - range_db * e for lv, e in zip(levels, energies, strict=True) if lv is not None]
+    if len(offsets) < 2 or max_db <= 0:
+        return [0.0] * len(levels), [None] * len(levels)
+    anchor = float(np.median(offsets))
+    gains: list[float] = []
+    targets: list[float | None] = []
+    for level, energy in zip(levels, energies, strict=True):
+        if level is None:
+            gains.append(0.0)
+            targets.append(None)
+            continue
+        target = anchor + range_db * energy
+        excess = abs(target - level) - tolerance_db
+        gains.append(math.copysign(min(excess, max_db), target - level) if excess > 0 else 0.0)
+        targets.append(target)
+    return gains, targets
+
+
+def gain_curve(
+    spans: Sequence[tuple[int, int]], gains_db: Sequence[float], frames: int, sr: int
+) -> np.ndarray:
+    """Per-sample gain: each section's gain, moving to the next one's over the last
+    ENERGY_RAMP_S of the section (raised cosine), so downbeats get their own gain. The
+    song's tail keeps the last section's gain."""
+    curve = np.ones(frames, dtype=np.float32)
+    gains = [db_to_gain(g) for g in gains_db]
+    for (start, end), gain in zip(spans, gains, strict=True):
+        curve[start:end] = gain
+    if spans:
+        curve[spans[-1][1] :] = gains[-1]
+    ramp = round(ENERGY_RAMP_S * sr)
+    for i in range(1, len(spans)):
+        before, after = gains[i - 1], gains[i]
+        end = min(spans[i][0], frames)
+        start = max(spans[i - 1][0], end - ramp)
+        if before == after or end <= start:
+            continue
+        shape = 0.5 - 0.5 * np.cos(np.pi * np.arange(end - start) / (end - start))
+        curve[start:end] = before + (after - before) * shape
+    return curve
+
+
+def gap_mask(gaps: Sequence[tuple[int, int]], frames: int, sr: int) -> np.ndarray:
+    """1, except 0 inside each gap: a GAP_CUT_S fade at its start, and a GAP_RETURN_S
+    fade back that ends where the next section begins."""
+    mask = np.ones(frames, dtype=np.float32)
+    for start, end in gaps:
+        end = min(end, frames)
+        if end <= start:
+            continue
+        mask[start:end] = 0.0
+        cut = min(round(GAP_CUT_S * sr), end - start)
+        mask[start : start + cut] = np.linspace(1, 0, cut, endpoint=False)
+        back = min(round(GAP_RETURN_S * sr), end - start - cut)
+        if back > 0:
+            mask[end - back : end] = np.linspace(0, 1, back, endpoint=False)
+    return mask
+
+
+def gap_tail(music: np.ndarray, start: int, length: int, sr: int, level: float) -> np.ndarray:
+    """What a reverb would ring on with after the music stops at `start`: `length`
+    samples (stereo), fading in over the cut and out to silence by the end."""
+    out = np.zeros((length, 2), dtype=np.float32)
+    source = min(start, round(GAP_SOURCE_S * sr))
+    if level <= 0 or length <= 0 or source <= 0:
+        return out
+    import pedalboard
+
+    feed = stereo(music[start - source : start]).astype(np.float32)
+    lead = min(source, round(0.05 * sr))
+    feed[:lead] *= np.linspace(0, 1, lead, dtype=np.float32)[:, None]
+    padded = np.concatenate([feed, np.zeros((length, 2), dtype=np.float32)])
+    room = pedalboard.Reverb(room_size=GAP_ROOM, damping=0.4, wet_level=1.0, dry_level=0.0,
+                             width=1.0)  # fmt: skip
+    wet = room(padded.T, sr).T[source:]
+    envelope = np.square(np.linspace(1, 0, length, dtype=np.float32))
+    cut = min(length, round(GAP_CUT_S * sr))
+    envelope[:cut] *= np.linspace(0, 1, cut, dtype=np.float32)
+    return (wet * envelope[:, None] * np.float32(level)).astype(np.float32)
 
 
 # --- Melody layer ------------------------------------------------------------------------------

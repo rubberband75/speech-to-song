@@ -4,8 +4,9 @@ Each take is one `music.compose_detailed` call with the arrangement's compositio
 `model_id` music_v2/v2.5 and `store_for_inpainting=True`, so the song can be edited
 later by section. Calls are never retried automatically (a timeout may still have been
 billed). Every call is logged to costs.json right after it returns. A take whose request
-is unchanged is reused instead of generated again, and takes made for an older request
-are moved to 06_music/archive/ rather than overwritten.
+is unchanged is reused instead of generated again. Takes made for an older request stay
+selectable while their timing still fits the arrangement, and otherwise move to
+06_music/archive/; nothing paid is ever overwritten.
 """
 
 import json
@@ -17,7 +18,14 @@ from pathlib import Path
 from typing import Any
 
 from speech2song.audio.io import probe, require_tool, run_tool
-from speech2song.backends.music_base import Take
+from speech2song.backends.music_base import (
+    Take,
+    next_take_number,
+    remove_stub_takes,
+    take_fits,
+    take_grid,
+    take_metas,
+)
 from speech2song.config import AppConfig, Preset, load_secrets
 from speech2song.costs import CostLog, SpendEstimate, unit_usd
 from speech2song.errors import S2SError, StageError
@@ -100,6 +108,7 @@ class ElevenLabsBackend:
             "model_id": self.config.music_model,
             "output_format": settings.output_format,
             "composition_plan": plan,
+            "grid_ms": [chunk.duration_ms for chunk in layout],
             "layout": [vars(chunk) for chunk in layout],
             "reference": reference,
         }
@@ -120,7 +129,7 @@ class ElevenLabsBackend:
             estimates.append(SpendEstimate(
                 service="elevenlabs", model=model, units={"minutes": round(minutes, 3)},
                 usd=unit_usd(pricing, PRICE_ITEM, minutes),
-                description=f"take {n}: {minutes * 60:.0f} s of music",
+                description=f"new take {n} of {takes}: {minutes * 60:.0f} s of music",
             ))  # fmt: skip
         return estimates
 
@@ -204,16 +213,19 @@ class ElevenLabsBackend:
         write_json(cache, {"sha256": reference["sha256"], "song_id": response.song_id})
         return response.song_id
 
-    def _archive_stale(self, out_dir: Path, digest: str, run_dir: Path, everything: bool) -> None:
-        """Move paid takes of another request (or all, for fresh takes) out of the way."""
-        for meta_path in sorted(out_dir.glob("take_*.meta.json")):
-            meta = TakeMeta.model_validate_json(meta_path.read_text())
-            if meta.backend == "stub" or (meta.request_sha256 == digest and not everything):
+    def _archive_misfits(self, out_dir: Path, request: dict[str, Any], run_dir: Path) -> None:
+        """Move paid takes whose timing no longer fits the arrangement out of the way."""
+        digest = request_digest(request)
+        for meta in take_metas(out_dir):
+            if meta.backend == "stub" or take_fits(meta, run_dir, request["grid_ms"], digest):
                 continue
             target = out_dir / ARCHIVE_DIR / meta.request_sha256[:12]
             target.mkdir(parents=True, exist_ok=True)
-            versions = [run_dir / v["file"] for v in meta.params.get("history", [])]
-            for path in (*versions, run_dir / meta.file, meta_path):
+            audio = [run_dir / v["file"] for v in meta.params.get("history", [])]
+            audio.append(run_dir / meta.file)
+            files = [*audio, *(path.with_suffix(".response.json") for path in audio),
+                     out_dir / f"take_{meta.take:03d}.meta.json"]  # fmt: skip
+            for path in files:
                 if path.exists():
                     shutil.move(str(path), str(target / path.name))
             log.info("archived take %d to %s", meta.take, target)
@@ -245,14 +257,25 @@ class ElevenLabsBackend:
         self, request: dict[str, Any], out_dir: Path, takes: int, run_dir: Path,
         say: Callable[[str], None] = print, fresh: bool = False,
     ) -> list[Take]:  # fmt: skip
-        """Generate `takes` takes, reusing paid takes made for this exact request unless
-        `fresh` (then the current ones are archived first)."""
+        """Make sure `takes` takes exist for this request: reuse the newest ones made for
+        it (unless `fresh`) and generate the rest under new take numbers."""
         problems = check_plan(request["composition_plan"])
         if problems:
             raise StageError("the composition plan breaks the API limits: " + "; ".join(problems))
         out_dir.mkdir(parents=True, exist_ok=True)
         digest = request_digest(request)
-        self._archive_stale(out_dir, digest, run_dir, everything=fresh)
+        remove_stub_takes(out_dir, run_dir)
+        self._archive_misfits(out_dir, request, run_dir)
+        matching = [m for m in take_metas(out_dir)
+                    if m.request_sha256 == digest and (run_dir / m.file).exists()]  # fmt: skip
+        reused = [] if fresh else matching[-takes:]
+        results = []
+        for meta in reused:
+            say(f"  take {meta.take}: reusing the paid take for this request ({meta.file})")
+            results.append(Take(run_dir / meta.file, meta))
+        missing = takes - len(reused)
+        if not missing:
+            return results
         plan = request["composition_plan"]
         song_id = self._reference_song(request, out_dir)
         if song_id:
@@ -260,15 +283,8 @@ class ElevenLabsBackend:
         minutes = plan_minutes(plan)
         model = request["model_id"]
         output_format = request["output_format"]
-        results = []
-        for number in range(1, takes + 1):
-            meta_path = out_dir / f"take_{number:03d}.meta.json"
-            if meta_path.exists():
-                meta = TakeMeta.model_validate_json(meta_path.read_text())
-                if meta.request_sha256 == digest and (run_dir / meta.file).exists():
-                    say(f"  take {number}: reusing the paid take for this request ({meta.file})")
-                    results.append(Take(run_dir / meta.file, meta))
-                    continue
+        first = next_take_number(out_dir)
+        for number in range(first, first + missing):
             say(f"  take {number}: composing {minutes * 60:.0f} s with {model} "
                 "(this can take a few minutes)")  # fmt: skip
             path = out_dir / f"take_{number:03d}{audio_extension(output_format)}"
@@ -280,10 +296,11 @@ class ElevenLabsBackend:
                 file=path.relative_to(run_dir).as_posix(), sample_rate=info.sample_rate,
                 channels=info.channels, seconds=round(info.duration_s or minutes * 60, 3),
                 usd=round(usd or 0.0, 6), song_id=response.song_id, request_sha256=digest,
+                grid_ms=request["grid_ms"],
                 params={"output_format": output_format, "reference_song_id": song_id,
                         "filename": getattr(response, "filename", None)},
             )  # fmt: skip
-            write_json(meta_path, meta)
+            write_json(out_dir / f"take_{number:03d}.meta.json", meta)
             say(f"  take {number}: song {response.song_id}, ${usd or 0:.2f} (est.)")
             results.append(Take(path, meta))
         return results
@@ -321,6 +338,7 @@ class ElevenLabsBackend:
             },
         ]
         updated = meta.model_copy(update={
+            "grid_ms": take_grid(meta, run_dir),
             "file": path.relative_to(run_dir).as_posix(), "song_id": response.song_id,
             "seconds": round(info.duration_s or meta.seconds, 3),
             "usd": round(meta.usd + (usd or 0.0), 6),

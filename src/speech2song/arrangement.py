@@ -208,6 +208,7 @@ def build_arrangement(
                 energy=spec.energy,
                 shape=spec.shape,
                 styles=list(spec.styles),
+                silent=spec.silent,
                 start_s=round(bar * bar_seconds(bpm), 4),
                 seconds=round(bars * bar_seconds(bpm), 4),
                 **fields,  # type: ignore[arg-type]
@@ -352,7 +353,9 @@ def timeline_strip(arrangement: Arrangement, width: int = 110) -> list[str]:
     ]
 
 
-def timeline_rows(arrangement: Arrangement, clip_texts: dict[str, str]) -> list[list[str]]:
+def timeline_rows(
+    arrangement: Arrangement, clip_texts: dict[str, str], melody_layer: bool = True
+) -> list[list[str]]:
     """Table rows: section, bars, time, role, energy, and the clip or replayed phrase."""
     rows = []
     bpm = arrangement.bpm
@@ -363,7 +366,9 @@ def timeline_rows(arrangement: Arrangement, clip_texts: dict[str, str]) -> list[
             text = clip_texts.get(section.clip_id, "")
             text = text if len(text) <= 48 else text[:47] + "…"
             what = f"{section.clip_id}  {text}"
-        elif section.melody_phrase:
+        elif section.silent:
+            what = "(music muted)"
+        elif section.melody_phrase and melody_layer:
             what = f"(melody of {section.melody_phrase})"
         else:
             what = ""

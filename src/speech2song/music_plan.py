@@ -7,9 +7,13 @@ always enforced on v2), `positive_styles`/`negative_styles` (up to 50 each, Engl
 chunk's styles set the tone of the whole song; the model holds a stated BPM and key.
 
 Sections become chunks: neighbours with the same role merge (two speech beds in a row
-are one quiet stretch of music), anything shorter than 3 s (a one-bar gap) folds into
-the chunk before it with a timed direction, and anything over 2 minutes is split.
-Chunk boundaries sit exactly on the arrangement's bar times, rounded to milliseconds.
+are one quiet stretch of music), silent sections (gaps) and anything shorter than 3 s
+fold into the chunk before them, and anything over 2 minutes is split. Chunk boundaries
+sit exactly on the arrangement's bar times, rounded to milliseconds.
+
+Folded sections get no direction of their own. Inline directions apply to a whole
+chunk, so a "{near silence}" cue for a one-bar gap turned a live take's 16-bar build
+nearly silent; gaps are muted in the mix instead, where the timing is exact.
 """
 
 import itertools
@@ -65,14 +69,28 @@ def _label(role: str) -> str:
 def layout_chunks(arrangement: Arrangement) -> list[ChunkLayout]:
     """Group sections into chunks within the API's duration limits."""
     chunks: list[ChunkLayout] = []
+    leading: list[tuple[Section, int, int]] = []  # silent sections before any music
     for section, start, end in section_bounds_ms(arrangement):
         last = chunks[-1] if chunks else None
+        if section.silent and last is None:
+            leading.append((section, start, end))
+            continue
+        if section.silent and last is not None:
+            last.sections.append(section.id)
+            last.folded.append((section.id, end - start))
+            last.end_ms = end
+            continue
         if (last is not None and last.roles[-1] == section.role
                 and end - last.start_ms <= MAX_CHUNK_MS):  # fmt: skip
             last.sections.append(section.id)
             last.end_ms = end
             continue
         chunks.append(ChunkLayout([section.id], [section.role], start, end))
+        if leading:
+            chunks[0].sections[:0] = [s.id for s, _, _ in leading]
+            chunks[0].folded[:0] = [(s.id, b - a) for s, a, b in leading]
+            chunks[0].start_ms = leading[0][1]
+            leading = []
     merged: list[ChunkLayout] = []
     for chunk in chunks:  # fold chunks under 3 s into the one before (or after, if first)
         if chunk.duration_ms < MIN_CHUNK_MS and merged:
@@ -96,6 +114,11 @@ def layout_chunks(arrangement: Arrangement) -> list[ChunkLayout]:
     return result
 
 
+def grid_ms(arrangement: Arrangement) -> list[int]:
+    """Chunk lengths: the timing a take is generated with (see TakeMeta.grid_ms)."""
+    return [chunk.duration_ms for chunk in layout_chunks(arrangement)]
+
+
 def _dedupe(styles: Sequence[str]) -> list[str]:
     seen: set[str] = set()
     out = []
@@ -112,6 +135,14 @@ def tempo_and_key(arrangement: Arrangement, preset: Preset) -> list[str]:
     if preset.tempo.feel != "normal":
         styles.append(f"{preset.tempo.feel} feel")
     return styles
+
+
+def shape_styles(section: Section) -> list[str]:
+    if section.shape == "rise":
+        return ["steadily building"]
+    if section.shape == "fall":
+        return ["fading out to silence at the end"]
+    return []
 
 
 def build_plan(
@@ -132,23 +163,11 @@ def build_plan(
     negative = _dedupe([*preset.negative_styles, *NO_VOICES])
     chunks = []
     for index, chunk in enumerate(layout):
-        main = by_id[chunk.sections[0]]
-        lines = [f"[{_label(main.role)}]"]
-        timed = []
-        for section_id, ms in chunk.folded:
-            folded = by_id[section_id]
-            cue = folded.styles[0] if folded.styles else folded.role.replace("_", " ")
-            lines.append(f"{{{cue}}}")
-            timed.append(f"ends with {ms / 1000:.1f} seconds of {', '.join(folded.styles) or cue}")
-        positive = [*common, INSTRUMENTAL, *main.styles, *timed]
-        if index == 0:
-            positive = [*common, INSTRUMENTAL, *preset.positive_styles, *main.styles, *timed]
-        if main.shape == "rise":
-            positive.append("steadily building")
-        elif main.shape == "fall":
-            positive.append("fading out to silence at the end")
+        main = next(by_id[s] for s in chunk.sections if not by_id[s].silent)
+        globals_ = preset.positive_styles if index == 0 else []
+        positive = [*common, INSTRUMENTAL, *globals_, *main.styles, *shape_styles(main)]
         item: dict = {
-            "text": "\n".join(lines),
+            "text": f"[{_label(main.role)}]",
             "duration_ms": chunk.duration_ms,
             "positive_styles": _dedupe(positive),
             "negative_styles": negative,
@@ -194,15 +213,58 @@ def plan_minutes(plan: dict) -> float:
 MIN_RANGE_MS = 50  # shortest audio-reference slice the API accepts
 
 
-def regeneration_range(layout: Sequence[ChunkLayout], section_id: str,
-                       bounds: dict[str, tuple[int, int]]) -> tuple[int, int]:  # fmt: skip
-    """The song range to regenerate for a section: the section itself when it is long
-    enough for a generation chunk, else the whole chunk that holds it."""
-    start, end = bounds[section_id]
-    if end - start >= MIN_CHUNK_MS:
-        return start, end
-    chunk = next(c for c in layout if section_id in c.sections)
-    return chunk.start_ms, chunk.end_ms
+def expand_sections(arrangement: Arrangement, specs: Sequence[str]) -> list[str]:
+    """Section IDs from `sN` and `sA-sB` specs, in song order. They must be neighbours."""
+    order = [s.id for s in arrangement.sections]
+    chosen: set[str] = set()
+    for spec in specs:
+        ends = [part.strip() for part in spec.split("-")]
+        for end in ends:
+            if end not in order:
+                raise ValueError(f"no section {end!r} (sections: {', '.join(order)})")
+        first, last = sorted(order.index(end) for end in (ends[0], ends[-1]))
+        chosen.update(order[first : last + 1])
+    indices = sorted(order.index(section_id) for section_id in chosen)
+    if not indices:
+        raise ValueError("no section given")
+    if indices[-1] - indices[0] + 1 != len(indices):
+        raise ValueError("sections to regenerate together must be next to each other "
+                         "(e.g. s3-s5)")  # fmt: skip
+    return [order[i] for i in indices]
+
+
+def regeneration_pieces(
+    arrangement: Arrangement, section_ids: Sequence[str]
+) -> list[tuple[int, int, Section]]:
+    """The song range to regenerate for neighbouring sections, as generation chunks
+    (start ms, end ms, the section whose styles it gets). Pieces follow the plan's chunk
+    boundaries; a piece under 3 s joins its neighbour, and a range under 3 s grows to
+    the whole chunks it touches."""
+    bounds = {s.id: (a, b) for s, a, b in section_bounds_ms(arrangement)}
+    layout = layout_chunks(arrangement)
+    start, end = bounds[section_ids[0]][0], bounds[section_ids[-1]][1]
+    if end - start < MIN_CHUNK_MS:
+        touched = [c for c in layout if c.start_ms < end and c.end_ms > start]
+        start, end = touched[0].start_ms, touched[-1].end_ms
+    edges: list[list[int]] = []
+    for chunk in layout:
+        a, b = max(chunk.start_ms, start), min(chunk.end_ms, end)
+        if b > a:
+            edges.append([a, b])
+    merged: list[list[int]] = []
+    for piece in edges:
+        if merged and (piece[1] - piece[0] < MIN_CHUNK_MS
+                       or merged[-1][1] - merged[-1][0] < MIN_CHUNK_MS):  # fmt: skip
+            merged[-1][1] = piece[1]
+        else:
+            merged.append(piece)
+    pieces = []
+    for a, b in merged:
+        inside = [s for s in arrangement.sections
+                  if bounds[s.id][0] < b and bounds[s.id][1] > a and not s.silent]  # fmt: skip
+        main = max(inside, key=lambda s: min(b, bounds[s.id][1]) - max(a, bounds[s.id][0]))
+        pieces.append((a, b, main))
+    return pieces
 
 
 def _kept(song_id: str, start: int, end: int) -> list[dict]:
@@ -220,37 +282,36 @@ def inpaint_plan(
     arrangement: Arrangement,
     preset: Preset,
     song_id: str,
-    section_id: str,
+    section_ids: Sequence[str],
     note: str | None,
     *,
     context_adherence: str = "high",
 ) -> tuple[dict, tuple[int, int]]:
-    """A plan that keeps the stored song around one section and regenerates that section
-    with its styles (plus `note`). Returns the plan and the regenerated range (ms)."""
+    """A plan that keeps the stored song around neighbouring sections and regenerates
+    them with their styles (plus `note`). Returns the plan and the regenerated range."""
     by_id = {s.id: s for s in arrangement.sections}
-    if section_id not in by_id:
-        raise ValueError(f"no section {section_id!r} (sections: {', '.join(by_id)})")
-    bounds = {s.id: (a, b) for s, a, b in section_bounds_ms(arrangement)}
+    for section_id in section_ids:
+        if section_id not in by_id:
+            raise ValueError(f"no section {section_id!r} (sections: {', '.join(by_id)})")
+    if all(by_id[section_id].silent for section_id in section_ids):
+        raise ValueError(f"{', '.join(section_ids)} is silent in the mix; regenerate the "
+                         "sections around it instead")  # fmt: skip
     total = section_bounds_ms(arrangement)[-1][2]
-    start, end = regeneration_range(layout_chunks(arrangement), section_id, bounds)
-    covered = [s for s in arrangement.sections if bounds[s.id][0] < end and bounds[s.id][1] > start]
-    main = by_id[section_id] if bounds[section_id][1] - bounds[section_id][0] >= MIN_CHUNK_MS \
-        else max(covered, key=lambda s: bounds[s.id][1] - bounds[s.id][0])  # fmt: skip
-    positive = [*tempo_and_key(arrangement, preset), INSTRUMENTAL, *main.styles]
-    lines = [f"[{_label(main.role)}]"]
-    for section in covered:
-        if section is not main and section.styles:
-            lines.append(f"{{{section.styles[0]}}}")
-    if note:
-        positive.insert(0, note)
-    generated = {
-        "text": "\n".join(lines),
-        "duration_ms": end - start,
-        "positive_styles": _dedupe(positive),
-        "negative_styles": _dedupe([*preset.negative_styles, *NO_VOICES]),
-        "context_adherence": context_adherence,
-    }
-    chunks = [*_kept(song_id, 0, start), generated, *_kept(song_id, end, total)]
+    pieces = regeneration_pieces(arrangement, section_ids)
+    common = [*tempo_and_key(arrangement, preset), INSTRUMENTAL]
+    negative = _dedupe([*preset.negative_styles, *NO_VOICES])
+    generated = []
+    for a, b, main in pieces:
+        positive = [*([note] if note else []), *common, *main.styles, *shape_styles(main)]
+        generated.append({
+            "text": f"[{_label(main.role)}]",
+            "duration_ms": b - a,
+            "positive_styles": _dedupe(positive),
+            "negative_styles": negative,
+            "context_adherence": context_adherence,
+        })  # fmt: skip
+    start, end = pieces[0][0], pieces[-1][1]
+    chunks = [*_kept(song_id, 0, start), *generated, *_kept(song_id, end, total)]
     return {"chunks": chunks}, (start, end)
 
 

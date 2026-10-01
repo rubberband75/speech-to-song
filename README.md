@@ -40,10 +40,11 @@ speech2song select --interactive-review   # Claude picks lines (asks first); rev
 speech2song melody                  # speech pitch -> melody, MIDI, audio reference
 uv run python scripts/melody_listen.py   # listening tests in runs/<run>/04_listen/
 speech2song arrange                 # sections on the bar grid; prints the timeline
-speech2song generate                # backing-track takes (stub: free), --take N to pick one
+speech2song generate                # backing-track takes (stub: free)
 speech2song generate --music-backend elevenlabs --dry-run   # Eleven Music: estimate first
-speech2song regenerate --section s5 --note "less busy"      # redo one section (paid)
-speech2song mix                     # stems, master.wav (24-bit), master.mp3
+speech2song regenerate --section s3-s5 --note "less busy"   # redo sections (paid)
+speech2song mix                     # pick a take, then stems, master.wav, master.mp3
+speech2song mix --take 2            # mix another take (free); --take auto: best again
 speech2song run inputs/talk.mp3 --transcript inputs/talk.txt      # every step
 speech2song run --run latest --stop-after arrange   # resume; stop to check the arrangement
 ```
@@ -91,6 +92,7 @@ and each clip gets its own speech bed, starting on a bar and long enough for the
 plus `speech_interaction.tail_beats`. Other sections take their `bars` from the preset.
 Beds use their clip's chords from the melody, other sections loop the main phrase's
 chords, and breakdowns and drops note which line was heard last, for the melody layer.
+Silent roles (`silent: true`, the gap before a drop) are muted in the mix.
 `05_arrangement.json` can be edited by hand: later steps pick up the edit, and the mixer
 checks it first.
 
@@ -107,35 +109,46 @@ it is retried once with feedback, and the preset's arc is used if it still can't
 
 - **elevenlabs**: the arrangement becomes an Eleven Music composition plan (one chunk per
   section or merged run of sections, each stating the tempo, key and "instrumental only",
-  with the section's styles). Each take is one paid call ($0.15 per generated minute at
-  API rates, about $0.51 for a 3.4-minute song); it estimates and asks first. Takes are
-  stored for inpainting and kept: a re-run reuses takes made for the same request,
-  `--force` makes new ones, and takes of an older request move to `06_music/archive/`.
+  with the section's styles). Silent sections and anything under 3 s ride along with the
+  chunk before them; nothing is generated for a gap. Each take is one paid call ($0.15
+  per generated minute at API rates, about $0.51 for a 3.4-minute song); it estimates and
+  asks first. Takes are stored for inpainting and never overwritten: a re-run reuses
+  takes made for the same request, `--force` adds new ones, and takes of an older request
+  stay available (new takes get the next numbers) as long as their timing still fits the
+  arrangement. Takes that no longer fit move to `06_music/archive/`.
 - **stub**: a free placeholder (chord pads, bass, half-time drums, risers).
 
-The free `take` stage then checks every take against the arrangement (tempo, allowing
-half time; key; whether section levels follow the planned energy; loudness), writes
-`06_music/analysis.json`, picks the best (or `--take N`) and conforms it to
-`selected.wav`. `generate` re-runs only when what it would send changes, not on every
-arrangement edit.
+`generate` re-runs only when what it would send changes, not on every arrangement edit.
 
-`regenerate --section sN [--note TEXT]` (ElevenLabs takes only, paid) regenerates one
-section of the current take and keeps the rest unchanged, then re-mixes. Each result is
-a new version of the take (`take_NNN_v2.mp3`, ...); earlier versions stay on disk.
+`regenerate --section sN [--note TEXT]` (ElevenLabs takes only, paid) regenerates a
+section, or a range of neighbouring ones (`--section s3-s5`: build, gap and drop
+together), of the current take and keeps the rest unchanged, then re-mixes. It works on
+any take whose timing fits, even one made for an older request, and never runs
+`generate`. Each result is a new version of the take (`take_NNN_v2.mp3`, ...); earlier
+versions stay on disk.
 
-`mix` writes `07_mix/`:
+`mix` first checks every take that fits the arrangement (tempo, allowing half time; key;
+whether section levels follow the planned energy; loudness), writes
+`06_music/analysis.json`, and picks the best of the takes made for the current request,
+or `--take N` (any take that fits; sticky, `--take auto` to undo). Then it writes
+`07_mix/`:
 
 - `stems/speech.wav`: the clips, sample-exact, on silence (float WAV)
 - `stems/music.wav` and `stems/melody_layer.wav`: as heard in the mix (ducked)
 - `master.wav` (24-bit) and `master.mp3` (320 kbps), at the preset's `target_lufs` with
   true peaks at or below -1 dBTP
-- `mix.json`: clip positions, levels and final loudness
+- `mix.json`: clip positions, levels, the music's shaping and final loudness
 
-The speech bus sits `mix.speech_level_lu` above the music's loudness, with a high-pass,
-gentle compression, and reverb/delay sends whose tails fade out before the next clip.
-The music ducks by `sidechain_duck_db` while speech plays. `--melody-layer` (on `mix` and
-`run`, sticky) chooses the melody layer: `replay` (default: breakdowns and drops replay
-the line just heard), `all` (also quietly under the speech) or `off`.
+The music is shaped toward the arrangement first: a section whose loudness strays more
+than `mix.energy_tolerance_db` from a line through the sections' median
+(`energy_range_db` from energy 0 to 1) is pulled back by the excess, at most
+`energy_max_db`. Silent sections are cut, leaving a short reverb tail of the music before
+them (`gap_reverb`). The speech bus sits `mix.speech_level_lu` above the music's
+loudness, with a high-pass, gentle compression, and reverb/delay sends whose tails fade
+out before the next clip. The music ducks by `sidechain_duck_db` while speech plays.
+`--melody-layer` (on `mix` and `run`, sticky) adds the MIDI melody: `off` (the preset's
+default), `replay` (breakdowns and drops replay the line just heard) or `all` (also
+quietly under the speech).
 
 ### Official transcripts
 

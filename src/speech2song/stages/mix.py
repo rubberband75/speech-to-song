@@ -3,8 +3,9 @@
 The speech stem holds the clips verbatim (sample-exact apart from their edge fades). The
 mix hears the speech bus instead: the clips set to the music's loudness plus
 `speech_level_lu`, high-passed, gently compressed, with reverb and delay sends. The music
-and melody layer are ducked under the speech. The master is normalized to the preset's
-loudness with true peaks at or below -1 dBTP.
+is first shaped toward the arrangement's energy, with its silent sections (gaps) cut to
+a reverb tail. The music and melody layer are ducked under the speech. The master is
+normalized to the preset's loudness with true peaks at or below -1 dBTP.
 """
 
 import subprocess
@@ -14,25 +15,30 @@ from typing import ClassVar, Literal
 import numpy as np
 import soundfile as sf
 
-from speech2song.arrangement import ClipInfo, clip_info, validate_arrangement
+from speech2song.arrangement import energy_bounds
 from speech2song.audio.dsp import db_to_gain, duck_gain, loudness_lufs, master
 from speech2song.audio.io import require_tool
 from speech2song.audio.mixing import (
     COMP_ABOVE_LU,
     NoteEvent,
     delay_seconds,
+    energy_gains,
+    gain_curve,
+    gap_mask,
+    gap_tail,
     melody_notes,
     place_clips,
+    section_spans,
     speech_bus,
     speech_stem,
 )
 from speech2song.audio.synth import find_soundfont, instrument, render_array, write_wav
-from speech2song.config import SAMPLE_RATE, load_preset
+from speech2song.config import SAMPLE_RATE, MixSpec, load_preset
 from speech2song.errors import S2SError, StageError
 from speech2song.manifest import temp_path_for, write_json
-from speech2song.models import Arrangement, ClipSet, Melody, MixReport
+from speech2song.models import Arrangement, ClipSet, Melody, MixReport, SectionLevel
 from speech2song.pipeline import Context, Stage, StagePlan, StageResult
-from speech2song.stages.arrange import ARRANGEMENT
+from speech2song.stages.arrange import ARRANGEMENT, usable_arrangement
 from speech2song.stages.generate_music import SELECTED, song_frames
 from speech2song.stages.melody import MELODY, kept_clips
 from speech2song.stages.select_clips import CLIPS
@@ -85,6 +91,39 @@ def render_notes(
     return out
 
 
+def shape_music(
+    music: np.ndarray, arrangement: Arrangement, spec: MixSpec, sr: int
+) -> tuple[np.ndarray, list[SectionLevel], list[str]]:
+    """The music pulled toward the arrangement's energy, with gaps cut to a reverb tail.
+    Returns it, each section's levels and gain, and the silenced section IDs."""
+    spans = section_spans(arrangement, sr)
+    energies = [(a + b) / 2 for a, b in energy_bounds(arrangement.sections)]
+    levels = [None if section.silent else loudness_lufs(music[start:end], sr)
+              for section, start, end in spans]  # fmt: skip
+    gains, targets = energy_gains(levels, energies, range_db=spec.energy_range_db,
+                                  tolerance_db=spec.energy_tolerance_db,
+                                  max_db=spec.energy_max_db)  # fmt: skip
+    for i, (section, _, _) in enumerate(spans):  # change gain inside the mute, not before it
+        if section.silent and i:
+            gains[i] = gains[i - 1]
+    frames = len(music)
+    curve = gain_curve([(a, b) for _, a, b in spans], gains, frames, sr)
+    gaps = [(start, end) for section, start, end in spans if section.silent]
+    shaped = music * (curve * gap_mask(gaps, frames, sr))[:, None]
+    for start, end in gaps:
+        shaped[start:end] += gap_tail(shaped, start, min(end, frames) - start, sr,
+                                      spec.gap_reverb)  # fmt: skip
+    report = [
+        SectionLevel(section_id=section.id, role=section.role, energy=round(energy, 3),
+                     lufs=None if level is None else round(level, 2),
+                     target_lufs=None if target is None else round(target, 2),
+                     gain_db=0.0 if section.silent else round(gain, 2))
+        for (section, _, _), energy, level, target, gain
+        in zip(spans, energies, levels, targets, gains, strict=True)
+    ]  # fmt: skip
+    return shaped.astype(np.float32), report, [s.id for s, _, _ in spans if s.silent]
+
+
 def write_mp3(wav: Path, mp3: Path) -> None:
     ffmpeg = require_tool("ffmpeg")
     tmp = temp_path_for(mp3)
@@ -106,7 +145,7 @@ def _db(value: float | None) -> str:
 
 class MixStage(Stage):
     name: ClassVar[str] = "mix"
-    version: ClassVar[int] = 1
+    version: ClassVar[int] = 2  # 2: energy shaping and silent gaps
 
     def plan(self, ctx: Context) -> StagePlan:
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
@@ -144,13 +183,9 @@ class MixStage(Stage):
         spec = preset.mix
         mode: MelodyLayer = plan.params["melody_layer"]
         sr = SAMPLE_RATE
-        arrangement = Arrangement.model_validate_json(plan.inputs["arrangement"].read_text())
+        arrangement = usable_arrangement(ctx)
         clip_set = ClipSet.model_validate_json(plan.inputs["clips"].read_text())
         clips = {c.id: c for c in clip_set.clips}
-        infos: dict[str, ClipInfo] = {c.id: clip_info(c) for c in clip_set.clips}
-        problems = validate_arrangement(arrangement, infos)
-        if problems:
-            raise StageError(f"{ARRANGEMENT} can't be mixed: " + "; ".join(problems))
         if clip_set.sample_rate != sr:
             raise StageError(f"clips are {clip_set.sample_rate} Hz; the mix runs at {sr} Hz")
 
@@ -167,6 +202,7 @@ class MixStage(Stage):
                              {k: len(a) for k, a in audio.items()}, sr)  # fmt: skip
         dry = speech_stem(placed, audio, frames, clip_set.channels)
         warnings: list[str] = []
+        music, levels, silenced = shape_music(music, arrangement, spec, sr)
 
         # Levels: speech sits speech_level_lu above the music's loudness.
         music_lufs = loudness_lufs(music, sr)
@@ -242,11 +278,16 @@ class MixStage(Stage):
             melody_gain_db=None if melody_gain_db is None else round(melody_gain_db, 3),
             target_lufs=spec.target_lufs, master_gain_db=round(mastered.gain_db, 3),
             integrated_lufs=round(mastered.lufs, 3),
-            true_peak_dbtp=round(mastered.true_peak_db, 3), warnings=warnings,
+            true_peak_dbtp=round(mastered.true_peak_db, 3), section_levels=levels,
+            silenced=silenced, warnings=warnings,
         )  # fmt: skip
         write_json(ctx.run.path(MIX_REPORT), report)
         for warning in warnings:
             ctx.say(f"[yellow]  {warning}[/]")
+        changed = [f"{level.section_id} {level.gain_db:+.1f} dB" for level in levels
+                   if level.gain_db]  # fmt: skip
+        ctx.say(f"  music shaped toward the arrangement: {', '.join(changed) or 'no changes'}"
+                + (f"; silenced {', '.join(silenced)}" if silenced else ""))  # fmt: skip
         ctx.say(f"  music {_db(music_lufs)} LUFS · speech {_db(speech_lufs)} LUFS dry, "
                 f"{gain_db:+.1f} dB to sit {spec.speech_level_lu:+g} LU above the music · "
                 f"melody layer: {mode}")  # fmt: skip
