@@ -4,8 +4,9 @@ Each clip plays in its own speech_bed section, starting on the section's first b
 preset's arc is a template whose speech_bed entries are slots: the clips, in play order,
 are shared out over the slots as consecutive groups that balance speech time (a `hook`
 leans to the first slot, an `outro` clip to the last), and a group's clips play back to
-back. With fewer clips than slots, the first slots and the last one are kept. Other roles
-take the preset's bar counts.
+back. The parts of a long quote always share a slot, with `part_pause_beats` of music
+after each part but the last. With fewer quotes than slots, the first slots and the last
+one are kept. Other roles take the preset's bar counts.
 
 Claude can optionally propose the arc instead, as a list of parts (a music section with
 its bars, or a speech passage with its clips). Its plan is checked here, and the preset's
@@ -40,11 +41,18 @@ class ClipInfo:
     text: str
     duration_s: float  # the cut file
     spoken_s: float  # from the start of the cut file to the end of the last word
+    quote: str = ""  # the selected quote this clip is part of ("" for the clip itself)
+    last_part: bool = True
+
+    @property
+    def quote_id(self) -> str:
+        return self.quote or self.id
 
 
 def clip_info(clip: Clip) -> ClipInfo:
     spoken = max(0.0, min(clip.duration_s, clip.nominal_end_s - clip.start_s))
-    return ClipInfo(clip.id, clip.role, clip.text, clip.duration_s, spoken)
+    return ClipInfo(clip.id, clip.role, clip.text, clip.duration_s, spoken,
+                    clip.quote or clip.id, clip.part == clip.parts)  # fmt: skip
 
 
 def beat_seconds(bpm: float) -> float:
@@ -55,10 +63,12 @@ def bar_seconds(bpm: float) -> float:
     return BEATS_PER_BAR * 60.0 / bpm
 
 
-def bed_bars(clip: ClipInfo, bpm: float, tail_beats: float) -> int:
-    """Whole bars that hold the clip file and `tail_beats` after its last word."""
+def bed_bars(clip: ClipInfo, bpm: float, tail_beats: float, part_pause_beats: float = 0.0) -> int:
+    """Whole bars that hold the clip file and `tail_beats` after its last word (or the
+    longer `part_pause_beats`, when more of its quote follows)."""
     beat = beat_seconds(bpm)
-    beats = max(clip.duration_s / beat, clip.spoken_s / beat + tail_beats)
+    tail = tail_beats if clip.last_part else max(tail_beats, part_pause_beats)
+    beats = max(clip.duration_s / beat, clip.spoken_s / beat + tail)
     return max(1, math.ceil(beats / BEATS_PER_BAR - 1e-9))
 
 
@@ -81,19 +91,32 @@ def _group_cost(groups: Sequence[Sequence[ClipInfo]]) -> float:
     return balance + hints
 
 
+def quote_runs(clips: Sequence[ClipInfo]) -> list[list[ClipInfo]]:
+    """Clips in play order, with neighbouring parts of the same quote kept together."""
+    runs: list[list[ClipInfo]] = []
+    for clip in clips:
+        if runs and runs[-1][-1].quote_id == clip.quote_id:
+            runs[-1].append(clip)
+        else:
+            runs.append([clip])
+    return runs
+
+
 def group_clips(clips: Sequence[ClipInfo], slots: int) -> list[list[ClipInfo]]:
     """Split clips (in play order) into consecutive groups, one per slot, choosing the
-    split with the lowest `_group_cost`. With no more clips than slots, each clip is its
-    own group."""
+    split with the lowest `_group_cost`. A quote's parts are never split up. With no more
+    quotes than slots, each quote is its own group."""
     if slots < 1:
         raise ValueError("the arc has no speech_bed slot")
-    if len(clips) <= slots:
-        return [[clip] for clip in clips]
+    runs = quote_runs(clips)
+    if len(runs) <= slots:
+        return [list(run) for run in runs]
     best: list[list[ClipInfo]] = []
     best_cost = math.inf
-    for cuts in itertools.combinations(range(1, len(clips)), slots - 1):
-        bounds = (0, *cuts, len(clips))
-        groups = [list(clips[a:b]) for a, b in itertools.pairwise(bounds)]
+    for cuts in itertools.combinations(range(1, len(runs)), slots - 1):
+        bounds = (0, *cuts, len(runs))
+        groups = [[clip for run in runs[a:b] for clip in run]
+                  for a, b in itertools.pairwise(bounds)]  # fmt: skip
         cost = _group_cost(groups)
         if cost < best_cost - 1e-12:
             best, best_cost = groups, cost
@@ -154,6 +177,14 @@ def check_parts(parts: Sequence[ArcPart], clips: Sequence[ClipInfo], preset: Pre
     if seen != order:
         problems.append(f"every clip must appear exactly once, in this order: {', '.join(order)} "
                         f"(the arc has: {', '.join(seen) or 'none'})")  # fmt: skip
+    quote_of = {c.id: c.quote_id for c in clips}
+    passages: dict[str, set[int]] = {}
+    for number, part in enumerate(parts):
+        for clip_id in part.clips:
+            passages.setdefault(quote_of.get(clip_id, clip_id), set()).add(number)
+    for quote, where in passages.items():
+        if len(where) > 1:
+            problems.append(f"the parts of quote {quote} must play in the same speech_bed part")
     if music_bars > MAX_MUSIC_BARS:
         problems.append(f"the music sections total {music_bars} bars; keep them under "
                         f"{MAX_MUSIC_BARS}")  # fmt: skip
@@ -190,6 +221,7 @@ def build_arrangement(
     the clip heard last, whose melody the layer replays there."""
     bpm = melody.bpm
     tail = preset.speech_interaction.tail_beats
+    pause = preset.speech_interaction.part_pause_beats
     by_id = {clip.id: clip for clip in clips}
     main_chords = _phrase_chords(melody, None)
     sections: list[Section] = []
@@ -219,7 +251,7 @@ def build_arrangement(
     for part in parts:
         if part.role == SPEECH_ROLE:
             for clip_id in part.clips:
-                bars = bed_bars(by_id[clip_id], bpm, tail)
+                bars = bed_bars(by_id[clip_id], bpm, tail, pause)
                 add(part.role, bars, chords=_cycle(_phrase_chords(melody, clip_id), bars),
                     clip_id=clip_id)  # fmt: skip
                 last_heard = clip_id
@@ -429,8 +461,16 @@ def build_arc_prompt(
         + (f"; {', '.join(spec.styles)}" if spec.styles else "")
         for name, spec in preset.section_roles.items()
     )
+    pause = preset.speech_interaction.part_pause_beats
+
+    def part_of(c: ClipInfo) -> str:
+        siblings = [x.id for x in clips if x.quote_id == c.quote_id]
+        return f", part {siblings.index(c.id) + 1} of {len(siblings)} of quote {c.quote_id}" \
+            if len(siblings) > 1 else ""  # fmt: skip
+
     clip_lines = "\n".join(
-        f'- {c.id} ({c.role}, {c.spoken_s:.1f} s, {bed_bars(c, bpm, tail)} bars): "{c.text}"'
+        f"- {c.id} ({c.role}, {c.spoken_s:.1f} s, {bed_bars(c, bpm, tail, pause)} bars"
+        f'{part_of(c)}): "{c.text}"'
         for c in clips
     )
     rendered = Template(user).substitute(

@@ -2,8 +2,10 @@
 
 Claude picks sentence ranges. Before anything is cut, its answer is checked against the
 transcript: the sentences must exist, the quoted text must match them, each clip must
-fit the duration bounds, clips must not overlap, and the total must fit the speech
-budget. One retry with feedback is allowed; after that, unusable clips are dropped.
+fit the duration bounds (a long quote is allowed up to `long_max_seconds`), clips must
+not overlap, the total must fit the speech budget, and every quote the user required
+must be there. One retry with feedback is allowed; after that, unusable clips are
+dropped and missing required quotes are added.
 """
 
 import hashlib
@@ -17,7 +19,14 @@ from rapidfuzz.distance import Indel
 from speech2song.config import Preset
 from speech2song.errors import StageError
 from speech2song.llm.claude import load_prompt
-from speech2song.models import ClipSelection, ClipTargets, RunOptions, SelectedClip, Transcript
+from speech2song.models import (
+    ClipSelection,
+    ClipTargets,
+    RequiredQuote,
+    RunOptions,
+    SelectedClip,
+    Transcript,
+)
 from speech2song.text.normalize import normalize_word
 
 CLIP_ROLES = ("hook", "build", "payoff", "breakdown", "outro")
@@ -62,13 +71,23 @@ SELECTION_SCHEMA = {
 }
 
 
-def clip_targets(preset: Preset, options: RunOptions) -> ClipTargets:
+def clip_targets(
+    preset: Preset, options: RunOptions, required: list[RequiredQuote] | None = None
+) -> ClipTargets:
+    """The preset's targets. `--clips N` asks for exactly N clips; otherwise Claude may
+    choose `count_tolerance` fewer or more, so the set can cover the whole talk."""
     spec = preset.clips
+    count = options.clips or spec.count
+    spread = 0 if options.clips else spec.count_tolerance
     return ClipTargets(
-        count=options.clips or spec.count,
+        count=count,
+        min_count=max(1, count - spread, len(required or [])),
+        max_count=max(count + spread, len(required or [])),
         min_seconds=spec.min_seconds,
         max_seconds=spec.max_seconds,
+        long_max_seconds=spec.long_max_seconds,
         total_speech_seconds=spec.total_speech_seconds,
+        required=list(required or []),
     )
 
 
@@ -89,18 +108,40 @@ def render_sentences(transcript: Transcript) -> str:
     )
 
 
+def render_required(targets: ClipTargets) -> str:
+    if not targets.required:
+        return ""
+    lines = [
+        "The producer requires these passages. Include each one as a clip with exactly the "
+        "sentence range given (it counts toward the totals and may be longer than the usual "
+        "limits); choose the other clips around them:",
+    ]
+    for quote in targets.required:
+        role = f", role {quote.role}" if quote.role else ""
+        lines.append(f"- sentences {quote.start_sentence}-{quote.end_sentence}{role}: "
+                     f'"{quote.text}"')  # fmt: skip
+    return "\n".join(lines) + "\n\n"
+
+
 def build_prompt(transcript: Transcript, preset: Preset, targets: ClipTargets) -> tuple[str, str]:
     system, user = _template()
+    low, high = targets.count_range
+    values = {
+        "min_seconds": f"{targets.min_seconds:g}",
+        "max_seconds": f"{targets.max_seconds:g}",
+        "long_max_seconds": f"{targets.longest:g}",
+        "part_seconds": f"{preset.clips.part_seconds:g}",
+    }
     rendered = Template(user).substitute(
         preset_description=" ".join(preset.description.split()),
         arc=", ".join(preset.arc),
-        count=targets.count,
-        min_seconds=f"{targets.min_seconds:g}",
-        max_seconds=f"{targets.max_seconds:g}",
+        count_rule=f"exactly {low}" if low == high else f"{low} to {high} (about {targets.count})",
         total_speech_seconds=f"{targets.total_speech_seconds:g}",
+        required=render_required(targets),
         sentences=render_sentences(transcript),
+        **values,
     )
-    return system, rendered
+    return Template(system).substitute(**values), rendered
 
 
 def feedback_prompt(user: str, answer: ClipSelection, problems: list["Problem"]) -> str:
@@ -112,8 +153,8 @@ def feedback_prompt(user: str, answer: ClipSelection, problems: list["Problem"])
     )
 
 
-ProblemKind = Literal["invalid", "overlap", "budget", "count", "order", "score"]
-RETRY_KINDS = {"invalid", "overlap", "budget"}
+ProblemKind = Literal["invalid", "overlap", "budget", "count", "order", "score", "required"]
+RETRY_KINDS = {"invalid", "overlap", "budget", "required"}
 
 
 @dataclass(frozen=True)
@@ -166,6 +207,7 @@ def validate(
             )
             continue
         text, duration = span
+        required = _required_for(clip, targets)
         if not text_matches(clip.text, text):
             problems.append(
                 Problem(
@@ -173,13 +215,13 @@ def validate(
                 )
             )
             continue
-        if not targets.min_seconds <= duration <= targets.max_seconds:
+        if required is None and not targets.min_seconds <= duration <= targets.longest:
             problems.append(
                 Problem(
                     name,
                     "invalid",
                     f"{name}: {rng} last {duration:.1f} s; clips must be "
-                    f"{targets.min_seconds:g}-{targets.max_seconds:g} s",
+                    f"{targets.min_seconds:g}-{targets.longest:g} s",
                 )
             )
             continue
@@ -205,20 +247,49 @@ def validate(
                 f"the clips total {total:.1f} s; the budget is {targets.total_speech_seconds:g} s",
             )
         )
-    if len(selection.clips) != targets.count:
+    low, high = targets.count_range
+    if not low <= len(selection.clips) <= high:
+        wanted = f"{low}" if low == high else f"{low}-{high}"
         problems.append(
             Problem(
                 None,
                 "count",
-                f"{len(selection.clips)} clips were returned; {targets.count} were asked for",
+                f"{len(selection.clips)} clips were returned; {wanted} were asked for",
             )
         )
+    chosen = {(c.start_sentence, c.end_sentence) for c, _ in usable}
+    for quote in targets.required:
+        if (quote.start_sentence, quote.end_sentence) not in chosen:
+            problems.append(
+                Problem(
+                    None,
+                    "required",
+                    f"the required passage {quote.id} (sentences {quote.start_sentence}-"
+                    f"{quote.end_sentence}) must be one of the clips, with exactly that range",
+                )
+            )
     order = selection.suggested_order
     if sorted(order) != sorted(seen) or len(set(order)) != len(order):
         problems.append(
             Problem(None, "order", "suggested_order must list every clip id exactly once")
         )
     return problems
+
+
+def _required_for(clip: SelectedClip, targets: ClipTargets) -> RequiredQuote | None:
+    return next((q for q in targets.required if (q.start_sentence, q.end_sentence)
+                 == (clip.start_sentence, clip.end_sentence)), None)  # fmt: skip
+
+
+def _required_clip(quote: RequiredQuote, transcript: Transcript, taken: set[str]) -> SelectedClip:
+    span = _span(transcript, SelectedClip(id=quote.id, start_sentence=quote.start_sentence,
+                                          end_sentence=quote.end_sentence, text="", score=1.0,
+                                          role="build", reason=""))  # fmt: skip
+    assert span is not None
+    name = quote.id if quote.id not in taken else f"{quote.id}r"
+    return SelectedClip(id=name, start_sentence=quote.start_sentence,
+                        end_sentence=quote.end_sentence, text=span[0], score=1.0,
+                        role=quote.role or "build", reason="required by the producer")  # fmt: skip
 
 
 def _overlaps(a: SelectedClip, b: SelectedClip) -> bool:
@@ -249,19 +320,36 @@ def finalize(
         assert span is not None
         clamped = clip.model_copy(update={"score": min(1.0, max(0.0, clip.score))})
         clips[clip.id] = (clamped, *span)
+    must = {(q.start_sentence, q.end_sentence) for q in targets.required}
+    present = {(c.start_sentence, c.end_sentence) for c, _, _ in clips.values()}
+    added = []
+    for quote in targets.required:  # the producer's quotes are never left out
+        if (quote.start_sentence, quote.end_sentence) not in present:
+            clip = _required_clip(quote, transcript, set(clips))
+            clips[clip.id] = (clip, *_span(transcript, clip))  # type: ignore[misc]
+            added.append(clip.id)
+            warnings.append(f"added the required passage {quote.id} as {clip.id} (sentences "
+                            f"{quote.start_sentence}-{quote.end_sentence})")  # fmt: skip
+
+    def priority(item: tuple[SelectedClip, str, float]) -> tuple[bool, float]:
+        clip = item[0]
+        return ((clip.start_sentence, clip.end_sentence) not in must, -clip.score)
 
     kept: list[tuple[SelectedClip, str, float]] = []
-    for item in sorted(clips.values(), key=lambda it: -it[0].score):
+    for item in sorted(clips.values(), key=priority):
         clip = item[0]
         clash = next((k[0].id for k in kept if _overlaps(clip, k[0])), None)
         if clash:
-            warnings.append(f"dropped {clip.id}: it overlaps {clash}, which scored higher")
+            warnings.append(f"dropped {clip.id}: it overlaps {clash}, which scored higher or "
+                            "is required")  # fmt: skip
             continue
         kept.append(item)
-    while len(kept) > targets.count:
-        dropped = kept.pop()  # lowest score (kept is in descending score order)
-        warnings.append(f"dropped {dropped[0].id}: more clips than the {targets.count} asked for")
-    while kept and sum(item[2] for item in kept) > targets.total_speech_seconds:
+    high = targets.count_range[1]
+    while len(kept) > high and (kept[-1][0].start_sentence, kept[-1][0].end_sentence) not in must:
+        dropped = kept.pop()  # lowest score (kept is in priority order)
+        warnings.append(f"dropped {dropped[0].id}: more clips than the {high} asked for")
+    while (sum(item[2] for item in kept) > targets.total_speech_seconds
+           and (kept[-1][0].start_sentence, kept[-1][0].end_sentence) not in must):  # fmt: skip
         dropped = kept.pop()
         warnings.append(f"dropped {dropped[0].id}: the clips exceeded the speech budget")
     if not kept:
@@ -274,12 +362,23 @@ def finalize(
         rename = {item[0].id: f"c{i}" for i, item in enumerate(kept, start=1)}
         warnings.append("renamed malformed clip IDs to c1..cN; the notes may use the old IDs")
     order = [rename[i] for i in dict.fromkeys(selection.suggested_order) if i in rename]
+    for item in kept:  # added required passages go before the first clip later in the talk
+        name = rename[item[0].id]
+        if item[0].id in added and name not in order:
+            start = item[0].start_sentence
+            later = next((n for n, i in enumerate(order) if _start(kept, rename, i) > start),
+                         len(order))  # fmt: skip
+            order.insert(later, name)
     by_score = sorted(kept, key=lambda item: -item[0].score)
     order += [rename[item[0].id] for item in by_score if rename[item[0].id] not in order]
     final = [
         item[0].model_copy(update={"id": rename[item[0].id], "text": item[1]}) for item in kept
     ]
     return ClipSelection(clips=final, suggested_order=order, notes=selection.notes), warnings
+
+
+def _start(kept: list[tuple[SelectedClip, str, float]], rename: dict[str, str], name: str) -> int:
+    return next(item[0].start_sentence for item in kept if rename[item[0].id] == name)
 
 
 def estimate_input_tokens(system: str, user: str) -> int:

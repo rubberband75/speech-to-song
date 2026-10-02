@@ -112,7 +112,7 @@ def test_run_dry_run_creates_nothing(cli: Cli, tmp_path: Path, input_file: Path)
     result = cli("run", str(input_file), "--dry-run")
     assert result.exit_code == 0, result.output
     assert "assuming a 15-minute talk" in result.output  # the fixture is not real audio
-    assert "select 5 clips" in result.output
+    assert "select up to 10 clips" in result.output
     assert "refine the arc" not in result.output
     assert "stub music backend is free" in result.output
     assert "Nothing was executed" in result.output

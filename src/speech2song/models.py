@@ -97,6 +97,7 @@ class Manifest(BaseModel):
     tool_version: str
     input: FileRef
     transcript: FileRef | None = None
+    quotes: FileRef | None = None  # passages the song must include (--quotes)
     preset: str
     options: RunOptions = RunOptions()
     settings: dict[str, Any] = {}
@@ -271,11 +272,35 @@ class ClipSelection(BaseModel):
     notes: str | None = None
 
 
+class RequiredQuote(BaseModel):
+    """A passage the user asked for (`--quotes`), matched to transcript sentences."""
+
+    id: str  # "q1", "q2", ...
+    text: str  # as the user wrote it
+    start_sentence: int
+    end_sentence: int
+    similarity: float  # 0-1, of the quote to the matched words
+    role: ClipRole | None = None
+    occurrences: int = 1  # spans matching as well (the first in the talk is used)
+
+
 class ClipTargets(BaseModel):
-    count: int
+    count: int  # aim for about this many...
     min_seconds: float
     max_seconds: float
     total_speech_seconds: float
+    min_count: int | None = None  # ...within this range (None: exactly `count`)
+    max_count: int | None = None
+    long_max_seconds: float | None = None  # quotes essential to the talk (None: max_seconds)
+    required: list[RequiredQuote] = []
+
+    @property
+    def count_range(self) -> tuple[int, int]:
+        return (self.min_count or self.count, self.max_count or self.count)
+
+    @property
+    def longest(self) -> float:
+        return max(self.max_seconds, self.long_max_seconds or self.max_seconds)
 
 
 class SelectionAttempt(BaseModel):
@@ -322,6 +347,11 @@ class Clip(BaseModel):
     end_sample: int
     duration_s: float
     cut_level_db: tuple[float, float]  # level around the start and end cuts
+    # A long quote plays in parts, each its own clip: `quote` is the selected clip's ID
+    # and `part` counts from 1 (a quote in one piece has part 1 of 1).
+    quote: str | None = None
+    part: int = 1
+    parts: int = 1
 
 
 class ClipSet(BaseModel):

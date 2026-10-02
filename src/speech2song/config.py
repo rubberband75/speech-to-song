@@ -84,6 +84,8 @@ class SpeechInteraction(_Strict):
     align_clip_starts_to: Literal["bar", "beat", "free"] = "bar"
     # Beats after a clip's last word before the next section may start.
     tail_beats: float = Field(default=2.0, ge=0)
+    # Music between the parts of a long quote, after a part's last word.
+    part_pause_beats: float = Field(default=4.0, ge=0)
 
 
 class MixSpec(_Strict):
@@ -139,10 +141,13 @@ class MelodySpec(_Strict):
 class ClipsSpec(_Strict):
     """Clip-selection targets (an addition to the spec; see docs/DECISIONS.md)."""
 
-    count: int = Field(default=5, ge=1)
+    count: int = Field(default=8, ge=1)  # about this many quotes...
+    count_tolerance: int = Field(default=2, ge=0)  # ...give or take this, to cover the talk
     min_seconds: float = Field(default=3.0, gt=0)
-    max_seconds: float = Field(default=15.0, gt=0)
-    total_speech_seconds: float = Field(default=60.0, gt=0)
+    max_seconds: float = Field(default=15.0, gt=0)  # the usual longest quote
+    long_max_seconds: float = Field(default=40.0, gt=0)  # for quotes essential to the talk
+    total_speech_seconds: float = Field(default=150.0, gt=0)
+    part_seconds: float = Field(default=15.0, gt=0)  # longer quotes play in parts
     fade_ms: float = Field(default=15.0, ge=0)
     # How far cut points may move from the word timestamps: before a clip's first word,
     # after its last word (speech and room reverb decay well past ASR end times), and
@@ -155,6 +160,8 @@ class ClipsSpec(_Strict):
     def _check_bounds(self) -> "ClipsSpec":
         if self.max_seconds < self.min_seconds:
             raise ValueError("clips.max_seconds must be >= clips.min_seconds")
+        if self.long_max_seconds < self.max_seconds:
+            raise ValueError("clips.long_max_seconds must be >= clips.max_seconds")
         return self
 
 

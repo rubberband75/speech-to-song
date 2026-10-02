@@ -37,6 +37,7 @@ speech2song status                  # what is done, stale or pending
 speech2song transcribe --no-transcript   # re-align without the transcript; ASR stays cached
 speech2song select --dry-run         # estimated Claude cost, no calls
 speech2song select --interactive-review   # Claude picks lines (asks first); review them
+speech2song select --quotes my_quotes.yaml   # lines the song must include
 speech2song melody                  # speech pitch -> melody, MIDI, audio reference
 uv run python scripts/melody_listen.py   # listening tests in runs/<run>/04_listen/
 speech2song arrange                 # sections on the bar grid; prints the timeline
@@ -64,13 +65,33 @@ speech2song run --run latest --stop-after arrange   # resume; stop to check the 
 ### Clips
 
 `select` sends the sentence list (not the audio) to Claude, which picks lines by sentence
-ID. The answer is checked against the transcript (ranges exist, quotes match, durations
+ID: about 8 (6 to 10), chosen so that together they retell the whole talk, usually in
+its own order. Lines run 3-15 s, or up to 40 s for a passage that is essential to the
+talk. The answer is checked against the transcript (ranges exist, quotes match, durations
 fit, no overlaps, total within budget); one retry with feedback is allowed. The `clips`
 stage then cuts each line from `01_clean.wav` at the quietest point near the sentence
-edges, adds 15 ms fades, and writes `clips/clip_NNN.wav` and `03_clips.json`. Apart from
-the fades, clip audio is sample-identical to the source. Review choices (drop, reorder)
-are saved to `03_review.json` and survive re-runs. Targets (count, length, speech budget,
-fades) live in the preset's `clips:` block; `--clips N` overrides the count.
+edges, adds 15 ms fades, and writes `clips/clip_NNN.wav` and `03_clips.json`. A line
+with more than 15 s of speech is cut into parts at its natural pauses (sentence ends,
+then commas, then the longest gaps), as clips `c3-1`, `c3-2`, ...; the arrangement keeps
+them together with a bar of music between them. Apart from the fades, clip audio is
+sample-identical to the source. Review choices (drop, reorder) are saved to
+`03_review.json` and survive re-runs. Targets (count, lengths, speech budget, part
+length, fades) live in the preset's `clips:` block; `--clips N` asks for exactly N.
+
+`--quotes FILE` (on `select` and `run`, sticky; `--no-quotes` drops it) names quotes the
+song must include. A `.txt` file has one quote per line, or one per paragraph when it
+has blank lines. A `.yaml` file is a list of quotes, each a string or a mapping:
+
+```yaml
+- text: The Savior loves all of us and is tenderly calling for you and for me to come home.
+  role: outro          # optional: hook, build, payoff, breakdown or outro
+- text: Come home.
+  occurrence: last     # optional, for a line the talk says more than once (1, 2, ... or last)
+```
+
+Each quote is matched to the transcript (small wording differences are fine) and widened
+to whole sentences before any paid call; a quote that can't be found stops the step.
+Claude is told to include them, and any it leaves out are added anyway.
 
 ### Melody
 

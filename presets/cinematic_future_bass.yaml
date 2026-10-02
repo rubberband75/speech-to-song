@@ -79,12 +79,23 @@ section_roles:
 arc: [intro, speech_bed, build, gap, drop, breakdown, speech_bed, build, gap, drop,
       speech_bed, outro]
 
+# Which lines Claude picks (seconds are spoken words, first to last)
+clips:
+  count: 8                          # about this many quotes, give or take
+  count_tolerance: 2                # this many, so together they summarize the talk
+  min_seconds: 3
+  max_seconds: 15                   # the usual longest quote...
+  long_max_seconds: 40              # ...unless it is essential to the talk's spirit
+  total_speech_seconds: 150
+  part_seconds: 15                  # longer quotes play in parts, with music between
+
 # How the arrangement reacts to speech
 speech_interaction:
   music_recedes_during_clips: true
   swell_after_clip_end: true        # use the end of an idea as a launch into the next section
   align_clip_starts_to: bar         # bar | beat | free
   tail_beats: 2                     # beats after a clip's last word before the next section
+  part_pause_beats: 4               # music between the parts of a long quote
 
 # Local mix settings (pedalboard)
 mix:

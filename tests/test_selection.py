@@ -6,7 +6,7 @@ import pytest
 
 from speech2song.config import load_preset
 from speech2song.errors import StageError
-from speech2song.models import ClipSelection, ClipTargets, RunOptions, SelectedClip
+from speech2song.models import ClipSelection, ClipTargets, RequiredQuote, RunOptions, SelectedClip
 from speech2song.selection import (
     SELECTION_SCHEMA,
     build_prompt,
@@ -58,8 +58,10 @@ def _selection(*clips: SelectedClip, order: list[str] | None = None) -> ClipSele
 
 def test_targets_come_from_the_preset_with_cli_override() -> None:
     preset = load_preset("cinematic_future_bass", PRESETS_DIR)
-    assert clip_targets(preset, RunOptions()).count == 5
-    assert clip_targets(preset, RunOptions(clips=8)).count == 8
+    default = clip_targets(preset, RunOptions())
+    assert (default.count, default.count_range, default.longest) == (8, (6, 10), 40)
+    exact = clip_targets(preset, RunOptions(clips=5))
+    assert (exact.count, exact.count_range) == (5, (5, 5))  # --clips N means exactly N
 
 
 def test_prompt_lists_sentences_and_targets() -> None:
@@ -186,3 +188,50 @@ def test_estimates_are_generous_and_offline() -> None:
     assert estimate_input_tokens("x" * 1100, "y" * 1100) == 1000 + 600
     assert estimate_output_tokens(5) == 3000 + 5 * 250
     assert estimate_input_tokens_from_duration(600) > 600 * 2.6 * 1.6
+
+
+# --- Count ranges, long quotes and required passages -----------------------------------
+
+
+def _required(start: int, end: int, role: str | None = None) -> RequiredQuote:
+    return RequiredQuote(id="q1", text="x", start_sentence=start, end_sentence=end,
+                         similarity=1.0, role=role)  # fmt: skip
+
+
+def test_long_quotes_and_count_ranges() -> None:
+    targets = ClipTargets(count=3, min_count=2, max_count=4, min_seconds=3, max_seconds=5,
+                          long_max_seconds=15, total_speech_seconds=40)  # fmt: skip
+    ok = _selection(_clip("c1", 1, 1), _clip("c2", 2, 3))  # 4 s and 9 s
+    assert validate(ok, TRANSCRIPT, targets) == []
+    too_long = _selection(_clip("c1", 1, 4))  # 19 s
+    problems = validate(too_long, TRANSCRIPT, targets)
+    assert any("clips must be 3-15 s" in p.message for p in problems)
+    assert any(p.kind == "count" and "2-4 were asked for" in p.message for p in problems)
+
+
+def test_required_passages_are_asked_for_and_never_dropped() -> None:
+    targets = ClipTargets(count=2, min_count=2, max_count=2, min_seconds=3, max_seconds=5,
+                          total_speech_seconds=20, required=[_required(4, 6, "outro")])  # fmt: skip
+    _, user = build_prompt(TRANSCRIPT, load_preset("cinematic_future_bass", PRESETS_DIR), targets)
+    assert "sentences 4-6, role outro" in user and "Choose exactly 2 clips" in user
+    answer = _selection(_clip("c1", 1, 1, 0.9), _clip("c2", 5, 5, 0.95), _clip("c3", 2, 2, 0.5))
+    problems = validate(answer, TRANSCRIPT, targets)
+    assert any(p.kind == "required" for p in problems) and needs_retry(problems)
+    final, warnings = finalize(answer, TRANSCRIPT, targets)
+    by_id = {c.id: c for c in final.clips}
+    # The 14 s required passage (over the 5 s limit) is added; c2 overlaps it and goes;
+    # the lowest score goes for the count.
+    assert set(by_id) == {"c1", "q1"}
+    assert (by_id["q1"].start_sentence, by_id["q1"].end_sentence, by_id["q1"].role) == (
+        4, 6, "outro")  # fmt: skip
+    assert any("added the required passage q1" in w for w in warnings)
+    assert final.suggested_order == ["c1", "q1"]  # in talk order relative to the others
+
+
+def test_a_required_passage_claude_chose_is_kept_as_is() -> None:
+    targets = ClipTargets(count=1, min_seconds=3, max_seconds=5, total_speech_seconds=30,
+                          required=[_required(2, 4)])  # fmt: skip
+    answer = _selection(_clip("c7", 2, 4, 0.4))  # 14 s: allowed because it is required
+    assert validate(answer, TRANSCRIPT, targets) == []
+    final, _ = finalize(answer, TRANSCRIPT, targets)
+    assert [c.id for c in final.clips] == ["c7"]

@@ -39,7 +39,9 @@ Return `parts`, the song from start to end. Each part is either:
 
 Rules:
 - every clip appears exactly once, in the order given above
+- the parts of one quote play in the same speech passage (the music between them is
+  already in their bars)
 - use only the roles listed above
-- keep the whole song between about 2.5 and 4.5 minutes
+- keep the whole song between about 3 and 6 minutes, longer when there is more speech
 
 Then give `notes`: one or two sentences on the shape you chose.

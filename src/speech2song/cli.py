@@ -256,6 +256,22 @@ def _set_transcript(run: Run, transcript: Path | None) -> None:
         run.manifest.transcript = run.file_ref(transcript)
 
 
+QUOTES_HELP = (
+    "Quotes the song must include (.txt: one per line, or one per paragraph; .yaml: a list, "
+    "items may give a role). Matched to the transcript before any paid call."
+)
+
+
+def _set_quotes(run: Run, quotes: Path | None) -> None:
+    if quotes is not None:
+        from speech2song.text.quotes import parse_quotes
+
+        if not quotes.is_file():
+            raise S2SError(f"Quotes file not found: {quotes}")
+        parse_quotes(quotes)  # fail early on a malformed file
+        run.manifest.quotes = run.file_ref(quotes)
+
+
 def _context(env: Env, run: Run, *, force: bool = False, dry_run: bool = False, yes: bool = False):
     return Context(run, env.config, env.console, force=force, dry_run=dry_run, yes=yes)
 
@@ -391,11 +407,14 @@ def run_cmd(
         typer.Argument(metavar="INPUT", help="Audio/video file for a new run (omit with --run)."),
     ] = None,
     transcript: Annotated[Path | None, typer.Option(help="Official transcript (.txt).")] = None,
+    quotes: Annotated[Path | None, typer.Option(help=QUOTES_HELP)] = None,
     preset: Annotated[str | None, typer.Option(help="Preset name (default from config).")] = None,
     isolate_voice: Annotated[
         bool | None, typer.Option("--isolate-voice/--no-isolate-voice", help="Use demucs.")
     ] = None,
-    clips: Annotated[int | None, typer.Option(min=1, help="Number of clips to select.")] = None,
+    clips: Annotated[
+        int | None, typer.Option(min=1, help="Exactly this many quotes (default: the preset's).")
+    ] = None,
     music_backend: Annotated[MusicBackend | None, typer.Option(help="Music backend.")] = None,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Show what would run and cost; do nothing.")
@@ -431,13 +450,19 @@ def run_cmd(
         _update_options(run, **options)
         _set_preset(env, run, preset)
         _set_transcript(run, transcript)
+        _set_quotes(run, quotes)
     elif dry_run:
+        if quotes is not None:
+            from speech2song.text.quotes import parse_quotes
+
+            env.console.print(f"{len(parse_quotes(quotes))} required quote(s) in {quotes}")
         _dry_run_new_input(env, input_path, preset, clips, steps, RunOptions(
             **{k: v for k, v in options.items() if v is not None}))  # fmt: skip
         return
     else:
         initial = RunOptions(**{k: v for k, v in options.items() if v is not None})
         run = _create_run(env, input_path, transcript, preset, initial)
+        _set_quotes(run, quotes)
     run.manifest.settings = env.config.snapshot()
     run.save()
     before = CostLog(run.costs_path).totals()["total"]
@@ -481,7 +506,7 @@ def _dry_run_new_input(
         env.config,
         env.config.claude_model,
         estimate_input_tokens_from_duration(seconds),
-        targets.count,
+        targets.count_range[1],
         f"estimated from {seconds / 60:.0f} min of audio",
     )
     if options.refine_arc and any(step.name == "arrange" for step in steps):
@@ -559,7 +584,13 @@ def transcribe(
 @cli_errors
 def select(
     ctx: typer.Context,
-    clips: Annotated[int | None, typer.Option(min=1, help="Number of clips to select.")] = None,
+    clips: Annotated[
+        int | None, typer.Option(min=1, help="Exactly this many quotes (default: the preset's).")
+    ] = None,
+    quotes: Annotated[Path | None, typer.Option(help=QUOTES_HELP)] = None,
+    no_quotes: Annotated[
+        bool, typer.Option("--no-quotes", help="Stop requiring the quotes file.")
+    ] = False,
     model: Annotated[str | None, typer.Option(help="Claude model for this run.")] = None,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Show the estimated cost; call nothing.")
@@ -573,8 +604,13 @@ def select(
 ) -> None:
     """Ask Claude for the best lines, then cut them as sample-exact clips."""
     env = _env(ctx)
+    if quotes is not None and no_quotes:
+        raise S2SError("Use either --quotes or --no-quotes.")
     run = _open_run(env, run_ref)
     _update_options(run, clips=clips, claude_model=model)
+    _set_quotes(run, quotes)
+    if no_quotes:
+        run.manifest.quotes = None
     hooks = {"select": _review_hook(env, run)} if interactive_review else None
     _run_step_command(env, run, "select", force=force, dry_run=dry_run, yes=yes, hooks=hooks)
 
@@ -772,6 +808,8 @@ def status(ctx: typer.Context, run_ref: RunRef = None) -> None:
     env.console.print(f"Input: {escape(manifest.input.path)}")
     transcript = manifest.transcript.path if manifest.transcript else "none"
     env.console.print(f"Transcript: {escape(transcript)} · preset: {manifest.preset}")
+    if manifest.quotes:
+        env.console.print(f"Required quotes: {escape(manifest.quotes.path)}")
     table = Table()
     for column in ("Step", "Stage", "State", "Finished", "Took"):
         table.add_column(column)

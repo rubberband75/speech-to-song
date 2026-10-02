@@ -191,3 +191,31 @@ def test_timeline_strip_and_rows() -> None:
     bed = next(r for r in rows if r[6].startswith("a "))
     assert bed[6].endswith("…")
     assert any("(melody of" in r[6] for r in rows)
+
+
+def _part(quote: str, n: int, of: int, spoken: float) -> ClipInfo:
+    return ClipInfo(f"{quote}-{n}", "build", "x", spoken + 0.3, spoken, quote, n == of)
+
+
+def test_a_long_quotes_parts_stay_together_with_music_between() -> None:
+    parts = [_part("b", 1, 3, 6.0), _part("b", 2, 3, 6.0), _part("b", 3, 3, 6.0)]
+    clips = [_clip("a", 3.0), *parts, _clip("c", 3.0)]
+    for slots in (2, 3, 5):
+        groups = _ids(group_clips(clips, slots))
+        holding = [g for g in groups if "b-1" in g]
+        assert len(holding) == 1 and "b-1,b-2,b-3" in ",".join(holding[0]), groups
+    assert _ids(group_clips(clips, 5)) == [["a"], ["b-1", "b-2", "b-3"], ["c"]]
+    # A part before more of its quote gets a bar of music after its last word.
+    assert bed_bars(parts[0], BPM, tail_beats=2, part_pause_beats=4) == 4  # 12 + 4 = 16 beats
+    assert bed_bars(parts[2], BPM, tail_beats=2, part_pause_beats=4) == 4  # 12 + 2 = 14 beats
+    assert bed_bars(parts[0], BPM, tail_beats=2, part_pause_beats=5) == 5
+
+
+def test_a_proposed_arc_must_keep_a_quotes_parts_together() -> None:
+    preset = load_preset("cinematic_future_bass", PRESETS_DIR)
+    clips = [_part("b", 1, 2, 6.0), _part("b", 2, 2, 6.0)]
+    split = [ArcPart(role="speech_bed", clips=["b-1"]), ArcPart(role="drop", bars=4),
+             ArcPart(role="speech_bed", clips=["b-2"])]  # fmt: skip
+    assert any("parts of quote b" in p for p in check_parts(split, clips, preset))
+    together = [ArcPart(role="speech_bed", clips=["b-1", "b-2"]), ArcPart(role="drop", bars=4)]
+    assert check_parts(together, clips, preset) == []
