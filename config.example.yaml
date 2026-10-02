@@ -3,6 +3,7 @@
 
 runs_dir: runs
 presets_dir: presets
+downloads_dir: inputs            # talks given as a URL are saved here (gitignored)
 default_preset: cinematic_future_bass
 
 claude_model: claude-sonnet-5-5   # claude-opus-5-5 for harder picks; per run: select --model

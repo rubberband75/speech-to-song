@@ -367,6 +367,7 @@ class ElevenLabsConfig(_Strict):
 class AppConfig(_Strict):
     runs_dir: Path = Path("runs")
     presets_dir: Path = Path("presets")
+    downloads_dir: Path = Path("inputs")  # where talks given as a URL are saved
     default_preset: str = "cinematic_future_bass"
     claude_model: str = "claude-sonnet-5-5"  # spec section 8; claude-opus-5-5 for harder picks
     claude_effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
@@ -412,6 +413,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         update={
             "runs_dir": base / config.runs_dir,
             "presets_dir": base / config.presets_dir,
+            "downloads_dir": base / config.downloads_dir,
         }
     )
 

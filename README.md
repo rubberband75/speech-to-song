@@ -48,6 +48,7 @@ speech2song regenerate --undo       # back to the take's previous version (free)
 speech2song mix                     # pick a take, then stems, master.wav, master.mp3
 speech2song mix --take 2            # mix another take (free); --take auto: best again
 speech2song run inputs/talk.mp3 --transcript inputs/talk.txt      # every step
+speech2song run "https://www.churchofjesuschrist.org/study/general-conference/2016/04/opposition-in-all-things?lang=eng"   # a talk's page
 speech2song run --run latest --stop-after arrange   # resume; stop to check the arrangement
 ```
 
@@ -181,6 +182,23 @@ needed. `mix.json` lists those words.
 `--melody-layer` (on `mix` and `run`, sticky) adds the MIDI melody: `off` (the preset's
 default), `replay` (breakdowns and drops replay the line just heard) or `all` (also
 quietly under the speech).
+
+### Talks from a URL
+
+`run` and `ingest` also take a talk's web page instead of a file. A handler for the page's
+site finds the audio and the published text, and saves them in `inputs/`
+(`downloads_dir`) as `<title>-by-<speaker>.mp3` and `.txt`; the run uses them as its
+input and official transcript (`--transcript` still wins). Files already there are kept
+as they are, so a talk downloads once and hand edits to its text survive. A dry run reads
+the page but downloads nothing. The page is recorded in the manifest and shown by
+`status`.
+
+Handlers match the URL's host and path prefix:
+
+- `www.churchofjesuschrist.org/study/general-conference/`: General Conference talks,
+  read through the site's content API. The transcript keeps the paragraphs and verse
+  lines; headings, the byline, images and captions, footnotes, and scripture citations in
+  parentheses are left out.
 
 ### Official transcripts
 

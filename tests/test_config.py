@@ -174,5 +174,5 @@ def test_example_config_documents_the_defaults() -> None:
     from .conftest import REPO_ROOT
 
     example = load_config(REPO_ROOT / "config.example.yaml")
-    paths = {"runs_dir", "presets_dir"}
+    paths = {"runs_dir", "presets_dir", "downloads_dir"}
     assert example.model_dump(exclude=paths) == AppConfig().model_dump(exclude=paths)

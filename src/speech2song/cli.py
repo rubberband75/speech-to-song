@@ -32,6 +32,7 @@ from speech2song.models import ClipSet, RunOptions
 from speech2song.pipeline import Context, Stage, check, execute
 from speech2song.review import run_review
 from speech2song.selection import clip_targets, estimate_input_tokens_from_duration
+from speech2song.sources import Talk, describe_talk, fetch_talk, is_url, talk_paths
 from speech2song.stages.align import AlignStage
 from speech2song.stages.arrange import ArcStage, ArrangeStage, arc_estimates, show_arrangement
 from speech2song.stages.generate_music import GenerateStage, TakeStage
@@ -216,14 +217,21 @@ def _open_run(env: Env, ref: str | None) -> Run:
 
 
 def _create_run(
-    env: Env, input_path: Path, transcript: Path | None, preset: str | None, options: RunOptions
+    env: Env, input_ref: str, transcript: Path | None, preset: str | None, options: RunOptions
 ) -> Run:
+    """A new run for a file, or for a talk's URL (its audio and transcript are saved in
+    the downloads folder first; --transcript still wins)."""
+    preset_name = preset or env.config.default_preset
+    load_preset(preset_name, env.config.presets_dir)  # fail early on a bad preset
+    source_url = input_ref if is_url(input_ref) else None
+    if source_url is not None:
+        input_path, transcript = _download_input(env, source_url, transcript)
+    else:
+        input_path = Path(input_ref)
     if not input_path.is_file():
         raise S2SError(f"Input file not found: {input_path}")
     if transcript is not None and not transcript.is_file():
         raise S2SError(f"Transcript file not found: {transcript}")
-    preset_name = preset or env.config.default_preset
-    load_preset(preset_name, env.config.presets_dir)  # fail early on a bad preset
     run = Run.create(
         env.config.runs_dir,
         input_path,
@@ -232,8 +240,29 @@ def _create_run(
         options=options,
         settings=env.config.snapshot(),
     )
+    if source_url is not None:
+        run.manifest.source_url = source_url
+        run.save()
     env.console.print(f"Created run [bold]{escape(run.id)}[/] ({escape(str(run.root))})")
     return run
+
+
+INPUT_HELP = "Audio/video file, or a talk's web page, for a new run (omit with --run)."
+
+
+def _talk_line(talk: Talk) -> str:
+    speaker = f" by {talk.speaker}" if talk.speaker else ""
+    return f"[bold]{escape(talk.title)}[/]{escape(speaker)}"
+
+
+def _download_input(env: Env, url: str, transcript: Path | None) -> tuple[Path, Path | None]:
+    """Save the talk at `url`; returns (audio, transcript), the page's unless given."""
+    talk, files = fetch_talk(url, env.config.downloads_dir)
+    env.console.print(f"Talk: {_talk_line(talk)}")
+    for path in (files.audio, files.transcript):
+        state = "downloaded" if path in files.written else "already there, kept as is"
+        env.console.print(f"  {escape(str(path))} ({state})")
+    return files.audio, transcript or files.transcript
 
 
 def _update_options(run: Run, **changes: Any) -> None:
@@ -402,11 +431,10 @@ def _run_step_command(
 @cli_errors
 def run_cmd(
     ctx: typer.Context,
-    input_path: Annotated[
-        Path | None,
-        typer.Argument(metavar="INPUT", help="Audio/video file for a new run (omit with --run)."),
+    input_ref: Annotated[str | None, typer.Argument(metavar="INPUT", help=INPUT_HELP)] = None,
+    transcript: Annotated[
+        Path | None, typer.Option(help="Official transcript (.txt); a URL input brings its own.")
     ] = None,
-    transcript: Annotated[Path | None, typer.Option(help="Official transcript (.txt).")] = None,
     quotes: Annotated[Path | None, typer.Option(help=QUOTES_HELP)] = None,
     preset: Annotated[str | None, typer.Option(help="Preset name (default from config).")] = None,
     isolate_voice: Annotated[
@@ -434,7 +462,7 @@ def run_cmd(
 ) -> None:
     """Run the whole pipeline (or resume a run with --run)."""
     env = _env(ctx)
-    if input_path is not None and run_ref is not None:
+    if input_ref is not None and run_ref is not None:
         raise S2SError("Pass INPUT to start a new run, or --run to resume one, not both.")
     last = STEPS.index(STEP_BY_NAME[stop_after.value]) if stop_after else len(STEPS) - 1
     steps = STEPS[: last + 1]
@@ -445,7 +473,7 @@ def run_cmd(
         "refine_arc": refine_arc,
         "melody_layer": melody_layer.value if melody_layer else None,
     }
-    if input_path is None:
+    if input_ref is None:
         run = _open_run(env, run_ref)
         _update_options(run, **options)
         _set_preset(env, run, preset)
@@ -456,12 +484,12 @@ def run_cmd(
             from speech2song.text.quotes import parse_quotes
 
             env.console.print(f"{len(parse_quotes(quotes))} required quote(s) in {quotes}")
-        _dry_run_new_input(env, input_path, preset, clips, steps, RunOptions(
+        _dry_run_new_input(env, input_ref, preset, clips, steps, RunOptions(
             **{k: v for k, v in options.items() if v is not None}))  # fmt: skip
         return
     else:
         initial = RunOptions(**{k: v for k, v in options.items() if v is not None})
-        run = _create_run(env, input_path, transcript, preset, initial)
+        run = _create_run(env, input_ref, transcript, preset, initial)
         _set_quotes(run, quotes)
     run.manifest.settings = env.config.snapshot()
     run.save()
@@ -479,29 +507,37 @@ def run_cmd(
 
 def _dry_run_new_input(
     env: Env,
-    input_path: Path,
+    input_ref: str,
     preset: str | None,
     clips: int | None,
     steps: list[Step],
     options: RunOptions,
 ) -> None:
-    """Estimate a new run's spend from the input's duration (ffprobe only, no stages)."""
-    if not input_path.is_file():
-        raise S2SError(f"Input file not found: {input_path}")
+    """Estimate a new run's spend from the input's duration (ffprobe only, no stages).
+    A URL input is looked up (its page only); nothing is downloaded."""
     names = ", ".join(step.name for step in steps)
-    env.console.print(f"Dry run: would create a new run for {escape(str(input_path))}")
+    if is_url(input_ref):
+        handler, talk = describe_talk(input_ref)
+        input_path, text_path = talk_paths(talk, env.config.downloads_dir)
+        env.console.print(f"Talk: {_talk_line(talk)} ({escape(handler.name)})")
+        env.console.print(f"Dry run: would save {escape(str(input_path))} and "
+                          f"{escape(text_path.name)}, then create a new run")  # fmt: skip
+    else:
+        input_path = Path(input_ref)
+        if not input_path.is_file():
+            raise S2SError(f"Input file not found: {input_path}")
+        env.console.print(f"Dry run: would create a new run for {escape(str(input_path))}")
     env.console.print(f"and run: {names}.")
     if not any(step.name == "select" for step in steps):
         env.console.print("No paid calls before the steps you asked for. Nothing was executed.")
         return
     preset_obj = load_preset(preset or env.config.default_preset, env.config.presets_dir)
     targets = clip_targets(preset_obj, RunOptions(clips=clips))
-    try:
-        seconds = probe(input_path).duration_s or 900.0
-    except S2SError as exc:
-        env.console.print(f"[yellow]Could not read the input ({escape(str(exc))}); "
-                          "assuming a 15-minute talk.[/]")  # fmt: skip
+    if not input_path.is_file():
+        env.console.print("[yellow]The audio isn't downloaded yet; assuming a 15-minute talk.[/]")
         seconds = 900.0
+    else:
+        seconds = _probe_seconds(env, input_path)
     estimates = select_estimates(
         env.config,
         env.config.claude_model,
@@ -515,22 +551,30 @@ def _dry_run_new_input(
     total = sum(e.usd or 0.0 for e in estimates)
     music = backend_name(env.config, options)
     note = ("The stub music backend is free." if music == "stub"
-            else f"The {music} music backend is planned for M5.")  # fmt: skip
+            else f"The {music} music is estimated when `generate` runs.")  # fmt: skip
     env.console.print(
         f"Dry run total, worst case (every retry happens): [bold]${total:.4f}[/]. "
         f"{note} Nothing was executed."
     )
 
 
+def _probe_seconds(env: Env, path: Path) -> float:
+    try:
+        return probe(path).duration_s or 900.0
+    except S2SError as exc:
+        env.console.print(f"[yellow]Could not read the input ({escape(str(exc))}); "
+                          "assuming a 15-minute talk.[/]")  # fmt: skip
+        return 900.0
+
+
 @app.command()
 @cli_errors
 def ingest(
     ctx: typer.Context,
-    input_path: Annotated[
-        Path | None,
-        typer.Argument(metavar="INPUT", help="Audio/video file for a new run (omit with --run)."),
+    input_ref: Annotated[str | None, typer.Argument(metavar="INPUT", help=INPUT_HELP)] = None,
+    transcript: Annotated[
+        Path | None, typer.Option(help="Official transcript (.txt); a URL input brings its own.")
     ] = None,
-    transcript: Annotated[Path | None, typer.Option(help="Official transcript (.txt).")] = None,
     preset: Annotated[str | None, typer.Option(help="Preset name (default from config).")] = None,
     isolate_voice: Annotated[
         bool | None, typer.Option("--isolate-voice/--no-isolate-voice", help="Use demucs.")
@@ -540,16 +584,16 @@ def ingest(
 ) -> None:
     """Extract 00_source.wav (and the optional voice-isolated 01_clean.wav)."""
     env = _env(ctx)
-    if input_path is not None and run_ref is not None:
+    if input_ref is not None and run_ref is not None:
         raise S2SError("Pass INPUT to start a new run, or --run to re-ingest one, not both.")
-    if input_path is None:
+    if input_ref is None:
         run = _open_run(env, run_ref)
         _update_options(run, isolate_voice=isolate_voice)
         _set_preset(env, run, preset)
         _set_transcript(run, transcript)
     else:
         options = RunOptions(isolate_voice=bool(isolate_voice))
-        run = _create_run(env, input_path, transcript, preset, options)
+        run = _create_run(env, input_ref, transcript, preset, options)
     _run_step_command(env, run, "ingest", force=force)
 
 
@@ -806,6 +850,8 @@ def status(ctx: typer.Context, run_ref: RunRef = None) -> None:
     run = _open_run(env, run_ref)
     manifest = run.manifest
     env.console.print(f"Input: {escape(manifest.input.path)}")
+    if manifest.source_url:
+        env.console.print(f"From: {escape(manifest.source_url)}")
     transcript = manifest.transcript.path if manifest.transcript else "none"
     env.console.print(f"Transcript: {escape(transcript)} · preset: {manifest.preset}")
     if manifest.quotes:

@@ -96,6 +96,7 @@ class Manifest(BaseModel):
     created_at: datetime
     tool_version: str
     input: FileRef
+    source_url: str | None = None  # the page the input was downloaded from
     transcript: FileRef | None = None
     quotes: FileRef | None = None  # passages the song must include (--quotes)
     preset: str
