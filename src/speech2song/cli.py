@@ -444,6 +444,9 @@ def run_cmd(
         int | None, typer.Option(min=1, help="Exactly this many quotes (default: the preset's).")
     ] = None,
     music_backend: Annotated[MusicBackend | None, typer.Option(help="Music backend.")] = None,
+    model: Annotated[
+        str | None, typer.Option(help="Claude model for this run (selection and arc).")
+    ] = None,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Show what would run and cost; do nothing.")
     ] = False,
@@ -470,6 +473,7 @@ def run_cmd(
         "isolate_voice": isolate_voice,
         "clips": clips,
         "music_backend": music_backend.value if music_backend else None,
+        "claude_model": model,
         "refine_arc": refine_arc,
         "melody_layer": melody_layer.value if melody_layer else None,
     }
@@ -538,15 +542,16 @@ def _dry_run_new_input(
         seconds = 900.0
     else:
         seconds = _probe_seconds(env, input_path)
+    model = options.claude_model or env.config.claude_model
     estimates = select_estimates(
         env.config,
-        env.config.claude_model,
+        model,
         estimate_input_tokens_from_duration(seconds),
         targets.count_range[1],
         f"estimated from {seconds / 60:.0f} min of audio",
     )
     if options.refine_arc and any(step.name == "arrange" for step in steps):
-        estimates += arc_estimates(env.config, env.config.claude_model)
+        estimates += arc_estimates(env.config, model)
     render_estimates(env.console, estimates)
     total = sum(e.usd or 0.0 for e in estimates)
     music = backend_name(env.config, options)

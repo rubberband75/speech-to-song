@@ -125,6 +125,18 @@ def test_run_dry_run_with_refine_arc_estimates_it(cli: Cli, input_file: Path) ->
     assert "refine the arc" in result.output
 
 
+def test_run_model_is_estimated_and_sticky(cli: Cli, cli_run: Run, input_file: Path) -> None:
+    result = cli("run", str(input_file), "--dry-run", "--refine-arc", "--model", "claude-opus-5-5")
+    assert result.exit_code == 0, result.output
+    assert "claude-opus-5-5" in result.output  # selection and arc rows
+    assert "claude-sonnet" not in result.output
+    result = cli("run", "--run", cli_run.id, "--model", "claude-opus-5-5", "--dry-run")
+    assert result.exit_code == 0, result.output
+    assert "claude-opus-5-5" in result.output and "claude-sonnet" not in result.output
+    assert Run.open(cli_run.root.parent, cli_run.id).manifest.options.claude_model == (
+        "claude-opus-5-5")  # fmt: skip
+
+
 def test_input_and_run_are_exclusive(cli: Cli, cli_run: Run, input_file: Path) -> None:
     result = cli("run", str(input_file), "--run", cli_run.id)
     assert result.exit_code == 1

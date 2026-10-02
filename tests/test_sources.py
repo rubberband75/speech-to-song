@@ -1,6 +1,6 @@
-"""Talks given as a URL: finding the handler, reading a General Conference page, saving the
-files, and `ingest`/`run` with a URL. The page and the audio are synthetic, and the
-network is never used."""
+"""Talks given as a URL: finding the handler, reading General Conference and BYU Speeches
+pages, saving the files, and `ingest`/`run` with a URL. The pages and the audio are
+synthetic, and the network is never used."""
 
 import json
 from collections.abc import Callable
@@ -15,12 +15,15 @@ from speech2song.errors import S2SError
 from speech2song.manifest import Run
 from speech2song.sources import describe_talk, find_handler, is_url
 from speech2song.sources.base import Talk, save_talk
+from speech2song.sources.byu_speeches import ByuSpeeches
+from speech2song.sources.byu_speeches import talk_from_page as byu_talk_from_page
 from speech2song.sources.general_conference import (
     API_URL,
     GeneralConference,
     talk_from_page,
     talk_text,
 )
+from speech2song.sources.html_text import clean
 
 from .fixtures.synth import speechlike, write_wav
 
@@ -73,15 +76,63 @@ def _page(**meta: object) -> dict:
     return {"meta": base | meta, "content": {"body": BODY}}
 
 
+BYU_URL = "https://speeches.byu.edu/talks/jane-q-example/a-made-up-devotional/"
+BYU_AUDIO = "https://speeches.byu.edu/wp-content/uploads/2030/01/Example-Jane.mp3"
+
+BYU_ARTICLE = {
+    "@context": "https://schema.org",
+    "@graph": [
+        {"@type": "WebPage", "name": "Devotional: A Made-Up Devotional - BYU Speeches"},
+        {"@type": "Article", "headline": "A Made-Up Devotional\u2019s Title",
+         "author": {"@type": "Person", "name": "Jane Q. Example"},
+         "audio": {"@type": "AudioObject", "contentUrl": BYU_AUDIO}},
+    ],
+}  # fmt: skip
+
+BYU_CONTENT = """<div class=individual-speech__content>
+<p>I begin with a story (and I mean it) about time.<sup><a
+class=individual-speech__footnote-ref href=#note-1>1</a></sup></p>
+<h2><b>I. A Heading</b></h2>
+<p>\u201cAll things in their time\u201d (<a href=https://example.org/a>Book 64:32</a>).
+Then he left (see Book 10\u201311). We read [the Lord] said it.</p>
+<p>A line of verse,<br> <i>and another.</i><br>
+[<i>A Book</i>&nbsp;(City: A Press, 1982), 93]</p>
+<div class=wp-block-group><p>[A photo was&nbsp;shown.] They walked west.
+(See <i>A Journal</i> [City: A Press, 1986], 36.)</p></div>
+<ul><li>Keep rowing.</li></ul>
+<p><br>\u00a9 Brigham Young University. All rights reserved.</p>
+</div>"""
+
+BYU_SPOKEN = (
+    "I begin with a story (and I mean it) about time.\n\n"
+    "\u201cAll things in their time\u201d. Then he left. We read the Lord said it.\n\n"
+    "A line of verse,\n\n"
+    "and another.\n\n"
+    "They walked west.\n\n"
+    "Keep rowing.\n"
+)
+
+
+def _byu_page(article: dict | None = BYU_ARTICLE, content: str = BYU_CONTENT) -> str:
+    data = ("" if article is None else
+            f'<script type="application/ld+json" class=yoast-schema-graph>'
+            f"{json.dumps(article)}</script>")  # fmt: skip
+    return (f"<html><head>{data}</head><body><blockquote class=individual-speech__callout>"
+            f"<p>A pull quote.</p></blockquote>{content}<div class=individual-speech__blurb>"
+            f"<p>Jane Q. Example was a speaker.</p></div></body></html>")  # fmt: skip
+
+
 class FakeHttp:
-    def __init__(self, page: dict | None = None, audio: bytes = b"audio bytes") -> None:
+    """Serves one page (a dict is sent as JSON, a str as HTML) and one audio file."""
+
+    def __init__(self, page: dict | str | None = None, audio: bytes = b"audio bytes") -> None:
         self.page = _page() if page is None else page
         self.audio = audio
         self.requests: list[str] = []
 
     def get(self, url: str) -> bytes:
         self.requests.append(url)
-        return json.dumps(self.page).encode()
+        return (self.page if isinstance(self.page, str) else json.dumps(self.page)).encode()
 
     def download(self, url: str, dest: Path) -> None:
         self.requests.append(url)
@@ -92,15 +143,18 @@ def test_handlers_match_host_and_path_prefix() -> None:
     assert isinstance(find_handler(PAGE_URL), GeneralConference)
     assert isinstance(find_handler(PAGE_URL.replace("https://www", "http://WWW")),
                       GeneralConference)  # fmt: skip
-    for url in ("https://speeches.byu.edu/talks/dallin-h-oaks/timing/",
-                "https://www.churchofjesuschrist.org/study/scriptures/bofm/2-ne/2?lang=eng",
+    assert isinstance(find_handler(BYU_URL), ByuSpeeches)
+    for url in ("https://www.churchofjesuschrist.org/study/scriptures/bofm/2-ne/2?lang=eng",
                 "https://www.churchofjesuschrist.org.example.com/study/general-conference/x",
-                "https://churchofjesuschrist.org/study/general-conference/2016/04/x"):  # fmt: skip
+                "https://churchofjesuschrist.org/study/general-conference/2016/04/x",
+                "https://speeches.byu.edu/speakers/jane-q-example/",
+                "https://speeches.byu.edu.example.com/talks/jane-q-example/x/"):  # fmt: skip
         assert find_handler(url) is None, url
     assert is_url("HTTPS://example.org/a") and not is_url("inputs/talk.mp3")
     with pytest.raises(S2SError, match="No handler for this URL") as error:
-        describe_talk("https://speeches.byu.edu/talks/dallin-h-oaks/timing/", FakeHttp())
+        describe_talk("https://example.org/talks/a-talk/", FakeHttp())
     assert "www.churchofjesuschrist.org/study/general-conference/" in str(error.value)
+    assert "speeches.byu.edu/talks/" in str(error.value)
 
 
 def test_talk_text_keeps_only_what_is_spoken() -> None:
@@ -131,6 +185,36 @@ def test_pages_that_are_not_talks_with_audio_are_refused() -> None:
     http.get = lambda url: b"<html>not json</html>"  # type: ignore[method-assign]
     with pytest.raises(S2SError, match="sent something unexpected"):
         GeneralConference().describe(PAGE_URL, http)
+
+
+def test_citations_are_dropped_and_spoken_words_kept() -> None:
+    assert clean("a (b) c [d] e (see f) [g h.] (i 2) [j (k, 1982), 9] l .") == "a (b) c d e l."
+    assert clean("unbalanced ( and ] stay") == "unbalanced ( and ] stay"
+
+
+def test_a_byu_talk_is_read_from_its_page() -> None:
+    http = FakeHttp(_byu_page())
+    talk = ByuSpeeches().describe(BYU_URL, http)
+    assert http.requests == [BYU_URL]
+    assert (talk.title, talk.speaker, talk.audio_url) == (
+        "A Made-Up Devotional\u2019s Title", "Jane Q. Example", BYU_AUDIO)  # fmt: skip
+    assert talk.text == BYU_SPOKEN
+    assert talk.stem == "a-made-up-devotionals-title-by-jane-q-example"
+
+
+def test_byu_pages_that_are_not_talks_with_audio_are_refused() -> None:
+    with pytest.raises(S2SError, match="Not a BYU Speeches talk"):
+        byu_talk_from_page(BYU_URL, _byu_page(article=None))
+    no_audio = {"@type": "Article", "headline": "A Talk", "author": {"name": "Jane"}}
+    with pytest.raises(S2SError, match="no audio download"):
+        byu_talk_from_page(BYU_URL, _byu_page(article=no_audio))
+    with pytest.raises(S2SError, match="no text"):
+        byu_talk_from_page(BYU_URL, _byu_page(content="<div class=other><p>Text.</p></div>"))
+    two = {"@type": ["Article"], "audio": [{"contentUrl": BYU_AUDIO}],
+           "author": [{"name": "Jane Q. Example"}, {"name": "John Example"}]}  # fmt: skip
+    talk = byu_talk_from_page(BYU_URL, _byu_page(article=two))
+    assert talk.title == "a-made-up-devotional"
+    assert talk.speaker == "Jane Q. Example and John Example"
 
 
 def test_a_talk_is_downloaded_once_and_edits_are_kept(tmp_path: Path) -> None:
@@ -202,6 +286,6 @@ def test_a_url_dry_run_reads_the_page_and_downloads_nothing(
 
 
 def test_a_url_without_a_handler_is_a_clean_error(cli: Cli, web: FakeHttp) -> None:
-    result = cli("run", "https://speeches.byu.edu/talks/dallin-h-oaks/timing/")
+    result = cli("run", "https://example.org/talks/a-talk/")
     assert result.exit_code == 1
     assert "No handler for this URL" in result.output

@@ -49,6 +49,7 @@ speech2song mix                     # pick a take, then stems, master.wav, maste
 speech2song mix --take 2            # mix another take (free); --take auto: best again
 speech2song run inputs/talk.mp3 --transcript inputs/talk.txt      # every step
 speech2song run "https://www.churchofjesuschrist.org/study/general-conference/2016/04/opposition-in-all-things?lang=eng"   # a talk's page
+speech2song run "https://speeches.byu.edu/talks/dallin-h-oaks/timing/" --model claude-opus-5-5 --refine-arc --music-backend elevenlabs   # the paid song in one go
 speech2song run --run latest --stop-after arrange   # resume; stop to check the arrangement
 ```
 
@@ -196,9 +197,15 @@ the page but downloads nothing. The page is recorded in the manifest and shown b
 Handlers match the URL's host and path prefix:
 
 - `www.churchofjesuschrist.org/study/general-conference/`: General Conference talks,
-  read through the site's content API. The transcript keeps the paragraphs and verse
-  lines; headings, the byline, images and captions, footnotes, and scripture citations in
-  parentheses are left out.
+  read through the site's content API.
+- `speeches.byu.edu/talks/`: BYU Speeches talks, read from the page itself (its article
+  data gives the title, speaker and audio file).
+
+The transcript keeps the paragraphs, list items and verse lines. Headings, the byline,
+images and captions, footnotes and the copyright line are left out, and so are citations:
+a group in parentheses or brackets that holds a link or a number or starts with "see",
+and bracketed notes such as "[A photo was shown.]". Editorial words in brackets, such as
+"[the Lord]", are kept without the brackets.
 
 ### Official transcripts
 

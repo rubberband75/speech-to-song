@@ -15,9 +15,10 @@ from speech2song.sources.base import (
     save_talk,
     talk_paths,
 )
+from speech2song.sources.byu_speeches import ByuSpeeches
 from speech2song.sources.general_conference import GeneralConference
 
-HANDLERS: tuple[UrlHandler, ...] = (GeneralConference(),)
+HANDLERS: tuple[UrlHandler, ...] = (GeneralConference(), ByuSpeeches())
 
 __all__ = ["HANDLERS", "Talk", "TalkFiles", "describe_talk", "fetch_talk", "find_handler",
            "is_url", "talk_paths"]  # fmt: skip

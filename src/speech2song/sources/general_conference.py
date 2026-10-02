@@ -2,98 +2,54 @@
 
 The site's content API returns a page as JSON (the same data the page renders):
 `meta.audio` lists the audio downloads and `content.body` holds the talk as HTML.
-The transcript keeps what is spoken: the body's paragraphs and verse lines, one per
-block. Headings, the byline, images and captions, footnote markers, the notes, and
-scripture citations in parentheses are left out; the aligner treats anything else the
-speaker skips as unspoken.
+The transcript keeps what is spoken (see `html_text`); the byline, in the body's header,
+gives the speaker.
 """
 
 import json
 import re
-from html.parser import HTMLParser
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from speech2song.errors import S2SError
 from speech2song.sources.base import Http, Talk
+from speech2song.sources.html_text import TalkHtml, classes, join_blocks
 
 API_URL = "https://www.churchofjesuschrist.org/study/api/v3/language-pages/type/content"
 TALK_TYPE = "general-conference-talk"
 
-SKIPPED = {"header", "footer", "figure", "figcaption", "img", "picture", "video", "audio",
-           "sup", "script", "style", "nav", "aside", "table", "h1", "h2", "h3", "h4", "h5",
-           "h6"}  # fmt: skip
-BLOCKS = {"p", "li", "div", "section", "blockquote", "dd", "dt"}
-VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source",
-        "track", "wbr"}  # fmt: skip
-CITATION = "\ue000"  # marks a scripture link while the text is assembled
-_CITED = re.compile(f"\\s*\\([^()]*{CITATION}[^()]*\\)")
 
+class _TalkHtml(TalkHtml):
+    """The talk's blocks, and the speaker from the byline (`p.author-name`)."""
 
-def _clean(text: str) -> str:
-    text = _CITED.sub("", text).replace(CITATION, "")
-    text = " ".join(text.split())
-    return re.sub(r"\s+([.,;:!?])", r"\1", text)  # where a citation was removed
-
-
-class _TalkHtml(HTMLParser):
     def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.skipping: list[str] = []  # open skipped elements, innermost last
-        self.chunks: list[str] = []
-        self.blocks: list[str] = []
+        super().__init__()
         self.author: str | None = None
         self._author: list[str] | None = None
 
-    def _flush(self) -> None:
-        text = _clean("".join(self.chunks))
-        self.chunks = []
-        if text:
-            self.blocks.append(text)
-
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        classes = (dict(attrs).get("class") or "").split()
-        if tag == "p" and "author-name" in classes:
+        if tag == "p" and "author-name" in classes(attrs):
             self._author = []
-        if tag in VOID:
-            if tag == "br" and not self.skipping:
-                self._flush()
-            return
-        if self.skipping or tag in SKIPPED:
-            self.skipping.append(tag)
-            return
-        if tag in BLOCKS:
-            self._flush()
-        elif tag == "a" and "scripture-ref" in classes:
-            self.chunks.append(CITATION)
+        super().handle_starttag(tag, attrs)
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "p" and self._author is not None:
             self.author = " ".join("".join(self._author).split())
             self._author = None
-        if self.skipping:
-            if tag in self.skipping:
-                del self.skipping[len(self.skipping) - 1 - self.skipping[::-1].index(tag) :]
-            return
-        if tag in BLOCKS:
-            self._flush()
+        super().handle_endtag(tag)
 
     def handle_data(self, data: str) -> None:
         if self._author is not None:
             self._author.append(data)
-        if not self.skipping:
-            self.chunks.append(data)
+        super().handle_data(data)
 
 
 def talk_text(body: str) -> tuple[str, str | None]:
-    """(transcript, speaker) from a talk's body HTML. The transcript has one block per
-    paragraph or verse line, separated by blank lines, like a hand-copied one."""
+    """(transcript, speaker) from a talk's body HTML."""
     parser = _TalkHtml()
     parser.feed(body)
     parser.close()
-    parser._flush()
     speaker = re.sub(r"(?i)^by\s+", "", parser.author) if parser.author else None
-    text = "\n\n".join(parser.blocks)
-    return (text + "\n" if text else ""), speaker or None
+    return join_blocks(parser.blocks), speaker or None
 
 
 def talk_from_page(url: str, page: dict) -> Talk:
