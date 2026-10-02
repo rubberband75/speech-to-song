@@ -117,7 +117,8 @@ and each clip gets its own speech bed, starting on a bar and long enough for the
 plus `speech_interaction.tail_beats`. Other sections take their `bars` from the preset.
 Beds use their clip's chords from the melody, other sections loop the main phrase's
 chords, and breakdowns and drops note which line was heard last, for the melody layer.
-Silent roles (`silent: true`, the gap before a drop) are muted in the mix.
+Silent roles (`silent: true`, the gap before a drop) get no music of their own; the mix
+turns them into a short lift (see `mix`).
 `05_arrangement.json` can be edited by hand: later steps pick up the edit, and the mixer
 checks it first.
 
@@ -169,18 +170,25 @@ or `--take N` (any take that fits; sticky, `--take auto` to undo). Then it write
 The music is shaped toward the arrangement first: a section whose loudness strays more
 than `mix.energy_tolerance_db` from a line through the sections' median
 (`energy_range_db` from energy 0 to 1) is pulled back by the excess, at most
-`energy_max_db`. Silent sections are cut, leaving a short reverb tail of the music before
-them (`gap_reverb`). Generated drops often open with a silent bar and a riser; when the
+`energy_max_db`. Nothing in the song is muted. A `gap` (the silent role: no music is
+generated for it) is a lift into the drop: the build's music runs on, rises by
+`gap_lift_db` (3) and gets a reverse-reverb swell of its own tail (`gap_swell`) that peaks
+on the downbeat. Generated drops often open with a silent bar and a riser; when the
 section after a gap opens near-silent and reaches full level within
 `late_entry_max_bars` (4), its music is taken from that many bars later, so it starts
-on the downbeat (and its spill into the next section goes back with it). The speech bus
+on the downbeat (and its spill into the next section goes back with it). The last chord
+rings out: the music's last audible stretch goes through a long reverb that dies away
+over `ring_out_s` (6), and the file ends there. The speech bus
 sits `mix.speech_level_lu` above the music's
 loudness, with a high-pass, gentle compression, and reverb/delay sends whose tails fade
-out before the next clip. The music ducks by `sidechain_duck_db` while speech plays, and
-the speech guard makes sure every word (from the transcript's timings) stays at least
+out before the next clip. The music ducks once per quote, by `sidechain_duck_db`: it
+eases down over the `duck_lead_s` (0.6) before the quote's first word, stays down through
+its pauses, and comes back over `duck_release_s` (1.5) after its last word. The speech
+guard makes sure every word (from the transcript's timings) stays at least
 `speech_margin_db` (10 dB) above the music in the speech band (200 Hz-5 kHz): under
-words that are softer than that, the music dips further, smoothly and only as far as
-needed. `mix.json` lists those words.
+words that are softer than that, the music dips further, slowly (40 dB/s in, 12 dB/s
+out), only as far as needed, and without recovering across pauses under half a second.
+`mix.json` lists those words.
 `--melody-layer` (on `mix` and `run`, sticky) adds the MIDI melody: `off` (the preset's
 default), `replay` (breakdowns and drops replay the line just heard) or `all` (also
 quietly under the speech).

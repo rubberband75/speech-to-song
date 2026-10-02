@@ -597,7 +597,8 @@ class MixReport(BaseModel):
     integrated_lufs: float
     true_peak_dbtp: float
     section_levels: list[SectionLevel] = []
-    silenced: list[str] = []  # silent sections (gaps), muted in the mix
+    lifted: list[str] = []  # silent sections (gaps), turned into lifts into the next section
+    ring_out_at_s: float | None = None  # where the last chord's reverb ring-out begins
     late_entries: list[dict[str, Any]] = []  # sections pulled onto their downbeat
     speech_margin_db: float | None = None
     guarded_words: list[dict[str, Any]] = []  # words that were less than the margin clear

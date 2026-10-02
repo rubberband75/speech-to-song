@@ -7,17 +7,17 @@ import pytest
 from speech2song.arrangement import ClipInfo, build_arrangement, default_parts
 from speech2song.audio.mixing import (
     ENERGY_RAMP_S,
-    GAP_CUT_S,
     TAIL_MAX_S,
     apply_entry_fix,
+    audible_end,
     bar_levels_db,
     energy_gains,
     gain_curve,
-    gap_mask,
-    gap_tail,
+    gap_lift,
     late_entries,
     melody_notes,
     place_clips,
+    ring_out,
     section_spans,
     speech_bus,
     speech_stem,
@@ -137,7 +137,7 @@ def test_energy_gains_fix_only_large_deviations() -> None:
     anchor = float(np.median([-17.5, -15.0, -34.0, -21.0, -13.7, -14.0]))
     assert targets[0] == pytest.approx(anchor + 1.5)
     assert gains[2] == 6.0  # 15 dB too quiet: capped
-    assert gains[3] == 0.0 and targets[3] is None  # silent: left to the gap mute
+    assert gains[3] == 0.0 and targets[3] is None  # silent: left to the lift
     assert gains[4] == pytest.approx((anchor + 10) - (-11.0) - 3)  # beyond the tolerance only
     assert gains[0] == 0.0 and gains[1] == 0.0  # close enough: untouched
     assert energy_gains(levels, energies, range_db=10, tolerance_db=3, max_db=0)[0] == [0.0] * 7
@@ -154,31 +154,78 @@ def test_gain_curve_ramps_into_each_section() -> None:
     assert np.all(np.diff(curve[2000 - ramp : 2001]) >= 0)  # a smooth climb to the downbeat
 
 
-def test_gaps_are_cut_and_come_back_on_the_downbeat() -> None:
-    sr = 1000
-    mask = gap_mask([(1000, 2000)], 3000, sr)
-    cut = round(GAP_CUT_S * sr)
-    assert mask[999] == 1.0 and mask[1000] == 1.0 and mask[1000 + cut] == 0.0
-    assert np.all(mask[1000 + cut : 1995] == 0.0)
-    assert mask[2000] == 1.0 and mask[1999] > 0  # back by the next section's first sample
-    assert np.all(mask[2000:] == 1.0)
+def _rms(block: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.square(block))))
 
 
-def test_gap_tail_rings_on_and_dies_away() -> None:
+def test_a_gap_lifts_into_the_next_section_and_is_never_silent() -> None:
     sr = SR
     rng = np.random.default_rng(1)
-    music = (0.3 * rng.standard_normal((2 * sr, 2))).astype(np.float32)
-    tail = gap_tail(music, sr, sr, sr, 0.5)
-    assert tail.shape == (sr, 2)
-    rms = [
-        float(np.sqrt(np.mean(np.square(tail[i : i + sr // 10])))) for i in range(0, sr, sr // 10)
-    ]
-    assert rms[0] > 0.01 and rms[-1] < rms[0] / 20  # rings on, then gone before the drop
-    assert np.abs(tail[-1]).max() < 1e-3
-    assert not gap_tail(music, sr, sr, sr, 0.0).any()
+    music = (0.1 * rng.standard_normal((6 * sr, 2))).astype(np.float32)
+    start, end = 3 * sr, 4 * sr
+    lifted = gap_lift(music, start, end, sr, swell=0.8, lift_db=3.0)
+    assert lifted.shape == (sr, 2) and lifted.dtype == np.float32
+    quarters = [_rms(lifted[i * sr // 4 : (i + 1) * sr // 4]) for i in range(4)]
+    assert quarters[0] > 0.05  # the build's tail runs on: no hole
+    assert quarters[3] > 1.4 * quarters[0]  # and rises into the downbeat
+    swell = lifted - gap_lift(music, start, end, sr, swell=0.0, lift_db=3.0)  # the swell alone
+    assert abs(swell[-1]).max() < 1e-3 < abs(swell[-sr // 10 : -sr // 100]).max()  # no click
+    plain = gap_lift(music, start, end, sr, swell=0.0, lift_db=0.0)
+    np.testing.assert_allclose(plain, music[start:end])  # no lift, no swell: as generated
 
 
-def test_shape_music_mutes_gaps_and_reports_levels() -> None:
+def test_a_gap_at_the_very_start_or_end_is_safe() -> None:
+    sr = 1000
+    music = np.ones((3000, 2), dtype=np.float32)
+    assert gap_lift(music, 0, 500, sr, swell=0.5, lift_db=3.0).shape == (500, 2)
+    assert gap_lift(music, 2800, 3500, sr, swell=0.5, lift_db=3.0).shape == (200, 2)
+
+
+def _fading_music(sr: int, seconds: float = 12.0, hold: float = 8.0) -> np.ndarray:
+    """A chord-like tone that holds for `hold` s, then fades out quickly (-30 dB a second)."""
+    t = np.arange(round(seconds * sr)) / sr
+    tone = sum(np.sin(2 * np.pi * f * t) for f in (220.0, 277.2, 329.6))
+    fade = np.where(t < hold, 1.0, 10 ** (-(t - hold) * 30 / 20))
+    return (0.1 * tone * fade)[:, None].repeat(2, axis=1).astype(np.float32)
+
+
+def test_audible_end_is_where_the_music_stops_being_loud_enough() -> None:
+    sr = 8000
+    music = _fading_music(sr)
+    end = audible_end(music, sr, 4 * sr, within_db=12.0)
+    assert end is not None and 8 * sr < end < 9 * sr  # about 12 dB into the fade
+    assert audible_end(np.zeros((sr, 2), dtype=np.float32), sr, 0, 12.0) is None
+    assert audible_end(music, sr, len(music), 12.0) is None  # nothing to look at
+
+
+def test_the_last_chord_rings_out_instead_of_stopping() -> None:
+    sr = 8000
+    music = _fading_music(sr)
+    out, at = ring_out(music, sr, 4 * sr, 6.0)
+    assert at == audible_end(music, sr, 4 * sr, 12.0)
+    assert len(out) >= at + 6 * sr and out.shape[1] == 2
+    np.testing.assert_array_equal(out[: at - 1], music[: at - 1])  # untouched up to there
+    plain = _rms(music[at : at + sr])  # the generated fade, a second after the stop point
+    ring = [_rms(out[at + i * sr : at + (i + 1) * sr]) for i in range(6)]
+    assert ring[1] > 2 * plain  # it rings on where the generated music has died away
+    assert ring[0] > ring[2] > ring[4] > ring[5]  # and dies away
+    assert ring[0] < 1.2 * _rms(music[at - 2 * sr : at]) and ring[-1] < ring[0] / 4
+    assert abs(out[at + 6 * sr - 1]).max() < 1e-3  # ends at silence, never a cut
+    same, where = ring_out(music, sr, 4 * sr, 0.0)  # off
+    assert same is music and where == len(music)
+    silent = np.zeros_like(music)
+    assert ring_out(silent, sr, 0, 6.0)[1] == len(silent)
+
+
+def test_a_ring_out_that_runs_past_the_end_extends_the_music() -> None:
+    sr = 8000
+    music = _fading_music(sr, seconds=9.0, hold=99.0)  # still at full level at the end
+    out, at = ring_out(music, sr, 0, 4.0)
+    assert at == len(music) and len(out) == len(music) + 4 * sr
+    assert _rms(out[len(music) : len(music) + sr]) > 0.01
+
+
+def test_shape_music_lifts_gaps_and_reports_levels() -> None:
     from speech2song.stages.mix import shape_music
 
     arrangement, _, _ = _setup()
@@ -187,14 +234,15 @@ def test_shape_music_mutes_gaps_and_reports_levels() -> None:
     frames = spans[-1][2] + sr
     rng = np.random.default_rng(2)
     music = (0.1 * rng.standard_normal((frames, 2))).astype(np.float32)  # evenly loud
-    shaped, levels, silenced, fixes = shape_music(music, arrangement, PRESET.mix, sr)
+    shaped, levels, lifted, fixes = shape_music(music, arrangement, PRESET.mix, sr)
     assert fixes == []  # evenly loud: nothing comes in late
     gaps = [(a, b) for s, a, b in spans if s.silent]
-    assert silenced == [s.id for s, _, _ in spans if s.silent] and gaps
+    assert lifted == [s.id for s, _, _ in spans if s.silent] and gaps
     start, end = gaps[0]
-    music_rms = float(np.sqrt(np.mean(np.square(music[start:end]))))
-    gap_rms = float(np.sqrt(np.mean(np.square(shaped[start + end >> 1 : end]))))
-    assert gap_rms < music_rms / 10  # only a dying reverb tail is left
+    first, last = (_rms(shaped[a:b]) for a, b in ((start, start + (end - start) // 4),
+                                                  (end - (end - start) // 4, end)))  # fmt: skip
+    assert first > 0.5 * _rms(music[start:end])  # not muted: the build runs on...
+    assert last > 1.3 * first  # ...and swells into the drop
     by_role = {lv.role: lv for lv in levels}
     assert by_role["drop"].gain_db > 3 and by_role["speech_bed"].gain_db <= 0  # contrast
     assert by_role["gap"].lufs is None and by_role["gap"].gain_db == 0.0

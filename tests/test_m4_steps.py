@@ -76,7 +76,8 @@ def test_arrange_generate_mix(cli: Cli, talk: Talk, install: Callable, short_son
     assert report.melody_layer == "off"  # the preset's default: no MIDI in the song
     assert not run.path("07_mix/stems/melody_layer.wav").exists()
     gaps = [s.id for s in arrangement.sections if s.silent]
-    assert gaps and report.silenced == gaps
+    assert gaps and report.lifted == gaps  # lifted into the drop, not muted
+    assert report.ring_out_at_s is not None  # the last chord rings out
     assert report.speech_margin_db == 10.0  # every word stays this far over the music
     assert all(w["margin_db"] < 10 for w in report.guarded_words)
     assert [level.section_id for level in report.section_levels] == [

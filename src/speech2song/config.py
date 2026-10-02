@@ -73,8 +73,8 @@ class SectionRole(_Strict):
     bars: int | None = Field(default=None, ge=1, le=64)
     # Energy over the section: steady, rising into the next section, or fading out.
     shape: Literal["flat", "rise", "fall"] = "flat"
-    # The mix silences the music here (a gap before a drop). Nothing is generated for
-    # it: the music of the section before runs on underneath and is muted locally.
+    # A short lift before a drop (the gap). Nothing is generated for it: the music of the
+    # section before runs on, and the mix adds a swell of that music's tail on top.
     silent: bool = False
 
 
@@ -90,8 +90,11 @@ class SpeechInteraction(_Strict):
 
 class MixSpec(_Strict):
     sidechain_duck_db: float = Field(default=-9.0, le=0)
-    duck_attack_ms: float = Field(default=30.0, gt=0)
-    duck_release_ms: float = Field(default=400.0, gt=0)
+    # The music ducks per quote (a clip, first word to last word), not per word: it eases
+    # down `duck_lead_s` before the first word, stays down through the pauses, and comes
+    # back over `duck_release_s` after the last word.
+    duck_lead_s: float = Field(default=0.6, ge=0)
+    duck_release_s: float = Field(default=1.5, ge=0)
     speech_highpass_hz: float = Field(default=90.0, ge=0)
     speech_reverb_send: float = Field(default=0.12, ge=0, le=1)
     speech_delay_send: float = Field(default=0.06, ge=0, le=1)
@@ -106,7 +109,14 @@ class MixSpec(_Strict):
     energy_range_db: float = Field(default=10.0, ge=0)
     energy_tolerance_db: float = Field(default=3.0, ge=0)
     energy_max_db: float = Field(default=6.0, ge=0)
-    gap_reverb: float = Field(default=0.5, ge=0, le=1)  # reverb tail level in silent sections
+    # A gap (silent section) is a lift into the next one: its music rises by `gap_lift_db`
+    # and a reverse swell of the build's tail (at `gap_swell` of that music's level) peaks
+    # on the downbeat. `gap_swell` 0 and `gap_lift_db` 0 leave the gap as generated.
+    gap_swell: float = Field(default=0.8, ge=0, le=1)
+    gap_lift_db: float = Field(default=3.0, ge=0)
+    # The last chord rings out: the final audible music goes through a reverb that dies
+    # away over this long (0 = the music ends as generated).
+    ring_out_s: float = Field(default=6.0, ge=0)
     # A section after a gap whose first 1-N bars are near-silent (a generated drop that
     # opens with a silent bar and a riser) is pulled onto its downbeat (0 turns this off).
     late_entry_max_bars: int = Field(default=4, ge=0, le=8)

@@ -7,8 +7,9 @@ speech bus, which only the mix hears. Each clip's sends are rendered on their ow
 faded out before the next clip starts, so tails never run into the next line.
 
 The music is shaped toward the arrangement: sections whose level strays far from their
-energy are pulled back toward it, and silent sections (gaps) are cut, leaving only a
-reverb tail of the music before them.
+energy are pulled back toward it, and gaps (the silent sections, with no music of their
+own) become a lift into the next section: the build's tail rising, with a reverse swell
+of it. The last chord rings out through a long reverb instead of stopping.
 """
 
 import math
@@ -87,6 +88,7 @@ WORD_TAIL_S = 0.15  # ASR word ends come early: speech and room tone ring on aft
 @dataclass(frozen=True)
 class WordSpan:
     clip_id: str
+    section_id: str
     word: str
     start: int  # mix samples
     end: int
@@ -105,9 +107,23 @@ def word_spans(
             if clip.start_s <= (word.start + word.end) / 2 < clip.end_s:
                 start = p.start_sample + round((word.start - clip.start_s) * sr)
                 end = p.start_sample + round((word.end + WORD_TAIL_S - clip.start_s) * sr)
-                spans.append(WordSpan(p.clip_id, word.w, max(start, p.start_sample),
+                spans.append(WordSpan(p.clip_id, p.section_id, word.w, max(start, p.start_sample),
                                       min(end, p.end_sample)))  # fmt: skip
     return spans
+
+
+def quote_regions(placed: Sequence[PlacedClip], words: Sequence[WordSpan]) -> list[tuple[int, int]]:
+    """Where the music ducks: for each placed clip, from its first word's start to its
+    last word's end, so the duck holds through the quote's pauses. A clip without words
+    in the transcript ducks for its whole length."""
+    regions = []
+    for p in placed:
+        mine = [w for w in words if w.section_id == p.section_id]
+        if mine:
+            regions.append((min(w.start for w in mine), max(w.end for w in mine)))
+        else:
+            regions.append((p.start_sample, p.end_sample))
+    return regions
 
 
 def highpass(audio: np.ndarray, sr: int, hz: float) -> np.ndarray:
@@ -209,10 +225,17 @@ def delay_seconds(bpm: float) -> float:
 # --- Music shaping ----------------------------------------------------------------------------
 
 ENERGY_RAMP_S = 0.5  # gain changes finish where the next section starts
-GAP_CUT_S = 0.02  # the fade into a silent section
-GAP_RETURN_S = 0.005  # the fade back in, ending where the next section starts
-GAP_SOURCE_S = 1.0  # how much music before a gap feeds its reverb tail
+GAP_SOURCE_S = 1.0  # how much of the build's tail feeds a gap's swell
 GAP_ROOM = 0.9
+GAP_LEAD_S = 0.05  # the swell's source fades in over this long
+GAP_END_FADE_S = 0.005  # the swell's last samples fade out, so it never clicks
+RING_SOURCE_S = 1.5  # how much of the last audible music feeds the ring-out
+RING_ROOM = 1.0  # the longest reverb: about -8 dB per second after the first second
+RING_ROOM_DAMPING = 0.1
+RING_HOLD = 0.4  # the ring keeps its natural decay for this fraction of its length, then tapers
+RING_WINDOW_S = 0.25  # level frames for finding where the music stops being audible
+RING_WITHIN_DB = 12.0  # "audible": within this of the last section's loudest frame
+RING_HANDOVER_S = 0.4  # the generated music fades out under the ring over this long
 
 
 LATE_ENTRY_DB = 15.0  # a section after a gap that opens this far below its median bar...
@@ -352,43 +375,107 @@ def gain_curve(
     return curve
 
 
-def gap_mask(gaps: Sequence[tuple[int, int]], frames: int, sr: int) -> np.ndarray:
-    """1, except 0 inside each gap: a GAP_CUT_S fade at its start, and a GAP_RETURN_S
-    fade back that ends where the next section begins."""
-    mask = np.ones(frames, dtype=np.float32)
-    for start, end in gaps:
-        end = min(end, frames)
-        if end <= start:
-            continue
-        mask[start:end] = 0.0
-        cut = min(round(GAP_CUT_S * sr), end - start)
-        mask[start : start + cut] = np.linspace(1, 0, cut, endpoint=False)
-        back = min(round(GAP_RETURN_S * sr), end - start - cut)
-        if back > 0:
-            mask[end - back : end] = np.linspace(0, 1, back, endpoint=False)
-    return mask
+def _rms(block: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.square(block)))) if len(block) else 0.0
 
 
-def gap_tail(music: np.ndarray, start: int, length: int, sr: int, level: float) -> np.ndarray:
-    """What a reverb would ring on with after the music stops at `start`: `length`
-    samples (stereo), fading in over the cut and out to silence by the end."""
-    out = np.zeros((length, 2), dtype=np.float32)
-    source = min(start, round(GAP_SOURCE_S * sr))
-    if level <= 0 or length <= 0 or source <= 0:
+def reverb_wash(
+    music: np.ndarray, start: int, length: int, sr: int, *, source_s: float, room: float,
+    damping: float = 0.4,
+) -> np.ndarray:  # fmt: skip
+    """What a reverb rings on with after `music` stops at `start`: `length` samples
+    (stereo) of the room's response to the `source_s` of music before `start`, at the
+    level the room returns it (not rescaled)."""
+    out = np.zeros((max(length, 0), 2), dtype=np.float32)
+    source = min(start, round(source_s * sr))
+    if length <= 0 or source <= 0:
         return out
     import pedalboard
 
     feed = stereo(music[start - source : start]).astype(np.float32)
-    lead = min(source, round(0.05 * sr))
+    lead = min(source, round(GAP_LEAD_S * sr))
     feed[:lead] *= np.linspace(0, 1, lead, dtype=np.float32)[:, None]
     padded = np.concatenate([feed, np.zeros((length, 2), dtype=np.float32)])
-    room = pedalboard.Reverb(room_size=GAP_ROOM, damping=0.4, wet_level=1.0, dry_level=0.0,
-                             width=1.0)  # fmt: skip
-    wet = room(padded.T, sr).T[source:]
-    envelope = np.square(np.linspace(1, 0, length, dtype=np.float32))
-    cut = min(length, round(GAP_CUT_S * sr))
-    envelope[:cut] *= np.linspace(0, 1, cut, dtype=np.float32)
-    return (wet * envelope[:, None] * np.float32(level)).astype(np.float32)
+    reverb = pedalboard.Reverb(room_size=room, damping=damping, wet_level=1.0, dry_level=0.0,
+                               width=1.0)  # fmt: skip
+    return reverb(padded.T, sr).T[source:].astype(np.float32)
+
+
+def gap_lift(
+    music: np.ndarray, start: int, end: int, sr: int, *, swell: float, lift_db: float
+) -> np.ndarray:
+    """The music for a gap, `start` to `end`, as a lift into the next section. What the
+    take has there (the build running on) rises by `lift_db` over the gap, and a reverse
+    swell of the build's tail, at `swell` times that tail's level, grows to its peak on
+    the downbeat. Returns the whole replacement block (stereo)."""
+    end = min(end, len(music))
+    block = stereo(music[start:end]).astype(np.float32)
+    length = len(block)
+    if length == 0:
+        return block
+    t = np.linspace(0, 1, length, dtype=np.float32)
+    rise = 0.5 - 0.5 * np.cos(np.pi * t)
+    block *= np.float32(10 ** (lift_db / 20)) ** rise[:, None]
+    source = min(start, round(GAP_SOURCE_S * sr))
+    if swell <= 0 or source <= 0:
+        return block
+    wash = reverb_wash(music, start, length, sr, source_s=GAP_SOURCE_S, room=GAP_ROOM)
+    near = _rms(wash[: round(0.25 * sr)])
+    if near <= 0:
+        return block
+    level = _rms(stereo(music[start - source : start])) / near * swell
+    envelope = np.sin(0.5 * np.pi * t) ** 2  # grows to the downbeat
+    fade = min(length, round(GAP_END_FADE_S * sr))
+    if fade:
+        envelope[length - fade :] *= np.linspace(1, 0, fade, dtype=np.float32)
+    return block + wash[::-1] * (envelope * np.float32(level))[:, None]
+
+
+def audible_end(music: np.ndarray, sr: int, start: int, within_db: float) -> int | None:
+    """The sample where the music, from `start` on, last is within `within_db` of its
+    loudest 250 ms frame (the end of the frame); None when it is silent."""
+    window = max(1, round(RING_WINDOW_S * sr))
+    count = (len(music) - start) // window
+    if count <= 0:
+        return None
+    frames = music[start : start + count * window].reshape(count, window, -1)
+    levels = 10 * np.log10(np.mean(np.square(frames), axis=(1, 2)) + 1e-12)
+    loud = np.flatnonzero(levels >= levels.max() - within_db)
+    if levels.max() < -80:
+        return None
+    return start + int(loud[-1] + 1) * window
+
+
+def ring_out(music: np.ndarray, sr: int, start: int, seconds: float) -> tuple[np.ndarray, int]:
+    """The last chord rings out. The music after the point where it stops being audible
+    (see `audible_end`, searched from `start`, the last section's first sample) fades
+    out over RING_HANDOVER_S, and the last RING_SOURCE_S before that point go through a
+    long reverb at the same level, which dies away over `seconds`. Returns the music
+    (longer, when the ring runs past its end) and the sample where the ring begins; the
+    music is returned unchanged, with the end of the music, when `seconds` is 0 or it is
+    silent."""
+    stop = audible_end(music, sr, start, RING_WITHIN_DB) if seconds > 0 else None
+    if stop is None:
+        return music, len(music)
+    length = round(seconds * sr)
+    wash = reverb_wash(music, stop, length, sr, source_s=RING_SOURCE_S, room=RING_ROOM,
+                       damping=RING_ROOM_DAMPING)  # fmt: skip
+    near = _rms(wash[: round(0.5 * sr)])
+    heard = _rms(stereo(music[max(0, stop - round(RING_SOURCE_S * sr)) : stop]))
+    if near <= 0 or heard <= 0:
+        return music, len(music)
+    t = np.linspace(0, 1, length, dtype=np.float32)
+    taper = np.clip((t - RING_HOLD) / (1 - RING_HOLD), 0, 1)
+    envelope = (0.5 + 0.5 * np.cos(np.pi * taper)) * np.minimum(1, t * seconds / 0.05)
+    out = np.zeros((max(len(music), stop + length), 2), dtype=np.float32)
+    out[: len(music)] = music
+    hand = min(len(music) - stop, round(RING_HANDOVER_S * sr))
+    fade = np.zeros(len(out) - stop, dtype=np.float32)
+    fade[:hand] = 0.5 + 0.5 * np.cos(np.pi * np.arange(hand) / max(hand, 1))
+    out[stop:] *= fade[:, None]
+    ring = wash * (envelope * np.float32(heard / near))[:, None]
+    out[stop : stop + length] += ring
+    return out, stop
 
 
 # --- Melody layer ------------------------------------------------------------------------------

@@ -1,12 +1,9 @@
 """Cut-point search and edge fades; ducking, loudness, true peak and limiting."""
 
-import math
-
 import numpy as np
 import pytest
 
 from speech2song.audio.dsp import (
-    duck_gain,
     fade_edges,
     frame_levels_db,
     limit,
@@ -14,7 +11,7 @@ from speech2song.audio.dsp import (
     master,
     oversampled_peaks,
     quietest_point,
-    smooth_gain_db,
+    quote_duck,
     true_peak_db,
 )
 
@@ -92,40 +89,30 @@ def test_zero_fade_and_short_blocks() -> None:
 # --- Ducking -----------------------------------------------------------------------------
 
 
-def test_gain_smoothing_uses_attack_down_and_release_up() -> None:
-    hop = 0.001
-    target = np.concatenate([np.full(1000, -10.0), np.zeros(3000)])
-    out = smooth_gain_db(target, hop, attack_ms=30, release_ms=400)
-    assert out[29] == pytest.approx(-10 * (1 - math.exp(-1)), abs=0.2)  # one time constant
-    assert out[999] == pytest.approx(-10, abs=0.01)
-    assert out[1000 + 399] == pytest.approx(-10 * math.exp(-1), abs=0.2)  # one release
-    assert out[-1] > -0.1
-
-
-def _speech_burst(start_s: float, seconds: float, total_s: float) -> np.ndarray:
-    out = np.zeros(round(total_s * SR), dtype=np.float32)
-    a = round(start_s * SR)
-    out[a : a + round(seconds * SR)] = noise_burst(seconds, amp=0.1)
-    return out
-
-
-def test_ducking_depth_lookahead_and_recovery() -> None:
-    speech = _speech_burst(1.0, 1.0, 4.5)
-    gain = duck_gain(speech, SR, len(speech), depth_db=-9, attack_ms=30, release_ms=400,
-                     floor_db=-50, full_db=-35)  # fmt: skip
+def test_a_quote_ducks_once_easing_down_before_and_up_after() -> None:
+    sr = 1000
+    gain = quote_duck([(3000, 5000)], 10000, sr, depth_db=-9, lead_s=0.6, release_s=1.5)
     db = 20 * np.log10(gain)
-    assert db[round(0.5 * SR)] == pytest.approx(0, abs=0.01)  # before the speech
-    assert db[round(1.0 * SR)] < -5  # look-ahead: already ducking at the first sample
-    assert db[round(1.5 * SR)] == pytest.approx(-9, abs=0.1)  # full depth during speech
-    assert -9 < db[round(2.3 * SR)] < -1  # releasing
-    assert db[-1] > -0.2  # recovered
+    assert db[2399] > -0.01  # nothing yet, 0.6 s before the first word
+    assert db[2700] == pytest.approx(-4.5, abs=0.3)  # half-way down at the middle of the ramp
+    assert db[3000] < -8.9 and db[4999] == pytest.approx(-9, abs=0.01)  # down for the quote
+    assert db[5750] == pytest.approx(-4.5, abs=0.3)  # half-way back up
+    assert db[6500] > -0.05 and db[-1] == 0  # recovered 1.5 s after the last word
+    assert np.all(np.diff(db[2400:3000]) <= 1e-6) and np.all(np.diff(db[5000:6500]) >= -1e-6)
 
 
-def test_quiet_speech_below_the_floor_does_not_duck() -> None:
-    speech = _speech_burst(0.5, 1.0, 2.0) * np.float32(0.0005)  # about -75 dBFS
-    gain = duck_gain(speech, SR, len(speech), depth_db=-9, attack_ms=30, release_ms=400,
-                     floor_db=-50, full_db=-35)  # fmt: skip
-    assert gain.min() == pytest.approx(1.0)
+def test_overlapping_quotes_take_the_deeper_duck_and_edges_are_safe() -> None:
+    sr = 1000
+    gain = quote_duck([(0, 1000), (1500, 2500)], 3000, sr, depth_db=-9, lead_s=0.6,
+                      release_s=1.5)  # fmt: skip
+    db = 20 * np.log10(gain)
+    assert db[500] == pytest.approx(-9, abs=0.01)  # a quote at the very start
+    assert db[1250] < -6  # 500 ms of pause between the quotes: not back up
+    assert db.min() >= -9 - 1e-6  # never deeper than the depth
+    assert quote_duck([], 100, sr, depth_db=-9, lead_s=0.6, release_s=1.5).min() == 1.0
+    assert quote_duck([(50, 50)], 100, sr, depth_db=-9, lead_s=0.6, release_s=1.5).min() == 1.0
+    flat = quote_duck([(10, 90)], 100, sr, depth_db=-9, lead_s=0.0, release_s=0.0)
+    assert flat[9] == 1.0 and flat[50] == pytest.approx(10 ** (-9 / 20), rel=1e-4)
 
 
 # --- Loudness, true peak, limiting --------------------------------------------------------
@@ -213,6 +200,28 @@ def test_the_guard_keeps_every_word_clear_of_the_music() -> None:
     assert speech_guard(speech, music, sr, [], margin_db=10)[0].min() == 1.0
 
 
+def test_words_close_together_are_guarded_without_recovering_between_them() -> None:
+    from speech2song.audio.dsp import GUARD_GROUP_S, dips, speech_guard
+
+    sr = 16000
+    rng = np.random.default_rng(5)
+    music = (0.05 * rng.standard_normal((9 * sr, 2))).astype(np.float32)
+    speech = np.zeros_like(music)
+    words = [(sr, 3 * sr // 2), (7 * sr // 4, 9 * sr // 4),  # a phrase: 250 ms apart
+             (6 * sr, 13 * sr // 2)]  # a word on its own, far from it  # fmt: skip
+    for (a, b), amp in zip(words, (0.05, 0.063, 0.05), strict=True):  # 0, +2, 0 dB over the music
+        speech[a:b] = amp * rng.standard_normal((b - a, 2))
+    assert GUARD_GROUP_S > 0.25
+    gain, margins = speech_guard(speech, music, sr, words, margin_db=10)
+    assert margins[0] < margins[1] < 3
+    db = 20 * np.log10(gain)
+    pause = db[3 * sr // 2 + sr // 100 : 7 * sr // 4 - sr // 100]
+    assert pause.max() < margins[1] - 10 + 0.3  # held at the shallower dip, not recovering
+    found = dips(gain, sr)
+    assert len(found) == 2  # one dip for the phrase, one for the lone word
+    assert found[0][0] < 1.0 and found[0][1] > 2.25  # eased in ahead and out after the phrase
+
+
 def test_word_spans_follow_the_clips() -> None:
     from speech2song.audio.mixing import WORD_TAIL_S, word_spans
     from speech2song.models import Clip, PlacedClip, Word
@@ -224,8 +233,21 @@ def test_word_spans_follow_the_clips() -> None:
              Word(w="hello", start=10.5, end=11.0), Word(w="end", start=11.9, end=12.0),
              Word(w="If", start=11.97, end=12.4)]  # fmt: skip
     spans = word_spans(placed, {"c1": clip}, words, 100)
+    assert {s.section_id for s in spans} == {"s2"}
     assert [(s.word, s.start, s.end) for s in spans] == [
         ("early", 1000, 1000 + round((0.3 + WORD_TAIL_S) * 100)),  # starts inside the clip
         ("hello", 1050, 1000 + round((1.0 + WORD_TAIL_S) * 100)),
         ("end", 1190, 1200),  # kept inside the clip
     ]  # "If", the next sentence's first word, only grazes the clip's end cut  # fmt: skip
+
+
+def test_quote_regions_run_from_the_first_word_to_the_last() -> None:
+    from speech2song.audio.mixing import WordSpan, quote_regions
+    from speech2song.models import PlacedClip
+
+    placed = [PlacedClip(clip_id="c1", section_id="s2", file="x.wav", start_sample=1000,
+                         end_sample=2000, start_s=0.0),
+              PlacedClip(clip_id="c2", section_id="s5", file="y.wav", start_sample=5000,
+                         end_sample=6000, start_s=0.0)]  # fmt: skip
+    words = [WordSpan("c1", "s2", "a", 1100, 1300), WordSpan("c1", "s2", "b", 1500, 1800)]
+    assert quote_regions(placed, words) == [(1100, 1800), (5000, 6000)]  # c2: no words

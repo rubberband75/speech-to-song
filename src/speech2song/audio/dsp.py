@@ -4,6 +4,7 @@ and limiting (mix). Pure numpy/scipy; no file I/O."""
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import Literal
 
 import numpy as np
@@ -84,61 +85,35 @@ def fade_edges(block: np.ndarray, fade: int) -> np.ndarray:
 # --- Ducking ---------------------------------------------------------------------------------
 
 
-def speech_activity(
-    mono: np.ndarray, sr: int, *, hop_s: float, frame_s: float, floor_db: float, full_db: float
-) -> np.ndarray:
-    """How strongly speech is present every `hop_s` (0-1): the RMS level of a `frame_s`
-    window, mapped linearly from `floor_db` (0) to `full_db` (1)."""
-    hop = max(1, round(hop_s * sr))
-    centers = np.arange(0, len(mono), hop)
-    if len(centers) == 0:
-        return np.zeros(0)
-    levels = frame_levels_db(mono, centers, max(2, round(frame_s * sr)))
-    return np.clip((levels - floor_db) / (full_db - floor_db), 0.0, 1.0)
-
-
-def smooth_gain_db(target_db: np.ndarray, hop_s: float, attack_ms: float, release_ms: float):
-    """One-pole smoothing of a gain curve (dB): moves toward more reduction with the
-    attack time constant and recovers with the release one."""
-    attack = math.exp(-hop_s / max(attack_ms / 1000, 1e-9))
-    release = math.exp(-hop_s / max(release_ms / 1000, 1e-9))
-    out = np.empty(len(target_db))
-    gain = 0.0
-    for i, target in enumerate(target_db.tolist()):
-        coef = attack if target < gain else release
-        gain = coef * gain + (1 - coef) * target
-        out[i] = gain
-    return out
-
-
-def duck_gain(
-    speech: np.ndarray,
-    sr: int,
+def quote_duck(
+    regions: Sequence[tuple[int, int]],
     frames: int,
+    sr: int,
     *,
     depth_db: float,
-    attack_ms: float,
-    release_ms: float,
-    floor_db: float,
-    full_db: float,
-    hop_s: float = 0.002,
-    frame_s: float = 0.02,
+    lead_s: float,
+    release_s: float,
 ) -> np.ndarray:
-    """Per-sample linear gain for the music bus: down by up to `depth_db` (negative)
-    while `speech` (mono) is active. The curve is moved earlier by the attack time
-    (look-ahead), so the reduction is in place when the first syllable arrives."""
-    activity = speech_activity(speech, sr, hop_s=hop_s, frame_s=frame_s, floor_db=floor_db,
-                               full_db=full_db)  # fmt: skip
-    smoothed = smooth_gain_db(depth_db * activity, hop_s, attack_ms, release_ms)
-    shift = round(attack_ms / 1000 / hop_s)
-    if shift and len(smoothed):
-        smoothed = np.concatenate([smoothed[shift:], np.full(min(shift, len(smoothed)),
-                                                             smoothed[-1])])  # fmt: skip
-    hop = max(1, round(hop_s * sr))
-    if len(smoothed) == 0:
-        return np.ones(frames, dtype=np.float32)
-    times = np.arange(len(smoothed)) * hop
-    gain_db = np.interp(np.arange(frames), times, smoothed)
+    """Per-sample linear gain for the music bus, ducking once per quote instead of once
+    per word. Each region is a quote's first to last word (sample positions): the music
+    eases down to `depth_db` (negative) over the `lead_s` before it, stays down through
+    the quote's pauses, and eases back up over `release_s` after it. Both ramps are
+    raised cosines in dB; overlapping regions take the deeper of the two."""
+    gain_db = np.zeros(frames, dtype=np.float32)
+    lead, release = round(lead_s * sr), round(release_s * sr)
+    for start, end in regions:
+        start, end = max(0, start), min(frames, end)
+        if end <= start:
+            continue
+        a, b = max(0, start - lead), min(frames, end + release)
+        shape = np.ones(b - a, dtype=np.float32)
+        if start > a:  # eases down; a region at the very start only gets the end of the ramp
+            at = np.arange(a, start) - (start - lead)
+            shape[: start - a] = 0.5 - 0.5 * np.cos(np.pi * (at + 0.5) / lead)
+        if b > end:
+            at = np.arange(end, b)
+            shape[end - a :] = 0.5 + 0.5 * np.cos(np.pi * (at - end + 0.5) / release)
+        gain_db[a:b] = np.minimum(gain_db[a:b], depth_db * shape)
     return (10 ** (gain_db / 20)).astype(np.float32)
 
 
@@ -146,8 +121,9 @@ GUARD_BAND_HZ = (200.0, 5000.0)  # where music masks words
 GUARD_FRAME_S = 0.1  # speech level frames inside a word
 GUARD_CORE_DB = 10.0  # a word's level: the mean of its frames within this of its loudest
 GUARD_HOP_S = 0.01
-GUARD_ATTACK_DB_S = 150.0  # how fast the music dips, ahead of the word
-GUARD_RELEASE_DB_S = 30.0  # how fast it comes back after it
+GUARD_ATTACK_DB_S = 40.0  # how fast the music dips, ahead of the word
+GUARD_RELEASE_DB_S = 12.0  # how fast it comes back after it
+GUARD_GROUP_S = 0.5  # across a pause shorter than this the dip holds between two words
 
 
 def band_filter(audio: np.ndarray, sr: int) -> np.ndarray:
@@ -189,7 +165,9 @@ def speech_guard(
 ) -> tuple[np.ndarray, list[float]]:
     """Per-sample gain (at most 1) for the music, and each word's margin before it:
     under every word (sample spans in `words`), the music in the speech band stays at
-    least `margin_db` under the word's level. The dip is rate-limited, so it starts
+    least `margin_db` under the word's level. Across a pause shorter than GUARD_GROUP_S
+    the dip holds at the shallower of the two neighbours' dips, so a phrase gets one
+    smooth dip, not one pumping per word. The dip is rate-limited (slowly), so it starts
     ahead of the word and recovers after it."""
     frames = len(music)
     hop = max(1, round(GUARD_HOP_S * sr))
@@ -199,13 +177,21 @@ def speech_guard(
         return np.ones(frames, dtype=np.float32), []
     spoken, heard = band_filter(speech, sr), band_filter(music, sr)
     margins = []
+    spans = []
     for start, end in words:
         end = max(end, start + 1)
         under = channel_levels_db(heard, np.array([(start + end) // 2]), end - start)[0]
         margin = word_level_db(spoken, start, end, sr) - under
         margins.append(float(margin))
+        spans.append((start, end, min(0.0, margin - margin_db)))
+    ordered = sorted(spans)
+    for start, end, dip in ordered:
         a, b = np.searchsorted(centers, [start, end])
-        gain[a:b] = np.minimum(gain[a:b], min(0.0, margin - margin_db))
+        gain[a:b] = np.minimum(gain[a:b], dip)
+    for (_, end, dip), (start, _, next_dip) in pairwise(ordered):
+        if 0 < start - end < GUARD_GROUP_S * sr:  # a short pause: no recovery between words
+            a, b = np.searchsorted(centers, [end, start])
+            gain[a:b] = np.minimum(gain[a:b], max(dip, next_dip))
     attack, release = GUARD_ATTACK_DB_S * GUARD_HOP_S, GUARD_RELEASE_DB_S * GUARD_HOP_S
     values = gain.tolist()
     for i in range(len(values) - 2, -1, -1):  # dip ahead of the word

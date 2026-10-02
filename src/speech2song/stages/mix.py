@@ -3,9 +3,10 @@
 The speech stem holds the clips verbatim (sample-exact apart from their edge fades). The
 mix hears the speech bus instead: the clips set to the music's loudness plus
 `speech_level_lu`, high-passed, gently compressed, with reverb and delay sends. The music
-is first shaped toward the arrangement's energy, with its silent sections (gaps) cut to
-a reverb tail. The music and melody layer are ducked under the speech. The master is
-normalized to the preset's loudness with true peaks at or below -1 dBTP.
+is first shaped toward the arrangement's energy, its gaps become lifts into the next
+section, and its last chord rings out. The music and melody layer duck once per quote,
+and a guard keeps every word clear of them. The master is normalized to the preset's
+loudness with true peaks at or below -1 dBTP.
 """
 
 import subprocess
@@ -19,9 +20,9 @@ from speech2song.arrangement import energy_bounds
 from speech2song.audio.dsp import (
     db_to_gain,
     dips,
-    duck_gain,
     loudness_lufs,
     master,
+    quote_duck,
     speech_guard,
 )
 from speech2song.audio.io import require_tool
@@ -33,11 +34,12 @@ from speech2song.audio.mixing import (
     delay_seconds,
     energy_gains,
     gain_curve,
-    gap_mask,
-    gap_tail,
+    gap_lift,
     late_entries,
     melody_notes,
     place_clips,
+    quote_regions,
+    ring_out,
     section_spans,
     speech_bus,
     speech_stem,
@@ -70,11 +72,11 @@ MASTER_WAV = "07_mix/master.wav"
 MASTER_MP3 = "07_mix/master.mp3"
 MIX_REPORT = "07_mix/mix.json"
 CEILING_DBTP = -1.0
-DUCK_FLOOR_LU = -30.0  # speech this far below its loudness doesn't duck the music
-DUCK_FULL_LU = -15.0  # from here up the music is fully ducked
 MP3_BITRATE = "320k"
 FALLBACK_MUSIC_LUFS = -20.0  # when the music is silent (nothing to measure)
 RENDER_TAIL_S = 1.5
+END_MARGIN_S = 0.5  # the file ends this long after the ring-out has died away
+SPEECH_TAIL_KEEP_S = 3.0  # and at least this long after the last line
 
 MelodyLayer = Literal["replay", "all", "off"]
 
@@ -114,8 +116,8 @@ def shape_music(
     music: np.ndarray, arrangement: Arrangement, spec: MixSpec, sr: int
 ) -> tuple[np.ndarray, list[SectionLevel], list[str], list[EntryFix]]:
     """The music pulled toward the arrangement's energy, with late entries after gaps
-    moved onto their downbeat and gaps cut to a reverb tail. Returns it, each section's
-    levels and gain, the silenced section IDs, and the entry fixes."""
+    moved onto their downbeat and each gap turned into a lift. Returns it, each section's
+    levels and gain, the IDs of the lifted gaps, and the entry fixes."""
     fixes = late_entries(music, arrangement, sr, spec.late_entry_max_bars)
     for fix in fixes:
         music = apply_entry_fix(music, fix, sr)
@@ -131,11 +133,12 @@ def shape_music(
             gains[i] = gains[i - 1]
     frames = len(music)
     curve = gain_curve([(a, b) for _, a, b in spans], gains, frames, sr)
+    shaped = music * curve[:, None]
     gaps = [(start, end) for section, start, end in spans if section.silent]
-    shaped = music * (curve * gap_mask(gaps, frames, sr))[:, None]
-    for start, end in gaps:
-        shaped[start:end] += gap_tail(shaped, start, min(end, frames) - start, sr,
-                                      spec.gap_reverb)  # fmt: skip
+    for start, end in gaps:  # a lift into the next section, from the build's tail
+        end = min(end, frames)
+        shaped[start:end] = gap_lift(shaped, start, end, sr, swell=spec.gap_swell,
+                                     lift_db=spec.gap_lift_db)  # fmt: skip
     report = [
         SectionLevel(section_id=section.id, role=section.role, energy=round(energy, 3),
                      lufs=None if level is None else round(level, 2),
@@ -144,8 +147,8 @@ def shape_music(
         for (section, _, _), energy, level, target, gain
         in zip(spans, energies, levels, targets, gains, strict=True)
     ]  # fmt: skip
-    silenced = [s.id for s, _, _ in spans if s.silent]
-    return shaped.astype(np.float32), report, silenced, fixes
+    lifted = [s.id for s, _, _ in spans if s.silent]
+    return shaped.astype(np.float32), report, lifted, fixes
 
 
 def write_mp3(wav: Path, mp3: Path) -> None:
@@ -169,8 +172,9 @@ def _db(value: float | None) -> str:
 
 class MixStage(Stage):
     name: ClassVar[str] = "mix"
-    # 2: energy shaping, gaps; 3: late entries; 4: speech guard; 5: guard words by midpoint
-    version: ClassVar[int] = 5
+    # 2: energy shaping, gaps; 3: late entries; 4: speech guard; 5: guard words by midpoint;
+    # 6 (M6): gaps lift instead of muting, a duck per quote, a gentler guard, a ring-out
+    version: ClassVar[int] = 6
 
     def plan(self, ctx: Context) -> StagePlan:
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
@@ -226,9 +230,17 @@ class MixStage(Stage):
             audio[clip_id] = block
         placed = place_clips(arrangement, {k: c.file for k, c in clips.items()},
                              {k: len(a) for k, a in audio.items()}, sr)  # fmt: skip
-        dry = speech_stem(placed, audio, frames, clip_set.channels)
         warnings: list[str] = []
-        music, levels, silenced, fixes = shape_music(music, arrangement, spec, sr)
+        music, levels, lifted, fixes = shape_music(music, arrangement, spec, sr)
+        last_section_start = section_spans(arrangement, sr)[-1][1]
+        music, ring_at = ring_out(music, sr, last_section_start, spec.ring_out_s)
+        if ring_at < len(music):  # the song ends where the ring dies away, not 4 s of silence later
+            keep = ring_at + round((spec.ring_out_s + END_MARGIN_S) * sr)
+            if placed:  # but never before the last line's own tail
+                keep = max(keep, placed[-1].end_sample + round(SPEECH_TAIL_KEEP_S * sr))
+            music = music[:keep]
+        frames = len(music)  # the ring-out may also run past the song's end
+        dry = speech_stem(placed, audio, frames, clip_set.channels)
 
         # Levels: speech sits speech_level_lu above the music's loudness.
         music_lufs = loudness_lufs(music, sr)
@@ -249,12 +261,12 @@ class MixStage(Stage):
             bus = type(bus)(bus.dry * makeup, bus.wet * makeup)
             gain_db += speech_target - processed
 
-        # Ducking, from the dry speech at its mix level.
-        mono = dry.mean(axis=1) * np.float32(db_to_gain(gain_db))
-        duck = duck_gain(mono, sr, frames, depth_db=spec.sidechain_duck_db,
-                         attack_ms=spec.duck_attack_ms, release_ms=spec.duck_release_ms,
-                         floor_db=speech_target + DUCK_FLOOR_LU,
-                         full_db=speech_target + DUCK_FULL_LU)[:, None]  # fmt: skip
+        # The music and melody layer duck once per quote, from its first word to its last.
+        transcript = Transcript.model_validate_json(plan.inputs["transcript"].read_text())
+        words = word_spans(placed, clips, transcript.words, sr)
+        duck = quote_duck(quote_regions(placed, words), frames, sr,
+                          depth_db=spec.sidechain_duck_db, lead_s=spec.duck_lead_s,
+                          release_s=spec.duck_release_s)[:, None]  # fmt: skip
 
         layer = np.zeros((frames, 2), dtype=np.float32)
         melody_gain_db = None
@@ -276,8 +288,6 @@ class MixStage(Stage):
         music_bus = music * duck
         layer_bus = layer * duck
         # The guard: under every word, the music stays speech_margin_db below it.
-        transcript = Transcript.model_validate_json(plan.inputs["transcript"].read_text())
-        words = word_spans(placed, clips, transcript.words, sr)
         guard, margins = speech_guard(bus.dry, music_bus + layer_bus, sr,
                                       [(w.start, w.end) for w in words],
                                       margin_db=spec.speech_margin_db)  # fmt: skip
@@ -318,7 +328,8 @@ class MixStage(Stage):
             target_lufs=spec.target_lufs, master_gain_db=round(mastered.gain_db, 3),
             integrated_lufs=round(mastered.lufs, 3),
             true_peak_dbtp=round(mastered.true_peak_db, 3), section_levels=levels,
-            silenced=silenced, warnings=warnings,
+            lifted=lifted, ring_out_at_s=round(ring_at / sr, 3) if ring_at < frames else None,
+            warnings=warnings,
             late_entries=[{"section_id": f.section_id, "bars": f.bars, "mode": f.mode}
                           for f in fixes],
             speech_margin_db=spec.speech_margin_db, guarded_words=guarded,
@@ -336,7 +347,10 @@ class MixStage(Stage):
             ctx.say(f"  {fix.section_id} came in {fix.bars} bar(s) late after the gap: "
                     f"{how}")  # fmt: skip
         ctx.say(f"  music shaped toward the arrangement: {', '.join(changed) or 'no changes'}"
-                + (f"; silenced {', '.join(silenced)}" if silenced else ""))  # fmt: skip
+                + (f"; lifts into {', '.join(lifted)}" if lifted else ""))  # fmt: skip
+        if ring_at < frames:
+            ctx.say(f"  the last chord rings out from {ring_at / sr:.1f} s, "
+                    f"over {spec.ring_out_s:g} s")  # fmt: skip
         if guarded:
             worst = min(guarded, key=lambda w: w["margin_db"])
             ctx.say(f"  speech guard: {len(guarded)} of {len(words)} words were less than "
