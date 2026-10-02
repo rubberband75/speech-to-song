@@ -1,0 +1,313 @@
+{
+  "grid_ms": [
+    16000,
+    8000,
+    18000,
+    32000,
+    16000,
+    10000,
+    18000,
+    32000,
+    6000,
+    16000
+  ],
+  "plan": {
+    "chunks": [
+      {
+        "text": "[Intro]",
+        "duration_ms": 16000,
+        "positive_styles": [
+          "120 BPM",
+          "A minor",
+          "half-time feel",
+          "instrumental only",
+          "cinematic psychedelic electronic",
+          "melodic future bass",
+          "midtempo bass",
+          "ambient electronica",
+          "warm sub-bass with rounded, elastic wobbling bass synth",
+          "punchy half-time electronic drums, wide snare, trap-influenced hats",
+          "lush wide synth chords, bright euphoric leads",
+          "granular textures, reversed sounds, pitch bends, ear candy",
+          "instrumental arrangement with large negative space in the quiet sections",
+          "bittersweet, awe-filled, polished, spacious, immersive",
+          "spacious ambient pads",
+          "soft granular textures",
+          "distant reversed sounds",
+          "filtered noise",
+          "sparse piano or bell fragments"
+        ],
+        "negative_styles": [
+          "aggressive dubstep growls",
+          "riddim",
+          "harsh or metallic bass",
+          "busy arpeggios or leads during narration",
+          "sung vocals or lyrics",
+          "vocals",
+          "singing",
+          "lyrics",
+          "voiceover",
+          "spoken word",
+          "rap"
+        ],
+        "context_adherence": "high"
+      },
+      {
+        "text": "[Ambient Bed]",
+        "duration_ms": 8000,
+        "positive_styles": [
+          "120 BPM",
+          "A minor",
+          "half-time feel",
+          "instrumental only",
+          "very sparse",
+          "soft evolving pad",
+          "lots of negative space",
+          "no drums or minimal filtered percussion"
+        ],
+        "negative_styles": [
+          "aggressive dubstep growls",
+          "riddim",
+          "harsh or metallic bass",
+          "busy arpeggios or leads during narration",
+          "sung vocals or lyrics",
+          "vocals",
+          "singing",
+          "lyrics",
+          "voiceover",
+          "spoken word",
+          "rap"
+        ],
+        "context_adherence": "high"
+      },
+      {
+        "text": "[Build]",
+        "duration_ms": 18000,
+        "positive_styles": [
+          "120 BPM",
+          "A minor",
+          "half-time feel",
+          "instrumental only",
+          "rising synths",
+          "filtered percussion",
+          "pitch sweeps",
+          "reverse swells",
+          "increasing stereo width and reverb",
+          "steadily building",
+          "rising energy throughout, from moderate to intense"
+        ],
+        "negative_styles": [
+          "aggressive dubstep growls",
+          "riddim",
+          "harsh or metallic bass",
+          "busy arpeggios or leads during narration",
+          "sung vocals or lyrics",
+          "vocals",
+          "singing",
+          "lyrics",
+          "voiceover",
+          "spoken word",
+          "rap"
+        ],
+        "context_adherence": "high"
+      },
+      {
+        "text": "[Drop]",
+        "duration_ms": 32000,
+        "positive_styles": [
+          "120 BPM",
+          "A minor",
+          "half-time feel",
+          "instrumental only",
+          "huge warm sub-bass",
+          "elastic synth bass",
+          "half-time drums",
+          "shimmering euphoric chords"
+        ],
+        "negative_styles": [
+          "aggressive dubstep growls",
+          "riddim",
+          "harsh or metallic bass",
+          "busy arpeggios or leads during narration",
+          "sung vocals or lyrics",
+          "vocals",
+          "singing",
+          "lyrics",
+          "voiceover",
+          "spoken word",
+          "rap"
+        ],
+        "context_adherence": "high"
+      },
+      {
+        "text": "[Breakdown]",
+        "duration_ms": 16000,
+        "positive_styles": [
+          "120 BPM",
+          "A minor",
+          "half-time feel",
+          "instrumental only",
+          "quiet introspective",
+          "soft chords",
+          "gentle melodic motif"
+        ],
+        "negative_styles": [
+          "aggressive dubstep growls",
+          "riddim",
+          "harsh or metallic bass",
+          "busy arpeggios or leads during narration",
+          "sung vocals or lyrics",
+          "vocals",
+          "singing",
+          "lyrics",
+          "voiceover",
+          "spoken word",
+          "rap"
+        ],
+        "context_adherence": "high"
+      },
+      {
+        "text": "[Ambient Bed]",
+        "duration_ms": 10000,
+        "positive_styles": [
+          "120 BPM",
+          "A minor",
+          "half-time feel",
+          "instrumental only",
+          "very sparse",
+          "soft evolving pad",
+          "lots of negative space",
+          "no drums or minimal filtered percussion"
+        ],
+        "negative_styles": [
+          "aggressive dubstep growls",
+          "riddim",
+          "harsh or metallic bass",
+          "busy arpeggios or leads during narration",
+          "sung vocals or lyrics",
+          "vocals",
+          "singing",
+          "lyrics",
+          "voiceover",
+          "spoken word",
+          "rap"
+        ],
+        "context_adherence": "high"
+      },
+      {
+        "text": "[Build]",
+        "duration_ms": 18000,
+        "positive_styles": [
+          "120 BPM",
+          "A minor",
+          "half-time feel",
+          "instrumental only",
+          "rising synths",
+          "filtered percussion",
+          "pitch sweeps",
+          "reverse swells",
+          "increasing stereo width and reverb",
+          "steadily building",
+          "rising energy throughout, from moderate to intense"
+        ],
+        "negative_styles": [
+          "aggressive dubstep growls",
+          "riddim",
+          "harsh or metallic bass",
+          "busy arpeggios or leads during narration",
+          "sung vocals or lyrics",
+          "vocals",
+          "singing",
+          "lyrics",
+          "voiceover",
+          "spoken word",
+          "rap"
+        ],
+        "context_adherence": "high"
+      },
+      {
+        "text": "[Drop]",
+        "duration_ms": 32000,
+        "positive_styles": [
+          "120 BPM",
+          "A minor",
+          "half-time feel",
+          "instrumental only",
+          "huge warm sub-bass",
+          "elastic synth bass",
+          "half-time drums",
+          "shimmering euphoric chords"
+        ],
+        "negative_styles": [
+          "aggressive dubstep growls",
+          "riddim",
+          "harsh or metallic bass",
+          "busy arpeggios or leads during narration",
+          "sung vocals or lyrics",
+          "vocals",
+          "singing",
+          "lyrics",
+          "voiceover",
+          "spoken word",
+          "rap"
+        ],
+        "context_adherence": "high"
+      },
+      {
+        "text": "[Ambient Bed]",
+        "duration_ms": 6000,
+        "positive_styles": [
+          "120 BPM",
+          "A minor",
+          "half-time feel",
+          "instrumental only",
+          "very sparse",
+          "soft evolving pad",
+          "lots of negative space",
+          "no drums or minimal filtered percussion"
+        ],
+        "negative_styles": [
+          "aggressive dubstep growls",
+          "riddim",
+          "harsh or metallic bass",
+          "busy arpeggios or leads during narration",
+          "sung vocals or lyrics",
+          "vocals",
+          "singing",
+          "lyrics",
+          "voiceover",
+          "spoken word",
+          "rap"
+        ],
+        "context_adherence": "high"
+      },
+      {
+        "text": "[Outro]",
+        "duration_ms": 16000,
+        "positive_styles": [
+          "120 BPM",
+          "A minor",
+          "half-time feel",
+          "instrumental only",
+          "peaceful atmospheric resolution",
+          "fading pads",
+          "fading out to silence at the end"
+        ],
+        "negative_styles": [
+          "aggressive dubstep growls",
+          "riddim",
+          "harsh or metallic bass",
+          "busy arpeggios or leads during narration",
+          "sung vocals or lyrics",
+          "vocals",
+          "singing",
+          "lyrics",
+          "voiceover",
+          "spoken word",
+          "rap"
+        ],
+        "context_adherence": "high"
+      }
+    ]
+  }
+}

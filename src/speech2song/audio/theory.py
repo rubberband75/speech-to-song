@@ -336,3 +336,66 @@ def parse_chord(name: str) -> tuple[int, int, int]:
     third = 3 if quality in ("m", "dim") else 4
     fifth = 6 if quality == "dim" else 7
     return root, (root + third) % 12, (root + fifth) % 12
+
+
+# --- Section progressions (M7) ----------------------------------------------------------------
+
+# Progressions per section role, as scale degrees, one entry per chord. Minor uses the
+# natural minor triads (i ii° III iv v VI VII), major the plain diatonic ones. Builds lean
+# on the chords that pull home (VII, v / V), outros come home to the tonic, and the
+# ending is the tonic alone.
+PROGRESSIONS: dict[str, dict[str, list[tuple[int, ...]]]] = {
+    "minor": {
+        "intro": [(1, 6), (1, 6, 3, 7), (6, 1)],
+        "build": [(6, 7, 4, 5), (4, 6, 7, 7), (6, 4, 7, 7)],
+        "drop": [(1, 6, 3, 7), (6, 7, 1, 1), (1, 7, 6, 7), (6, 3, 7, 1)],
+        "breakdown": [(6, 3, 7, 1), (4, 1, 6, 7), (1, 3, 6, 7)],
+        "outro": [(6, 7, 1, 1), (4, 6, 1, 1)],
+        "ending": [(1,)],
+    },
+    "major": {
+        "intro": [(1, 4), (1, 5, 6, 4), (4, 1)],
+        "build": [(4, 5, 6, 5), (2, 4, 5, 5), (6, 4, 5, 5)],
+        "drop": [(1, 5, 6, 4), (6, 4, 1, 5), (4, 1, 5, 6), (1, 6, 4, 5)],
+        "breakdown": [(6, 4, 1, 5), (4, 6, 5, 1), (1, 3, 4, 5)],
+        "outro": [(4, 5, 1, 1), (4, 1, 4, 1)],
+        "ending": [(1,)],
+    },
+}
+BARS_PER_CHORD = {"intro": 2, "outro": 2, "build": 1, "drop": 1, "breakdown": 1, "ending": 1}
+REPEAT_PENALTY = 0.5  # the same progression as this role's previous section
+
+
+def progression_fit(degrees: Sequence[int], key: Key, weights: np.ndarray) -> float:
+    """How well a progression's chords hold a melody's pitch classes (0-1): the mean
+    share of the melody's duration that each chord covers."""
+    total = float(weights.sum())
+    if total <= 0:
+        return 0.0
+    triads = diatonic_triads(key)
+    return sum(sum(weights[pc] for pc in triads[d - 1].pitch_classes) / total
+               for d in degrees) / len(degrees)  # fmt: skip
+
+
+def section_progression(
+    role: str, key: Key, bars: int, melody_weights: np.ndarray, avoid: tuple[int, ...] | None
+) -> tuple[tuple[int, ...], list[str]] | None:
+    """(degrees, one chord name per bar) for a music section of `role`, or None when the
+    role has no vocabulary (the caller keeps its own chords). Of the role's progressions,
+    the one that best holds the nearby speech melody's pitch classes wins, unless it is
+    the one the role's previous section used (`avoid`), so repeated sections differ."""
+    options = PROGRESSIONS[key.mode].get(role)
+    if not options or bars < 1:
+        return None
+
+    def score(degrees: tuple[int, ...]) -> float:
+        repeat = REPEAT_PENALTY if degrees == avoid else 0.0
+        return progression_fit(degrees, key, melody_weights) - repeat
+
+    best = max(options, key=score)  # ties keep the vocabulary's order
+    triads = diatonic_triads(key)
+    per_chord = BARS_PER_CHORD.get(role, 1)
+    names = [triads[best[(bar // per_chord) % len(best)] - 1].name for bar in range(bars)]
+    if role == "outro" and bars >= 2:  # a closing section lands home
+        names[-1] = triads[0].name
+    return best, names

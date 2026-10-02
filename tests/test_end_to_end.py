@@ -16,7 +16,7 @@ from speech2song.audio.dsp import fade_edges
 from speech2song.backends import transcribe_base
 from speech2song.costs import CostLog
 from speech2song.manifest import Run
-from speech2song.models import AsrResult, AsrWord, ClipSet, MixReport, Transcript
+from speech2song.models import Arrangement, AsrResult, AsrWord, ClipSet, MixReport, Transcript
 
 from .fixtures.fake_claude import clip_answer, response
 from .fixtures.synth import asr_result, synthetic_talk, write_wav
@@ -88,3 +88,26 @@ def test_whole_pipeline_keeps_speech_exact(
     status = cli("status")
     for stage in ("arrange", "generate", "take", "mix"):
         assert any(stage in line and "complete" in line for line in status.output.splitlines())
+
+    # A passage played alone (a hand edit): the music stops for it; the speech stays exact.
+    path = run.path("05_arrangement.json")
+    arrangement = Arrangement.model_validate_json(path.read_text())
+    bed = [s for s in arrangement.sections if s.clip_id][1]
+    bed.treatment = "alone"
+    path.write_text(arrangement.model_dump_json(indent=2))
+    result = cli("mix", "--run", "latest")  # the free stub's take is made again for it
+    assert result.exit_code == 1 and "generate" in result.output  # (the old take no longer fits)
+    result = cli("run", "--run", "latest", "--yes")
+    assert result.exit_code == 0, result.output
+    assert "silence spliced in" in result.output and "stops for the passages" in result.output
+    report = MixReport.model_validate_json(run.path("07_mix/mix.json").read_text())
+    assert report.alone == [bed.id]
+    speech, _ = sf.read(str(run.path("07_mix/stems/speech.wav")), dtype="float32", always_2d=True)
+    for placed in report.clips:
+        assert np.array_equal(speech[placed.start_sample : placed.end_sample],
+                              clips[placed.clip_id])  # fmt: skip
+    music, sr = sf.read(str(run.path("07_mix/stems/music.wav")), dtype="float32")
+    start = round(bed.start_bar * 4 * 60 / arrangement.bpm * sr)
+    words = next(p for p in report.clips if p.section_id == bed.id)
+    alone = music[start + round(2.6 * sr) : words.end_sample - sr // 2]  # after the ring
+    assert len(alone) and np.abs(alone).max() < 1e-4  # the speaker alone

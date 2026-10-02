@@ -1,5 +1,5 @@
-"""DSP helpers: quiet cut points and edge fades (clips), and ducking, loudness, true peak
-and limiting (mix). Pure numpy/scipy; no file I/O."""
+"""DSP helpers: quiet cut points and edge fades (clips), and the speech guard, loudness,
+true peak and limiting (mix). Pure numpy/scipy; no file I/O."""
 
 import math
 from collections.abc import Sequence
@@ -82,39 +82,7 @@ def fade_edges(block: np.ndarray, fade: int) -> np.ndarray:
     return out
 
 
-# --- Ducking ---------------------------------------------------------------------------------
-
-
-def quote_duck(
-    regions: Sequence[tuple[int, int]],
-    frames: int,
-    sr: int,
-    *,
-    depth_db: float,
-    lead_s: float,
-    release_s: float,
-) -> np.ndarray:
-    """Per-sample linear gain for the music bus, ducking once per quote instead of once
-    per word. Each region is a quote's first to last word (sample positions): the music
-    eases down to `depth_db` (negative) over the `lead_s` before it, stays down through
-    the quote's pauses, and eases back up over `release_s` after it. Both ramps are
-    raised cosines in dB; overlapping regions take the deeper of the two."""
-    gain_db = np.zeros(frames, dtype=np.float32)
-    lead, release = round(lead_s * sr), round(release_s * sr)
-    for start, end in regions:
-        start, end = max(0, start), min(frames, end)
-        if end <= start:
-            continue
-        a, b = max(0, start - lead), min(frames, end + release)
-        shape = np.ones(b - a, dtype=np.float32)
-        if start > a:  # eases down; a region at the very start only gets the end of the ramp
-            at = np.arange(a, start) - (start - lead)
-            shape[: start - a] = 0.5 - 0.5 * np.cos(np.pi * (at + 0.5) / lead)
-        if b > end:
-            at = np.arange(end, b)
-            shape[end - a :] = 0.5 + 0.5 * np.cos(np.pi * (at - end + 0.5) / release)
-        gain_db[a:b] = np.minimum(gain_db[a:b], depth_db * shape)
-    return (10 ** (gain_db / 20)).astype(np.float32)
+# --- Speech guard -----------------------------------------------------------------------------
 
 
 GUARD_BAND_HZ = (200.0, 5000.0)  # where music masks words

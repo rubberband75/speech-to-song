@@ -103,8 +103,11 @@ speaker's tuning offset, finds the key (`--key "D minor"` overrides it), snaps n
 toward the scale (`melody.scale_snap_strength`), moves them up into a melody register,
 picks the tempo within the preset's tolerance that best fits the clips, quantizes to the
 preset grid, and chooses one chord per bar. It writes `04_melody.json`, `04_melody.mid`
-(each phrase looped `loop_phrase_count` times) and `04_melody_reference.wav` (two loops
-of the main phrase, rendered with fluidsynth and a General MIDI soundfont).
+(each phrase looped `loop_phrase_count` times), `04_melody_reference.wav` (two loops
+of the main phrase, rendered with fluidsynth and a General MIDI soundfont) and
+`04_quote_melodies.wav` (every quote's own melody with its chords, looped to at least
+8 s, indexed by `04_quote_melodies.json`; the music around each quote can be conditioned
+on it).
 `scripts/melody_listen.py` writes, per clip, the speech, the melody, both together, and
 an "illusion" take where the speech repeats while the melody fades in.
 
@@ -114,18 +117,30 @@ an "illusion" take where the speech repeats while the melody fades in.
 slots: the clips, in play order, are shared out over them in consecutive groups that
 balance speech time (a `hook` clip leans to the first slot, an `outro` clip to the last),
 and each clip gets its own speech bed, starting on a bar and long enough for the clip
-plus `speech_interaction.tail_beats`. Other sections take their `bars` from the preset.
-Beds use their clip's chords from the melody, other sections loop the main phrase's
-chords, and breakdowns and drops note which line was heard last, for the melody layer.
-Silent roles (`silent: true`, the gap before a drop) get no music of their own; the mix
-turns them into a short lift (see `mix`).
+plus `speech_interaction.tail_beats`. A passage (the beds of neighbouring clips) starts
+`lead_in_beats` (4, a bar) before its first word, so the music has settled into the quiet
+bed when the voice comes in. A passage can also be played **alone**: no music at all, the
+music stopping on the bar line `alone_lead_in_beats` (2) before the voice and coming back
+on the next downbeat (Claude's arc chooses this for the line or two that matter most).
+Other sections take their `bars` from the preset. Beds use their clip's chords from the
+melody; music sections take a progression for their role that best fits the melody heard
+last, and a different one from the role's previous section. A role that appears more than
+once adds `first_styles` and `last_styles` (a restrained first drop, a climactic last
+one). The song's first music section and the music right after each passage note a quote
+whose melody conditions them (`melody_ref`). Silent roles (`silent: true`, the gap before
+a drop) get no music of their own; the mix turns them into a short lift (see `mix`). The
+song's `ending` (the preset's `ending`, or Claude's choice) is `held_chord` (the last
+music comes home to the tonic and that chord is held and rings away), `stop` (a crisp stop
+on the last downbeat) or `fade` (the music fades out by itself).
 `05_arrangement.json` can be edited by hand: later steps pick up the edit, and the mixer
 checks it first.
 
 `arrange --refine-arc` asks Claude to propose the arc around the clip texts instead (a
-small paid call, about $0.03 on Sonnet; it asks first). Its answer is kept in
-`05_arc.json`; if it breaks the rules (unknown roles, clips out of order, odd lengths)
-it is retried once with feedback, and the preset's arc is used if it still can't be.
+small paid call, about $0.03 on Sonnet, $0.05 on Opus; it asks first): the parts, how the
+music meets each passage (`under` or `alone`, at most two alone), a few style words per
+part for the song's development, and the ending. Its answer is kept in `05_arc.json`; if
+it breaks the rules (unknown roles, clips out of order, odd lengths, voices in styles) it
+is retried once with feedback, and the preset's arc is used if it still can't be.
 `--no-refine-arc` goes back to the preset's arc. Both flags stick to the run.
 
 ### Music and mix
@@ -135,8 +150,15 @@ it is retried once with feedback, and the preset's arc is used if it still can't
 
 - **elevenlabs**: the arrangement becomes an Eleven Music composition plan (one chunk per
   section or merged run of sections, each stating the tempo, key and "instrumental only",
-  with the section's styles). Silent sections and anything under 3 s ride along with the
-  chunk before them; nothing is generated for a gap. Each take is one paid call ($0.15
+  with the section's styles, its role's `negative_styles`, and its chords as words).
+  Silent sections and anything under 3 s ride along with the chunk before them; nothing
+  is generated for a gap or for a passage played alone (the take is spliced open there,
+  so a build still runs straight into its drop). The music around each quote is
+  conditioned on that quote's rendered melody (`conditioning_ref`, `condition_strength`
+  low); the quote melodies used are uploaded once per run, as one file (billed like a
+  generation). The model fades out at the end of any generation, so a song that ends on a
+  held chord or a stop is generated 20 s longer and cut on its last bar line. Each take
+  is one paid call ($0.15
   per generated minute at API rates, about $0.51 for a 3.4-minute song); it estimates and
   asks first. Takes are stored for inpainting and never overwritten: a re-run reuses
   takes made for the same request, `--force` adds new ones, and takes of an older request
@@ -162,7 +184,7 @@ or `--take N` (any take that fits; sticky, `--take auto` to undo). Then it write
 `07_mix/`:
 
 - `stems/speech.wav`: the clips, sample-exact, on silence (float WAV)
-- `stems/music.wav` and `stems/melody_layer.wav`: as heard in the mix (ducked)
+- `stems/music.wav` and `stems/melody_layer.wav`: as heard in the mix
 - `master.wav` (24-bit) and `master.mp3` (320 kbps), at the preset's `target_lufs` with
   true peaks at or below -1 dBTP
 - `mix.json`: clip positions, levels, the music's shaping and final loudness
@@ -176,15 +198,20 @@ generated for it) is a lift into the drop: the build's music runs on, rises by
 on the downbeat. Generated drops often open with a silent bar and a riser; when the
 section after a gap opens near-silent and reaches full level within
 `late_entry_max_bars` (4), its music is taken from that many bars later, so it starts
-on the downbeat (and its spill into the next section goes back with it). The last chord
-rings out: the music's last audible stretch goes through a long reverb that dies away
-over `ring_out_s` (6), and the file ends there. The speech bus
-sits `mix.speech_level_lu` above the music's
-loudness, with a high-pass, gentle compression, and reverb/delay sends whose tails fade
-out before the next clip. The music ducks once per quote, by `sidechain_duck_db`: it
-eases down over the `duck_lead_s` (0.6) before the quote's first word, stays down through
-its pauses, and comes back over `duck_release_s` (1.5) after its last word. The speech
-guard makes sure every word (from the transcript's timings) stays at least
+on the downbeat (and its spill into the next section goes back with it). Before a
+passage played alone, the music stops on the bar line and its reverb dies away over
+`alone_ring_s` (2.5); after it, a reverse swell of the returning music grows into the
+next downbeat. At the end, a held chord rings out: the last music that is actually heard
+goes through a long reverb that dies away over `ring_out_s` (6); a stop gets a short
+ring; a fade is left as the model made it (it is rung out only if it would stop
+abruptly). The file ends where the music has died away, or 3 s after the last line. The
+speech bus sits `mix.speech_level_lu` above the music's loudness, with a high-pass,
+gentle compression, and reverb/delay sends whose tails fade out before the next clip.
+The music is never turned down word by word: under each passage it is set once, at the
+passage's bar lines (easing in during the lead-in bar, back out after the last word),
+and only as far as it takes to sit `bed_margin_db` (14 dB) under the speech, at most
+`sidechain_duck_db`; a bed the music model made quiet is left alone. The speech guard
+makes sure every word (from the transcript's timings) stays at least
 `speech_margin_db` (10 dB) above the music in the speech band (200 Hz-5 kHz): under
 words that are softer than that, the music dips further, slowly (40 dB/s in, 12 dB/s
 out), only as far as needed, and without recovering across pauses under half a second.

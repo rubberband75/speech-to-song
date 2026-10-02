@@ -17,17 +17,18 @@ key:
   tonic: auto         # auto = use key detected from the extracted speech melody
   fallback: C
 
-# Global style words sent to the music generator
+# Global style words sent to the music generator (the first chunk, which sets the tone of
+# the whole song): genre, palette and mood. Density (drums, bass, leads) belongs to the
+# sections that have it, so the quiet sections can stay quiet.
 positive_styles:
   - cinematic psychedelic electronic
   - melodic future bass
   - midtempo bass
   - ambient electronica
-  - warm sub-bass with rounded, elastic wobbling bass synth
-  - punchy half-time electronic drums, wide snare, trap-influenced hats
-  - lush wide synth chords, bright euphoric leads
+  - lush wide synth chords
   - granular textures, reversed sounds, pitch bends, ear candy
   - instrumental arrangement with large negative space in the quiet sections
+  - dynamic arrangement, near-empty quiet passages and huge drops
   - bittersweet, awe-filled, polished, spacious, immersive
 
 negative_styles:
@@ -42,19 +43,25 @@ negative_styles:
 # section length (default 8; a speech_bed is fitted to its clip). "shape" is flat, rise
 # (builds into the next section) or fall (fades out). "silent" sections get no music of
 # their own (nothing is generated for them); the mix turns them into a short lift.
+# "negative_styles" are what a section must leave out (the music model fills silence
+# unless told not to). When a role appears more than once, its first and last
+# occurrence add "first_styles" and "last_styles", so the song develops.
 section_roles:
   intro:
     energy: 0.15
     bars: 8
     styles: [spacious ambient pads, soft granular textures, distant reversed sounds, filtered noise, sparse piano or bell fragments]
-  speech_bed:           # plays under a spoken clip
+    negative_styles: [drums, heavy bass]
+  speech_bed:           # plays under a spoken clip (unless the clip plays alone)
     energy: 0.2
-    styles: [very sparse, soft evolving pad, lots of negative space, no drums or minimal filtered percussion]
+    styles: [just a soft sustained pad, minimal and sparse, lots of open space, quiet and still]
+    negative_styles: [drums, percussion, beat, bassline, sub-bass, lead melody, arpeggios, busy, loud, build-up, risers]
   build:
     energy: 0.6
     bars: 8
     shape: rise
     styles: [rising synths, filtered percussion, pitch sweeps, reverse swells, increasing stereo width and reverb]
+    last_styles: [the biggest build of the song]
   gap:                  # a bar before a drop: the build's tail and a swell into the drop
     energy: 0.0
     bars: 1
@@ -62,16 +69,26 @@ section_roles:
   drop:
     energy: 1.0
     bars: 16
-    styles: [huge warm sub-bass, elastic synth bass, half-time drums, shimmering euphoric chords]
+    styles: [huge warm sub-bass, rounded elastic wobbling bass synth, punchy half-time drums, wide snare, trap-influenced hats, shimmering euphoric chords]
+    first_styles: [restrained first drop, filtered lead, leaves room to grow]
+    last_styles: [final drop and climax of the song, fullest and widest arrangement, soaring bright euphoric lead melody]
   breakdown:
     energy: 0.3
     bars: 8
     styles: [quiet introspective, soft chords, gentle melodic motif]
+    negative_styles: [heavy drums, sub drop]
   outro:
     energy: 0.1
     bars: 8
     shape: fall
-    styles: [peaceful atmospheric resolution, fading pads]
+    styles: [peaceful atmospheric resolution, warm pads settling]
+    negative_styles: [drums, build-up]
+
+# How the song's music ends, unless Claude's arc chooses: held_chord (it comes home to the
+# tonic and that chord is held and rings away), stop (it ends crisply on the tonic), or
+# fade (it fades out by itself). The music model always fades out at the very end of a
+# generation, so held chords and stops are generated past the end and cut on the last bar.
+ending: held_chord
 
 # Default arc, adapted to however many clips were selected: the clips (in play order)
 # are shared out over the speech_bed slots. The last slot lets the closing line end the
@@ -96,12 +113,14 @@ speech_interaction:
   align_clip_starts_to: bar         # bar | beat | free
   tail_beats: 2                     # beats after a clip's last word before the next section
   part_pause_beats: 4               # music between the parts of a long quote
+  lead_in_beats: 4                  # a passage's quiet bed starts a bar before its first word
+  alone_lead_in_beats: 2            # the music stops this long before a quote played alone
 
 # Local mix settings (pedalboard)
 mix:
-  sidechain_duck_db: -9             # music reduction while speech is active
-  duck_lead_s: 0.6                  # the music eases down this long before a quote's first
-  duck_release_s: 1.5               # word, and back up this long after its last word
+  bed_margin_db: 14                 # under a passage the music sits this far under the speech
+  sidechain_duck_db: -9             # (set once, at the passage's bar lines), coming down at
+                                    # most this much; a bed that is already quiet is left alone
   speech_highpass_hz: 90
   speech_reverb_send: 0.12          # increase for the psychedelic sections
   speech_delay_send: 0.06
@@ -109,12 +128,15 @@ mix:
   speech_level_lu: 2                # speech loudness relative to the music's
   melody_layer_lu: -10              # melody layer loudness relative to the music's
   melody_under_speech_db: -6        # extra cut when the melody plays under speech
-  energy_range_db: 10               # level from energy 0 to 1 when shaping the music
+  energy_range_db: 20               # level from energy 0 to 1 when shaping the music (M7
+                                    # beds are composed quiet: about 16 dB under the drops)
   energy_tolerance_db: 3            # deviations within this are left alone
   energy_max_db: 6                  # largest correction per section (0 = no shaping)
   gap_swell: 0.8                    # a gap lifts into the drop: reverse swell of the build's
   gap_lift_db: 3                    # tail (level, 0 = none) and a rise of this much (dB)
-  ring_out_s: 6                     # the last chord rings out this long (0 = as generated)
+  ring_out_s: 6                     # the last chord rings out this long, where the music
+                                    # would stop abruptly (0 = as generated)
+  alone_ring_s: 2.5                 # before a quote played alone the music rings away this long
   late_entry_max_bars: 4            # pull a drop that opens silent after a gap onto its
                                     # downbeat, if it is at most this late (0 = off)
   speech_margin_db: 10              # music stays this far under every word (speech band)

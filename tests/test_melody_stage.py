@@ -12,8 +12,8 @@ from typer.testing import Result
 from speech2song.audio.pitch import Segment
 from speech2song.config import load_preset
 from speech2song.listen import write_listening_set
-from speech2song.models import Clip, Melody
-from speech2song.stages.melody import build_melody
+from speech2song.models import Clip, Melody, QuoteMelodies
+from speech2song.stages.melody import build_melody, quote_loops
 
 from .conftest import PRESETS_DIR, Talk
 from .fixtures.fake_claude import clip_answer, response
@@ -97,6 +97,19 @@ def test_melody_step_end_to_end(cli: Cli, talk: Talk, install: Callable) -> None
     info = sf.info(str(run.path("04_melody_reference.wav")))
     expected = 2 * main.bars * 4 * 60 / melody.bpm + 1.5
     assert info.duration == pytest.approx(expected, abs=0.05)
+
+    # Every quote's own melody, looped to at least 8 s, one after another (M7 conditioning).
+    index = QuoteMelodies.model_validate_json(run.path("04_quote_melodies.json").read_text())
+    quotes = sf.info(str(run.path(index.file)))
+    assert list(index.clips) == [c.clip_id for c in melody.clips]
+    edges = [edge for span in index.clips.values() for edge in span]
+    assert edges == sorted(edges) and edges[-1] <= quotes.duration * 1000 + 1
+    for clip in melody.clips:
+        start, end = index.clips[clip.clip_id]
+        loops = quote_loops(clip, melody.bpm)
+        phrase_s = clip.bars * 4 * 60 / melody.bpm
+        assert loops * phrase_s >= 8.0 - 1e-6 or loops * phrase_s + phrase_s > 30
+        assert 8_000 <= end - start <= 30_000
 
     assert "melody: cached" in cli("melody").output
     changed = cli("melody", "--key", "f#m")

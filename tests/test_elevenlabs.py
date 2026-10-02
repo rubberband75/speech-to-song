@@ -13,12 +13,15 @@ from typer.testing import Result
 
 from speech2song.arrangement import ClipInfo, build_arrangement, default_parts
 from speech2song.backends import music_elevenlabs
+from speech2song.backends.music_base import MelodyFiles
 from speech2song.config import load_preset
 from speech2song.costs import CostLog
 from speech2song.manifest import Run
 from speech2song.models import ArcPart, Arrangement, TakeChoice, TakeMeta
 from speech2song.music_plan import (
+    ENDING_TAIL_MS,
     MAX_CHUNK_MS,
+    MELODY_SONG,
     MIN_CHUNK_MS,
     build_plan,
     check_plan,
@@ -26,7 +29,9 @@ from speech2song.music_plan import (
     grid_ms,
     inpaint_plan,
     layout_chunks,
+    plan_references,
     section_bounds_ms,
+    tail_ms,
     total_ms,
 )
 from speech2song.stages.generate_music import choose_take
@@ -40,11 +45,15 @@ Cli = Callable[..., Result]
 PRESET = load_preset("cinematic_future_bass", PRESETS_DIR)
 
 
-def _arrangement(parts: list[ArcPart] | None = None, bpm: float = 120.0) -> Arrangement:
+def _arrangement(
+    parts: list[ArcPart] | None = None, bpm: float = 120.0, ending: str | None = None
+) -> Arrangement:
     clips = [ClipInfo("a", "hook", "a", 6.3, 6.0), ClipInfo("b", "build", "b", 9.3, 9.0),
              ClipInfo("c", "outro", "c", 5.3, 5.0)]  # fmt: skip
     melody = _melody(clips).model_copy(update={"bpm": bpm})
-    return build_arrangement(parts or default_parts(PRESET, clips), clips, melody, PRESET)
+    return build_arrangement(
+        parts or default_parts(PRESET, clips), clips, melody, PRESET, ending=ending
+    )  # type: ignore[arg-type]
 
 
 # --- The composition plan -----------------------------------------------------------------
@@ -55,7 +64,12 @@ def test_plan_tiles_the_song_within_the_api_limits() -> None:
     plan, layout = build_plan(arrangement, PRESET)
     assert check_plan(plan) == []
     total = section_bounds_ms(arrangement)[-1][2]
-    assert sum(c["duration_ms"] for c in plan["chunks"]) == total
+    tail = plan["chunks"][-1]  # music past the end, for the model to fade out in
+    assert tail["duration_ms"] == ENDING_TAIL_MS == tail_ms(arrangement)
+    assert "slowly fading out" in tail["positive_styles"]
+    assert sum(c["duration_ms"] for c in plan["chunks"]) == total + ENDING_TAIL_MS
+    assert grid_ms(arrangement) == [c["duration_ms"] for c in plan["chunks"]]
+    assert tail_ms(_arrangement(ending="fade")) == 0  # a fade is the model's own ending
     assert layout[0].start_ms == 0 and layout[-1].end_ms == total
     for a, b in itertools.pairwise(layout):
         assert a.end_ms == b.start_ms
@@ -84,7 +98,8 @@ def test_long_silent_sections_fold_too() -> None:
     arrangement = _arrangement(parts)
     plan, layout = build_plan(arrangement, PRESET)
     assert check_plan(plan) == []
-    assert [c["text"] for c in plan["chunks"]] == ["[Intro]", "[Ambient Bed]", "[Outro]"]
+    assert [c["text"] for c in plan["chunks"]] == ["[Intro]", "[Ambient Bed]", "[Outro]",
+                                                   "[Outro]"]  # fmt: skip
     assert layout[0].sections == ["s1", "s2", "s3"]  # 8 s gaps: still nothing generated
     assert layout[0].start_ms == 0 and layout[0].end_ms == 24_000
     assert grid_ms(arrangement) == [c["duration_ms"] for c in plan["chunks"]]
@@ -103,18 +118,148 @@ def test_styles_set_tempo_key_and_keep_it_instrumental() -> None:
     assert "melodic future bass" in first["positive_styles"]  # global styles open the song
     assert "melodic future bass" not in later["positive_styles"]
     assert later["text"] == "[Ambient Bed]"  # never "speech": no generated voices
-    assert plan["chunks"][-1]["text"] == "[Outro]"
-    assert "fading out to silence at the end" in plan["chunks"][-1]["positive_styles"]
+    outro, tail = plan["chunks"][-2:]
+    assert outro["text"] == tail["text"] == "[Outro]"  # held to the end; the tail is cut away
+    assert "fading out to silence at the end" not in outro["positive_styles"]
+    assert outro["positive_styles"][-1].endswith("- Am")  # it comes home to the tonic
+    faded, _ = build_plan(_arrangement(ending="fade"), PRESET)
+    assert "fading out to silence at the end" in faded["chunks"][-1]["positive_styles"]
+
+
+def _m5() -> tuple[Arrangement, dict]:
+    """A plan-version-1 arrangement and the plan the M5 code made for it (fixtures made
+    with the code as of commit 13c08f1)."""
+    fixtures = Path(__file__).parent / "fixtures"
+    arrangement = Arrangement.model_validate_json((fixtures / "m5_arrangement.json").read_text())
+    return arrangement, json.loads((fixtures / "m5_plan.json").read_text())
+
+
+def test_m5_arrangements_keep_their_plan_and_timing() -> None:
+    arrangement, expected = _m5()
+    assert arrangement.plan_version == 1 and arrangement.ending is None
+    plan, _ = build_plan(arrangement, PRESET)
+    assert grid_ms(arrangement) == expected["grid_ms"]  # its takes still fit
+    assert plan["chunks"][1:] == expected["plan"]["chunks"][1:]  # no chords, no negatives...
+    first, old = plan["chunks"][0], expected["plan"]["chunks"][0]
+    assert {k: v for k, v in first.items() if k != "positive_styles"} == \
+        {k: v for k, v in old.items() if k != "positive_styles"}  # fmt: skip
+    assert first["positive_styles"][:4] == old["positive_styles"][:4]
+    assert first["positive_styles"][-5:] == old["positive_styles"][-5:]  # only the preset's
+    # global styles (edited for M7) differ
 
 
 def test_reference_conditions_only_the_first_chunk() -> None:
-    plan, _ = build_plan(_arrangement(), PRESET, reference_song_id="ref_9", reference_ms=45_000,
+    arrangement, _ = _m5()  # the M5 melody reference
+    plan, _ = build_plan(arrangement, PRESET, reference_song_id="ref_9", reference_ms=45_000,
                          condition_strength="medium")  # fmt: skip
     first = plan["chunks"][0]
     assert first["conditioning_ref"] == {"song_id": "ref_9",
                                          "range": {"start_ms": 0, "end_ms": 30_000}}  # fmt: skip
     assert first["condition_strength"] == "medium"
     assert all("conditioning_ref" not in c for c in plan["chunks"][1:])
+
+
+def test_m7_chunks_carry_chords_negatives_and_the_development() -> None:
+    clips = [ClipInfo("a", "hook", "a", 6.3, 6.0), ClipInfo("b", "build", "b", 9.3, 9.0),
+             ClipInfo("c", "outro", "c", 5.3, 5.0)]  # fmt: skip
+    melody = _melody(clips).model_copy(update={"bpm": 120.0})
+    arrangement = build_arrangement(default_parts(PRESET, clips), clips, melody, PRESET)
+    plan, _ = build_plan(arrangement, PRESET)
+    assert check_plan(plan) == []
+    by_text: dict[str, list[dict]] = {}
+    for chunk in plan["chunks"]:
+        by_text.setdefault(chunk["text"], []).append(chunk)
+    bed = by_text["[Ambient Bed]"][0]
+    assert {"drums", "bassline", "lead melody"} <= set(bed["negative_styles"])
+    assert "just a soft sustained pad" in bed["positive_styles"]
+    assert any(s.startswith("slow chord changes") for s in bed["positive_styles"])
+    first_drop, last_drop = by_text["[Drop]"]
+    assert "restrained first drop" in first_drop["positive_styles"]
+    assert "final drop and climax of the song" in last_drop["positive_styles"]
+    assert "drums" not in first_drop["negative_styles"]
+    progressions = [next(s for s in d["positive_styles"] if s.startswith("chord progression"))
+                    for d in (first_drop, last_drop)]  # fmt: skip
+    assert progressions[0] != progressions[1]
+    assert by_text["[Intro]"][0]["positive_styles"].count("chord progression Am - F") == 1
+
+
+def test_alone_passages_take_no_music_time() -> None:
+    parts = [ArcPart(role="intro", bars=4), ArcPart(role="speech_bed", clips=["a"]),
+             ArcPart(role="build", bars=8),
+             ArcPart(role="speech_bed", clips=["b"], treatment="alone"),
+             ArcPart(role="drop", bars=16),
+             ArcPart(role="speech_bed", clips=["c"], treatment="alone")]  # fmt: skip
+    arrangement = _arrangement(parts)
+    plan, layout = build_plan(arrangement, PRESET)
+    alone = {s.id for s in arrangement.sections if s.rest}
+    assert not alone & {s for chunk in layout for s in chunk.sections}
+    assert [c["text"] for c in plan["chunks"]] == [
+        "[Intro]",
+        "[Ambient Bed]",
+        "[Build]",
+        "[Drop]",
+        "[Drop]",
+    ]  # fmt: skip (+ tail)
+    music = sum(s.bars for s in arrangement.sections if not s.rest) * 2000
+    assert total_ms(plan) == music + ENDING_TAIL_MS
+    assert section_bounds_ms(arrangement)[-1][2] == music
+    build = next(c for c in layout if c.roles[0] == "build")
+    drop = next(c for c in layout if c.roles[0] == "drop")
+    assert build.end_ms == drop.start_ms  # the build runs straight into its drop
+    with pytest.raises(ValueError, match="no music of its own"):
+        inpaint_plan(arrangement, PRESET, "song_1", sorted(alone)[:1], None)
+
+
+def test_quotes_condition_the_music_around_them() -> None:
+    from .test_arrangement import _sung
+
+    clips = [ClipInfo("a", "hook", "a", 6.3, 6.0), ClipInfo("b", "build", "b", 9.3, 9.0),
+             ClipInfo("c", "outro", "c", 5.3, 5.0)]  # fmt: skip
+    melody = _sung(_melody(clips)).model_copy(update={"bpm": 120.0})
+    arrangement = build_arrangement(default_parts(PRESET, clips), clips, melody, PRESET)
+    assert plan_references(arrangement) == ["a", "b", "c"]
+    ranges = {"a": (0, 9000), "b": (9500, 21500), "c": (22000, 30000)}
+    plan, _ = build_plan(arrangement, PRESET, melody_ranges=ranges,
+                              condition_strength="medium")  # fmt: skip
+    conditioned = [(c["text"], c["conditioning_ref"]["range"]) for c in plan["chunks"]
+                   if "conditioning_ref" in c]  # fmt: skip
+    assert conditioned == [("[Intro]", {"start_ms": 0, "end_ms": 9000}),
+                           ("[Build]", {"start_ms": 0, "end_ms": 9000}),
+                           ("[Build]", {"start_ms": 9500, "end_ms": 21500}),
+                           ("[Outro]", {"start_ms": 22000, "end_ms": 30000})]  # fmt: skip
+    assert all(c.get("condition_strength") == "medium" for c in plan["chunks"]
+               if "conditioning_ref" in c)  # fmt: skip
+    assert all(c["conditioning_ref"]["song_id"] == MELODY_SONG for c in plan["chunks"]
+               if "conditioning_ref" in c)  # fmt: skip
+    long = {**ranges, "a": (0, 45_000)}
+    capped, _ = build_plan(arrangement, PRESET, melody_ranges=long)
+    assert capped["chunks"][0]["conditioning_ref"]["range"]["end_ms"] == 30_000
+    assert check_plan(plan) == []
+    broken = json.loads(json.dumps(plan))
+    broken["chunks"][0]["conditioning_ref"]["range"]["end_ms"] = 40_000
+    assert any("references must be up to 30000 ms" in p for p in check_plan(broken))
+
+
+def test_the_upload_holds_only_the_referenced_quote_melodies(tmp_path: Path) -> None:
+    from speech2song.backends.music_base import MelodyFiles
+    from speech2song.backends.music_elevenlabs import melody_upload
+    from speech2song.models import QuoteMelodies
+
+    wav = tmp_path / "quotes.wav"
+    wav.write_bytes(b"not read here, only hashed")
+    index = QuoteMelodies(
+        file="quotes.wav",
+        sample_rate=44100,
+        instrument="soft_piano",
+        clips={"a": (0, 9000), "b": (9500, 50000), "c": (50500, 60000)},
+    )
+    upload = melody_upload(MelodyFiles(quotes=wav, index=index), ["c", "b", "zz"])
+    assert upload is not None
+    assert upload["source"] == {"c": [50500, 60000], "b": [9500, 39500]}  # at most 30 s each
+    assert upload["ranges"] == {"c": [0, 9500], "b": [10000, 40000]}  # back to back
+    assert upload["ms"] == 40000
+    assert melody_upload(MelodyFiles(), ["a"]) is None  # a run from before M7
+    assert melody_upload(MelodyFiles(quotes=wav, index=index), ["zz"]) is None
 
 
 def test_long_sections_split_and_a_short_opening_merges_forward() -> None:
@@ -169,7 +314,7 @@ def test_inpainting_refuses_silence_and_scattered_sections() -> None:
     arrangement = _arrangement()
     ids = [s.id for s in arrangement.sections]
     gap = ids[[s.role for s in arrangement.sections].index("gap")]
-    with pytest.raises(ValueError, match="silent in the mix"):
+    with pytest.raises(ValueError, match="no music of its own"):
         inpaint_plan(arrangement, PRESET, "song_1", [gap], None)
     with pytest.raises(ValueError, match="next to each other"):
         expand_sections(arrangement, [ids[0], ids[3]])
@@ -198,8 +343,8 @@ def test_take_analysis_reads_tempo_key_and_energy() -> None:
     from speech2song.audio.analysis import analyze_take
     from speech2song.backends.music_stub import StubBackend, synthesize
 
-    arrangement = _arrangement()
-    audio = synthesize(StubBackend().request(arrangement, PRESET, None), seed=3)
+    arrangement = _arrangement(ending="fade")
+    audio = synthesize(StubBackend().request(arrangement, PRESET, MelodyFiles()), seed=3)
     bar = 2.0
     spans = [(s.start_bar * bar, (s.start_bar + s.bars) * bar) for s in arrangement.sections]
     result = analyze_take(audio, 44100, take=1, bpm=120.0, key="A minor", spans_s=spans,
@@ -270,11 +415,15 @@ def test_generate_with_elevenlabs(cli: Cli, talk: Talk, eleven: Callable) -> Non
     assert json.loads(run.path("06_music/take_001.response.json").read_text())["song_metadata"]
     entries = [e for e in CostLog(run.costs_path).read() if e.service == "elevenlabs"]
     minutes = sum(c["duration_ms"] for c in call["composition_plan"]["chunks"]) / 60_000
-    assert [e.operation for e in entries] == ["music.compose_detailed"] * 2
-    assert entries[0].usd == pytest.approx(minutes * 0.15, abs=1e-6)
-    assert entries[0].units == {"minutes": pytest.approx(minutes, abs=1e-4)}
+    # the quote melodies the plan is conditioned on are uploaded once, before the takes
+    assert [e.operation for e in entries] == ["music.upload", *["music.compose_detailed"] * 2]
+    assert len(fake.upload_calls) == 1 and entries[0].note.endswith("c2")
+    conditioned = [c for c in call["composition_plan"]["chunks"] if "conditioning_ref" in c]
+    assert conditioned and all(c["conditioning_ref"]["song_id"] == "ref_1" for c in conditioned)
+    assert entries[1].usd == pytest.approx(minutes * 0.15, abs=1e-6)
+    assert entries[1].units == {"minutes": pytest.approx(minutes, abs=1e-4)}
     assert "generate: cached" in cli("generate", "--yes").output  # no second payment
-    assert len(fake.compose_calls) == 2
+    assert len(fake.compose_calls) == 2 and len(fake.upload_calls) == 1
 
     result = cli("mix")  # picks a take (free), then mixes
     assert result.exit_code == 0, result.output
@@ -286,7 +435,7 @@ def test_generate_with_elevenlabs(cli: Cli, talk: Talk, eleven: Callable) -> Non
     assert selected.samplerate == 44100
     assert selected.duration == pytest.approx(arrangement.total_seconds + 2.0, abs=1e-3)
     gaps = {s.id for s in arrangement.sections if s.silent}
-    assert gaps and not gaps & set(choice.takes[0].sections)  # muted, so not measured
+    assert gaps and not gaps & set(choice.takes[0].sections)  # lifted, so not measured
 
 
 def test_a_failed_take_does_not_repeat_the_paid_one(cli: Cli, talk: Talk, eleven: Callable) -> None:
@@ -297,7 +446,8 @@ def test_a_failed_take_does_not_repeat_the_paid_one(cli: Cli, talk: Talk, eleven
     result = cli("generate", "--music-backend", "elevenlabs", "--yes")
     assert result.exit_code == 1
     assert "ElevenLabs error 500" in result.output and "boom" in result.output
-    assert len([e for e in CostLog(run.costs_path).read() if e.service == "elevenlabs"]) == 1
+    paid = [e.operation for e in CostLog(run.costs_path).read() if e.service == "elevenlabs"]
+    assert paid == ["music.upload", "music.compose_detailed"]
     fake.responses = []
     result = cli("generate", "--yes")
     assert result.exit_code == 0, result.output
@@ -388,7 +538,8 @@ def test_copyright_rejection_is_explained(cli: Cli, talk: Talk, eleven: Callable
     assert "rejected the plan (bad_composition_plan" in result.output
     saved = json.loads(run.path("06_music/plan_suggestion.json").read_text())
     assert saved["suggestion"] == suggestion
-    assert not [e for e in CostLog(run.costs_path).read() if e.service == "elevenlabs"]
+    paid = [e.operation for e in CostLog(run.costs_path).read() if e.service == "elevenlabs"]
+    assert paid == ["music.upload"]  # the quote melodies (kept for the next try); no take
 
 
 def test_missing_key_and_confirmation(
@@ -473,7 +624,7 @@ def test_regenerate_one_section(cli: Cli, talk: Talk, eleven: Callable) -> None:
     assert "▶ take" in result.output and "▶ mix" in result.output  # remixed with the new take
     assert "▶ generate" not in result.output
     stages = [e.stage for e in CostLog(run.costs_path).read() if e.service == "elevenlabs"]
-    assert stages == ["generate", "generate", "regenerate"]
+    assert stages == ["generate", "generate", "generate", "regenerate"]  # upload, two takes
 
     bad = cli("regenerate", "--section", "s99", "--yes")
     assert bad.exit_code == 1 and "no section 's99'" in bad.output

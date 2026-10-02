@@ -1,0 +1,353 @@
+{
+  "schema_version": 1,
+  "bpm": 120.0,
+  "key": "A minor",
+  "time_signature": "4/4",
+  "arc_source": "preset",
+  "sections": [
+    {
+      "id": "s1",
+      "role": "intro",
+      "start_bar": 0,
+      "bars": 8,
+      "energy": 0.15,
+      "shape": "flat",
+      "styles": [
+        "spacious ambient pads",
+        "soft granular textures",
+        "distant reversed sounds",
+        "filtered noise",
+        "sparse piano or bell fragments"
+      ],
+      "chords": [
+        "Am",
+        "F",
+        "C",
+        "G",
+        "Am",
+        "F",
+        "C",
+        "G"
+      ],
+      "clip_id": null,
+      "clip_offset_beats": 0.0,
+      "melody_phrase": null,
+      "silent": false,
+      "start_s": 0.0,
+      "seconds": 16.0
+    },
+    {
+      "id": "s2",
+      "role": "speech_bed",
+      "start_bar": 8,
+      "bars": 4,
+      "energy": 0.2,
+      "shape": "flat",
+      "styles": [
+        "very sparse",
+        "soft evolving pad",
+        "lots of negative space",
+        "no drums or minimal filtered percussion"
+      ],
+      "chords": [
+        "Am",
+        "F",
+        "C",
+        "G"
+      ],
+      "clip_id": "a",
+      "clip_offset_beats": 0.0,
+      "melody_phrase": null,
+      "silent": false,
+      "start_s": 16.0,
+      "seconds": 8.0
+    },
+    {
+      "id": "s3",
+      "role": "build",
+      "start_bar": 12,
+      "bars": 8,
+      "energy": 0.6,
+      "shape": "rise",
+      "styles": [
+        "rising synths",
+        "filtered percussion",
+        "pitch sweeps",
+        "reverse swells",
+        "increasing stereo width and reverb"
+      ],
+      "chords": [
+        "Am",
+        "F",
+        "C",
+        "G",
+        "Am",
+        "F",
+        "C",
+        "G"
+      ],
+      "clip_id": null,
+      "clip_offset_beats": 0.0,
+      "melody_phrase": null,
+      "silent": false,
+      "start_s": 24.0,
+      "seconds": 16.0
+    },
+    {
+      "id": "s4",
+      "role": "gap",
+      "start_bar": 20,
+      "bars": 1,
+      "energy": 0.0,
+      "shape": "flat",
+      "styles": [],
+      "chords": [
+        "Am"
+      ],
+      "clip_id": null,
+      "clip_offset_beats": 0.0,
+      "melody_phrase": null,
+      "silent": true,
+      "start_s": 40.0,
+      "seconds": 2.0
+    },
+    {
+      "id": "s5",
+      "role": "drop",
+      "start_bar": 21,
+      "bars": 16,
+      "energy": 1.0,
+      "shape": "flat",
+      "styles": [
+        "huge warm sub-bass",
+        "elastic synth bass",
+        "half-time drums",
+        "shimmering euphoric chords"
+      ],
+      "chords": [
+        "Am",
+        "F",
+        "C",
+        "G",
+        "Am",
+        "F",
+        "C",
+        "G",
+        "Am",
+        "F",
+        "C",
+        "G",
+        "Am",
+        "F",
+        "C",
+        "G"
+      ],
+      "clip_id": null,
+      "clip_offset_beats": 0.0,
+      "melody_phrase": "a",
+      "silent": false,
+      "start_s": 42.0,
+      "seconds": 32.0
+    },
+    {
+      "id": "s6",
+      "role": "breakdown",
+      "start_bar": 37,
+      "bars": 8,
+      "energy": 0.3,
+      "shape": "flat",
+      "styles": [
+        "quiet introspective",
+        "soft chords",
+        "gentle melodic motif"
+      ],
+      "chords": [
+        "Am",
+        "F",
+        "C",
+        "G",
+        "Am",
+        "F",
+        "C",
+        "G"
+      ],
+      "clip_id": null,
+      "clip_offset_beats": 0.0,
+      "melody_phrase": "a",
+      "silent": false,
+      "start_s": 74.0,
+      "seconds": 16.0
+    },
+    {
+      "id": "s7",
+      "role": "speech_bed",
+      "start_bar": 45,
+      "bars": 5,
+      "energy": 0.2,
+      "shape": "flat",
+      "styles": [
+        "very sparse",
+        "soft evolving pad",
+        "lots of negative space",
+        "no drums or minimal filtered percussion"
+      ],
+      "chords": [
+        "Dm",
+        "Am",
+        "Dm",
+        "Am",
+        "Dm"
+      ],
+      "clip_id": "b",
+      "clip_offset_beats": 0.0,
+      "melody_phrase": null,
+      "silent": false,
+      "start_s": 90.0,
+      "seconds": 10.0
+    },
+    {
+      "id": "s8",
+      "role": "build",
+      "start_bar": 50,
+      "bars": 8,
+      "energy": 0.6,
+      "shape": "rise",
+      "styles": [
+        "rising synths",
+        "filtered percussion",
+        "pitch sweeps",
+        "reverse swells",
+        "increasing stereo width and reverb"
+      ],
+      "chords": [
+        "Am",
+        "F",
+        "C",
+        "G",
+        "Am",
+        "F",
+        "C",
+        "G"
+      ],
+      "clip_id": null,
+      "clip_offset_beats": 0.0,
+      "melody_phrase": null,
+      "silent": false,
+      "start_s": 100.0,
+      "seconds": 16.0
+    },
+    {
+      "id": "s9",
+      "role": "gap",
+      "start_bar": 58,
+      "bars": 1,
+      "energy": 0.0,
+      "shape": "flat",
+      "styles": [],
+      "chords": [
+        "Am"
+      ],
+      "clip_id": null,
+      "clip_offset_beats": 0.0,
+      "melody_phrase": null,
+      "silent": true,
+      "start_s": 116.0,
+      "seconds": 2.0
+    },
+    {
+      "id": "s10",
+      "role": "drop",
+      "start_bar": 59,
+      "bars": 16,
+      "energy": 1.0,
+      "shape": "flat",
+      "styles": [
+        "huge warm sub-bass",
+        "elastic synth bass",
+        "half-time drums",
+        "shimmering euphoric chords"
+      ],
+      "chords": [
+        "Am",
+        "F",
+        "C",
+        "G",
+        "Am",
+        "F",
+        "C",
+        "G",
+        "Am",
+        "F",
+        "C",
+        "G",
+        "Am",
+        "F",
+        "C",
+        "G"
+      ],
+      "clip_id": null,
+      "clip_offset_beats": 0.0,
+      "melody_phrase": "b",
+      "silent": false,
+      "start_s": 118.0,
+      "seconds": 32.0
+    },
+    {
+      "id": "s11",
+      "role": "speech_bed",
+      "start_bar": 75,
+      "bars": 3,
+      "energy": 0.2,
+      "shape": "flat",
+      "styles": [
+        "very sparse",
+        "soft evolving pad",
+        "lots of negative space",
+        "no drums or minimal filtered percussion"
+      ],
+      "chords": [
+        "Dm",
+        "Am",
+        "Dm"
+      ],
+      "clip_id": "c",
+      "clip_offset_beats": 0.0,
+      "melody_phrase": null,
+      "silent": false,
+      "start_s": 150.0,
+      "seconds": 6.0
+    },
+    {
+      "id": "s12",
+      "role": "outro",
+      "start_bar": 78,
+      "bars": 8,
+      "energy": 0.1,
+      "shape": "fall",
+      "styles": [
+        "peaceful atmospheric resolution",
+        "fading pads"
+      ],
+      "chords": [
+        "Am",
+        "F",
+        "C",
+        "G",
+        "Am",
+        "F",
+        "C",
+        "G"
+      ],
+      "clip_id": null,
+      "clip_offset_beats": 0.0,
+      "melody_phrase": null,
+      "silent": false,
+      "start_s": 156.0,
+      "seconds": 16.0
+    }
+  ],
+  "total_bars": 86,
+  "total_seconds": 172.0,
+  "notes": null,
+  "warnings": []
+}

@@ -14,16 +14,28 @@ from typing import Any
 
 import numpy as np
 
-from speech2song.arrangement import BEATS_PER_BAR, SONG_TAIL_S, beat_seconds, energy_bounds
+from speech2song.arrangement import (
+    BEATS_PER_BAR,
+    SONG_TAIL_S,
+    beat_seconds,
+    energy_bounds,
+    music_bars,
+    music_total_bars,
+)
 from speech2song.audio.synth import write_wav
 from speech2song.audio.theory import parse_chord
-from speech2song.backends.music_base import Take, next_take_number, remove_stub_takes
+from speech2song.backends.music_base import (
+    MelodyFiles,
+    Take,
+    next_take_number,
+    remove_stub_takes,
+)
 from speech2song.config import SAMPLE_RATE, Preset
 from speech2song.costs import SpendEstimate
 from speech2song.llm.claude import request_digest
 from speech2song.manifest import write_json
 from speech2song.models import Arrangement, TakeMeta
-from speech2song.music_plan import grid_ms
+from speech2song.music_plan import grid_ms, tail_ms
 
 STUB_VERSION = 1  # bump when the sound changes
 BASE_SEED = 1234
@@ -124,7 +136,7 @@ def synthesize(request: dict[str, Any], seed: int, sr: int = SAMPLE_RATE) -> np.
     rng = np.random.default_rng(seed)
     beat = beat_seconds(request["bpm"])
     bar = BEATS_PER_BAR * beat
-    frames = round((request["total_bars"] * bar + SONG_TAIL_S) * sr)
+    frames = round((request["total_bars"] * bar + max(SONG_TAIL_S, request.get("tail_s", 0))) * sr)
     energy = energy_curve(request, frames, sr)
     pads = np.zeros((frames, 2))
     bass = np.zeros(frames)
@@ -183,22 +195,29 @@ class StubBackend:
     paid = False
 
     def request(
-        self, arrangement: Arrangement, preset: Preset, melody_reference: Path | None
+        self, arrangement: Arrangement, preset: Preset, melody: MelodyFiles
     ) -> dict[str, Any]:
+        """Sections in music time: a passage played alone has no music (the take stage
+        splices it open)."""
         bounds = energy_bounds(arrangement.sections)
-        return {
+        starts = music_bars(arrangement)
+        request = {
             "backend": self.name,
             "version": STUB_VERSION,
             "bpm": arrangement.bpm,
             "key": arrangement.key,
-            "total_bars": arrangement.total_bars,
+            "total_bars": music_total_bars(arrangement),
             "grid_ms": grid_ms(arrangement),
             "sections": [
-                {"role": s.role, "start_bar": s.start_bar, "bars": s.bars, "shape": s.shape,
+                {"role": s.role, "start_bar": start, "bars": s.bars, "shape": s.shape,
                  "energy_start": a, "energy_end": b, "chords": s.chords}
-                for s, (a, b) in zip(arrangement.sections, bounds, strict=True)
+                for s, (a, b), start in zip(arrangement.sections, bounds, starts, strict=True)
+                if not s.rest
             ],
         }  # fmt: skip
+        if tail_ms(arrangement):  # music past the last bar, as the paid plan has
+            request["tail_s"] = tail_ms(arrangement) / 1000
+        return request
 
     def estimate(self, request: dict[str, Any], takes: int) -> list[SpendEstimate]:
         return []

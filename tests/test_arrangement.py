@@ -5,6 +5,7 @@ import pytest
 
 from speech2song.arrangement import (
     ClipInfo,
+    arc_schema,
     arrangement_warnings,
     bar_energies,
     bar_seconds,
@@ -14,13 +15,16 @@ from speech2song.arrangement import (
     default_parts,
     energy_bounds,
     group_clips,
+    music_bars,
+    music_total_bars,
+    passages,
     timeline_rows,
     timeline_strip,
     used_slots,
     validate_arrangement,
 )
 from speech2song.config import load_preset
-from speech2song.models import ArcPart, BarChord, ClipMelody, Melody
+from speech2song.models import ArcPart, BarChord, ClipMelody, Melody, MelodyNote
 
 from .conftest import PRESETS_DIR
 
@@ -112,14 +116,19 @@ def test_arrangement_sections_bars_chords_and_melody_plan() -> None:
     assert arrangement.total_bars == bar
     assert arrangement.total_seconds == pytest.approx(bar * 2.0)
     intro, bed = sections[0], sections[1]
-    assert intro.chords == ["Am", "F", "C", "G", "Am", "F", "C", "G"]  # the main phrase
-    assert bed.chords == ["Am", "F", "C", "G"]  # c2 (4 bars) plays its own phrase's chords
-    assert sections[2].chords[:2] == ["Dm", "Am"]  # c1's own phrase
+    assert intro.chords == ["Am", "Am", "F", "F", "Am", "Am", "F", "F"]  # i-VI, 2 bars each
+    # c2 opens its passage: a lead-in bar (holding its first chord), then its own chords
+    assert bed.clip_offset_beats == 4 and bed.bars == 5  # 4 + max(12.6, 12 + 2) = 18 beats
+    assert bed.chords == ["Am", "Am", "F", "C", "G"]
+    assert sections[2].clip_offset_beats == 0 and sections[2].chords[:2] == ["Dm", "Am"]
     drops = [s for s in sections if s.role == "drop"]
     assert [d.melody_phrase for d in drops] == ["c1", "c4"]  # the line heard just before
     assert next(s for s in sections if s.role == "breakdown").melody_phrase == "c1"
     assert all(s.melody_phrase is None for s in sections if s.role in ("intro", "build"))
     assert next(s for s in sections if s.role == "build").shape == "rise"
+    assert arrangement.plan_version == 2 and arrangement.ending == "held_chord"
+    outro = sections[-1]  # it holds steady and comes home: the mix rings that chord out
+    assert outro.role == "outro" and outro.shape == "flat" and outro.chords[-1] == "Am"
     assert validate_arrangement(arrangement, {c.id: c for c in clips}) == []
 
 
@@ -130,10 +139,105 @@ def test_energy_rises_through_the_gap_and_falls_at_the_end() -> None:
                       strict=True))  # fmt: skip
     build = next(s for s in arrangement.sections if s.role == "build")
     assert bounds[build.id] == (0.6, 1.0)  # rises into the drop after the gap
-    outro = arrangement.sections[-1]
-    assert bounds[outro.id] == (0.1, 0.0)
+    fade = build_arrangement(default_parts(PRESET, clips), clips, _melody(clips), PRESET,
+                             ending="fade")  # fmt: skip
+    bounds = dict(zip([s.id for s in fade.sections], energy_bounds(fade.sections), strict=True))
+    outro = fade.sections[-1]
+    assert outro.role == "outro" and bounds[outro.id] == (0.1, 0.0)
     energies = bar_energies(arrangement)
     assert len(energies) == arrangement.total_bars
+
+
+def _note(midi: int, start: float, beats: float = 1.0) -> MelodyNote:
+    return MelodyNote(start_beat=start, beats=beats, midi=midi, pitch=midi, speech_pitch=midi,
+                      start_s=0, end_s=0, velocity=80)  # fmt: skip
+
+
+def _sung(melody: Melody) -> Melody:
+    """Every phrase gets a few notes (so it can condition the music)."""
+    clips = [p.model_copy(update={"notes": [_note(69, 0), _note(72, 1), _note(76, 2)]})
+             for p in melody.clips]  # fmt: skip
+    return melody.model_copy(update={"clips": clips})
+
+
+def test_alone_passages_stop_the_music_and_leads_in_settle_it() -> None:
+    clips = [_clip("a", 5), _clip("b", 4), _clip("c", 3, "outro")]
+    parts = [ArcPart(role="intro", bars=4), ArcPart(role="speech_bed", clips=["a"]),
+             ArcPart(role="build", bars=8), ArcPart(role="speech_bed", clips=["b"],
+                                                    treatment="alone"),
+             ArcPart(role="drop", bars=16), ArcPart(role="speech_bed", clips=["c"],
+                                                    treatment="alone")]  # fmt: skip
+    arrangement = build_arrangement(parts, clips, _melody(clips), PRESET)
+    roles = [(s.role, s.clip_id, s.treatment) for s in arrangement.sections]
+    assert roles == [
+        ("intro", None, "under"),
+        ("speech_bed", "a", "under"),
+        ("build", None, "under"),
+        ("speech_bed", "b", "alone"),
+        ("drop", None, "under"),
+        ("speech_bed", "c", "alone"),
+    ]
+    assert arrangement.sections[4].chords[-1] == "Am"  # the drop comes home before the last line
+    a, b, c = (s for s in arrangement.sections if s.clip_id)
+    assert a.clip_offset_beats == 4 and b.clip_offset_beats == 2  # the stop sinks in first
+    assert b.bars == bed_bars(clips[1], BPM, 2, lead_in_beats=2) == 3  # 2 + 8 + 2 = 12 beats
+    assert b.energy == 0 and b.styles == [] and b.rest and not a.rest
+    build = next(s for s in arrangement.sections if s.role == "build")
+    assert energy_bounds(arrangement.sections)[2] == (0.6, 1.0)  # rises through the stop
+    assert build.bars == 8
+    # Music time leaves the alone passages out: the build runs straight into the drop.
+    starts = music_bars(arrangement)
+    assert starts[4] == starts[2] + 8 and starts[3] == starts[4]
+    assert music_total_bars(arrangement) == arrangement.total_bars - b.bars - c.bars
+    assert [[s.clip_id for s in run] for run in passages(arrangement)] == [["a"], ["b"], ["c"]]
+    rows = timeline_rows(arrangement, {"b": "the key line"})
+    assert rows[3][-1] == "b  the key line  (alone)"
+
+
+def test_sections_develop_and_their_chords_vary() -> None:
+    clips = [_clip("a", 4), _clip("b", 4), _clip("c", 4)]
+    arrangement = build_arrangement(default_parts(PRESET, clips), clips, _melody(clips), PRESET)
+    drops = [s for s in arrangement.sections if s.role == "drop"]
+    builds = [s for s in arrangement.sections if s.role == "build"]
+    assert "restrained first drop" in drops[0].styles
+    assert "final drop and climax of the song" in drops[1].styles
+    assert "restrained first drop" not in drops[1].styles
+    assert "the biggest build of the song" in builds[1].styles
+    assert "the biggest build of the song" not in builds[0].styles
+    assert drops[0].chords[:4] != drops[1].chords[:4]  # the second drop is not a repeat
+    outro = next(s for s in arrangement.sections if s.role == "outro")
+    assert outro.chords[-1] == "Am"  # comes home
+    claude = [
+        ArcPart(role="intro", bars=4, styles=["a lone music box"]),
+        ArcPart(role="speech_bed", clips=["a", "b", "c"], styles=["warm tape hiss"]),
+    ]
+    parts = build_arrangement(claude, clips, _melody(clips), PRESET).sections
+    assert parts[0].styles[-1] == "a lone music box"  # Claude's words come last
+    assert all(s.styles[-1] == "warm tape hiss" for s in parts if s.clip_id)
+
+
+def test_endings() -> None:
+    clips = [_clip("a", 4), _clip("b", 4, "outro")]
+    parts = [ArcPart(role="intro", bars=4), ArcPart(role="speech_bed", clips=["a", "b"])]
+    held = build_arrangement(parts, clips, _melody(clips), PRESET)
+    last = held.sections[-1]  # the closing line's bed: it comes home to the tonic
+    assert held.ending == "held_chord" and last.clip_id == "b" and last.chords[-1] == "Am"
+    stop = build_arrangement(parts, clips, _melody(clips), PRESET, ending="stop")
+    assert stop.ending == "stop" and stop.sections[-1].shape == "flat"
+    fade = build_arrangement(parts, clips, _melody(clips), PRESET, ending="fade")
+    assert fade.ending == "fade" and fade.sections[-1].role == "speech_bed"
+    assert fade.sections[-1].shape == "fall"  # the last music fades under the last line
+
+
+def test_melody_references_answer_each_passage() -> None:
+    clips = [_clip("a", 4, "hook"), _clip("b", 4), _clip("c", 4)]
+    melody = _sung(_melody(clips, main="b"))
+    arrangement = build_arrangement(default_parts(PRESET, clips), clips, melody, PRESET)
+    refs = [(s.role, s.melody_ref) for s in arrangement.sections if s.melody_ref]
+    # the opening carries the main phrase; the music after a passage answers its last quote
+    assert refs == [("intro", "b"), ("build", "a"), ("build", "b"), ("outro", "c")]
+    plain = build_arrangement(default_parts(PRESET, clips), clips, _melody(clips), PRESET)
+    assert all(s.melody_ref is None for s in plain.sections)  # phrases without notes
 
 
 def test_claude_parts_are_checked() -> None:
@@ -153,6 +257,29 @@ def test_claude_parts_are_checked() -> None:
     assert "part 5: a speech_bed part needs at least one clip" in text
     assert "in this order: a, b" in text
     assert check_parts([], clips, PRESET) == ["the arc has no parts"]
+
+
+def test_treatments_and_styles_in_claude_parts_are_checked() -> None:
+    clips = [_clip("a", 4), _clip("b", 4), _clip("c", 4), _clip("d", 4)]
+    alone = [ArcPart(role="speech_bed", clips=["a", "b"], treatment="alone"),
+             ArcPart(role="drop", bars=8, styles=["soaring lead", "angelic choir"]),
+             ArcPart(role="speech_bed", clips=["c"], treatment="alone"),
+             ArcPart(role="speech_bed", clips=["d"], treatment="alone",
+                     styles=["one", "two", "three", "four", "five"])]  # fmt: skip
+    text = "\n".join(check_parts(alone, clips, PRESET))
+    assert "part 1: a passage played alone holds one quote (it has a, b)" in text
+    assert "3 passages are played alone; use at most 2" in text
+    assert "part 2: the style 'angelic choir' mentions 'choir'" in text
+    assert "part 4: 5 styles; give at most 4" in text
+    parted = [
+        ClipInfo("q-1", "build", "x", 4.3, 4.0, "q", False),
+        ClipInfo("q-2", "build", "y", 4.3, 4.0, "q", True),
+    ]
+    whole = [ArcPart(role="speech_bed", clips=["q-1", "q-2"], treatment="alone")]
+    assert check_parts(whole, parted, PRESET) == []  # one quote in parts may play alone
+    schema = arc_schema(["intro", "speech_bed"], ["a"])
+    assert schema["required"] == ["parts", "ending", "notes"]
+    assert schema["properties"]["parts"]["items"]["required"][-2:] == ["treatment", "styles"]
 
 
 def test_hand_edited_arrangements_are_validated() -> None:

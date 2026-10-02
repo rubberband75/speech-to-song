@@ -430,7 +430,26 @@ class Melody(BaseModel):
     clips: list[ClipMelody]  # in playback order
 
 
+class QuoteMelodies(BaseModel):
+    """04_quote_melodies.json: where each clip's rendered melody sits in
+    04_quote_melodies.wav (looped to at least a few seconds, with its chords). M7 plans
+    condition the music around a quote on it."""
+
+    schema_version: Literal[1] = 1
+    file: str
+    sample_rate: int
+    instrument: str
+    clips: dict[str, tuple[int, int]]  # clip ID -> (start ms, end ms)
+
+
 # --- 05_arc.json (optional: Claude refines the arc) -------------------------------------
+
+# How the music meets a speech passage: "under" plays a quiet bed beneath it, "alone"
+# stops the music for it (the speaker alone, the music returning on the next downbeat).
+Treatment = Literal["under", "alone"]
+# How the music ends: its last chord held and ringing away, fading out by itself, or a
+# crisp stop (see the mix).
+Ending = Literal["held_chord", "fade", "stop"]
 
 
 class ArcPart(BaseModel):
@@ -440,6 +459,8 @@ class ArcPart(BaseModel):
     role: str
     bars: int = 0  # ignored for speech_bed parts (beds are fitted to their clips)
     clips: list[str] = []
+    treatment: Treatment = "under"  # speech_bed parts only
+    styles: list[str] = []  # a few extra style words for this part (the song's development)
 
 
 class ArcPlan(BaseModel):
@@ -447,6 +468,7 @@ class ArcPlan(BaseModel):
 
     parts: list[ArcPart]
     notes: str = ""
+    ending: Ending | None = None  # None: the preset's
 
 
 class ArcAttempt(BaseModel):
@@ -488,9 +510,17 @@ class Section(BaseModel):
     clip_id: str | None = None  # the clip this speech_bed carries
     clip_offset_beats: float = 0.0  # where the clip starts, from the section start
     melody_phrase: str | None = None  # clip whose melody the melody layer replays here
-    silent: bool = False  # the mix mutes the music here (a gap); nothing is generated for it
+    silent: bool = False  # a gap: nothing is generated for it; the mix lifts the music on
+    treatment: Treatment = "under"  # a speech bed: music beneath it, or none ("alone")
+    melody_ref: str | None = None  # clip whose rendered melody conditions this music (M7)
     start_s: float = 0.0  # informational: start_bar at the arrangement's tempo
     seconds: float = 0.0
+
+    @property
+    def rest(self) -> bool:
+        """No music at all here: a speech bed played alone. Nothing is generated for it
+        and the take is spliced open to fit it (unlike a gap, where the music runs on)."""
+        return self.treatment == "alone"
 
 
 class Arrangement(BaseModel):
@@ -504,6 +534,11 @@ class Arrangement(BaseModel):
     total_seconds: float
     notes: str | None = None
     warnings: list[str] = []
+    # 1: the M5 composition plan (arrangements written before M7 keep exactly the plan
+    # their takes were made with); 2: M7 (chords, development, per-section negatives,
+    # an ending of its own, melody conditioning).
+    plan_version: Literal[1, 2] = 1
+    ending: Ending | None = None  # None: as M5 plans ended (an outro fading out)
 
 
 # --- 06_music ------------------------------------------------------------------------------
@@ -591,7 +626,7 @@ class MixReport(BaseModel):
     speech_lufs: float | None  # dry speech, before its gain
     speech_gain_db: float
     melody_gain_db: float | None
-    duck_db: float
+    duck_db: float  # the furthest the music comes down under a passage
     target_lufs: float
     master_gain_db: float
     integrated_lufs: float
@@ -599,6 +634,10 @@ class MixReport(BaseModel):
     section_levels: list[SectionLevel] = []
     lifted: list[str] = []  # silent sections (gaps), turned into lifts into the next section
     ring_out_at_s: float | None = None  # where the last chord's reverb ring-out begins
+    ending: str | None = None  # the arrangement's ending (None: an M5 arrangement)
+    ended: Literal["ring", "natural"] | None = None  # rung out, or left to die away
+    passages: list[dict[str, Any]] = []  # the music's level under each speech passage
+    alone: list[str] = []  # speech beds played without music
     late_entries: list[dict[str, Any]] = []  # sections pulled onto their downbeat
     speech_margin_db: float | None = None
     guarded_words: list[dict[str, Any]] = []  # words that were less than the margin clear

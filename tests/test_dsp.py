@@ -11,7 +11,6 @@ from speech2song.audio.dsp import (
     master,
     oversampled_peaks,
     quietest_point,
-    quote_duck,
     true_peak_db,
 )
 
@@ -87,35 +86,6 @@ def test_zero_fade_and_short_blocks() -> None:
 
 
 # --- Ducking -----------------------------------------------------------------------------
-
-
-def test_a_quote_ducks_once_easing_down_before_and_up_after() -> None:
-    sr = 1000
-    gain = quote_duck([(3000, 5000)], 10000, sr, depth_db=-9, lead_s=0.6, release_s=1.5)
-    db = 20 * np.log10(gain)
-    assert db[2399] > -0.01  # nothing yet, 0.6 s before the first word
-    assert db[2700] == pytest.approx(-4.5, abs=0.3)  # half-way down at the middle of the ramp
-    assert db[3000] < -8.9 and db[4999] == pytest.approx(-9, abs=0.01)  # down for the quote
-    assert db[5750] == pytest.approx(-4.5, abs=0.3)  # half-way back up
-    assert db[6500] > -0.05 and db[-1] == 0  # recovered 1.5 s after the last word
-    assert np.all(np.diff(db[2400:3000]) <= 1e-6) and np.all(np.diff(db[5000:6500]) >= -1e-6)
-
-
-def test_overlapping_quotes_take_the_deeper_duck_and_edges_are_safe() -> None:
-    sr = 1000
-    gain = quote_duck([(0, 1000), (1500, 2500)], 3000, sr, depth_db=-9, lead_s=0.6,
-                      release_s=1.5)  # fmt: skip
-    db = 20 * np.log10(gain)
-    assert db[500] == pytest.approx(-9, abs=0.01)  # a quote at the very start
-    assert db[1250] < -6  # 500 ms of pause between the quotes: not back up
-    assert db.min() >= -9 - 1e-6  # never deeper than the depth
-    assert quote_duck([], 100, sr, depth_db=-9, lead_s=0.6, release_s=1.5).min() == 1.0
-    assert quote_duck([(50, 50)], 100, sr, depth_db=-9, lead_s=0.6, release_s=1.5).min() == 1.0
-    flat = quote_duck([(10, 90)], 100, sr, depth_db=-9, lead_s=0.0, release_s=0.0)
-    assert flat[9] == 1.0 and flat[50] == pytest.approx(10 ** (-9 / 20), rel=1e-4)
-
-
-# --- Loudness, true peak, limiting --------------------------------------------------------
 
 
 def test_true_peak_finds_inter_sample_overs() -> None:
@@ -239,15 +209,3 @@ def test_word_spans_follow_the_clips() -> None:
         ("hello", 1050, 1000 + round((1.0 + WORD_TAIL_S) * 100)),
         ("end", 1190, 1200),  # kept inside the clip
     ]  # "If", the next sentence's first word, only grazes the clip's end cut  # fmt: skip
-
-
-def test_quote_regions_run_from_the_first_word_to_the_last() -> None:
-    from speech2song.audio.mixing import WordSpan, quote_regions
-    from speech2song.models import PlacedClip
-
-    placed = [PlacedClip(clip_id="c1", section_id="s2", file="x.wav", start_sample=1000,
-                         end_sample=2000, start_s=0.0),
-              PlacedClip(clip_id="c2", section_id="s5", file="y.wav", start_sample=5000,
-                         end_sample=6000, start_s=0.0)]  # fmt: skip
-    words = [WordSpan("c1", "s2", "a", 1100, 1300), WordSpan("c1", "s2", "b", 1500, 1800)]
-    assert quote_regions(placed, words) == [(1100, 1800), (5000, 6000)]  # c2: no words

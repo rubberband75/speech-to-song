@@ -15,11 +15,18 @@ from typing import ClassVar
 import numpy as np
 import soundfile as sf
 
-from speech2song.arrangement import SONG_TAIL_S, bar_seconds, energy_bounds
+from speech2song.arrangement import (
+    SONG_TAIL_S,
+    bar_seconds,
+    energy_bounds,
+    music_bars,
+    music_total_bars,
+)
 from speech2song.audio.analysis import analyze_take
 from speech2song.audio.io import extract_audio, probe
 from speech2song.audio.synth import write_wav
 from speech2song.backends.music_base import (
+    MelodyFiles,
     MusicBackend,
     backend_name,
     make_backend,
@@ -31,16 +38,18 @@ from speech2song.costs import CostLog, SpendEstimate, unit_usd
 from speech2song.errors import S2SError, StageError
 from speech2song.llm.claude import request_digest
 from speech2song.manifest import write_json
-from speech2song.models import Arrangement, TakeAnalysis, TakeChoice, TakeMeta
-from speech2song.music_plan import grid_ms, plan_minutes
+from speech2song.models import Arrangement, QuoteMelodies, TakeAnalysis, TakeChoice, TakeMeta
+from speech2song.music_plan import grid_ms, plan_minutes, tail_ms
 from speech2song.pipeline import Context, Stage, StagePlan, StageResult
 from speech2song.stages.arrange import ARRANGEMENT, usable_arrangement
-from speech2song.stages.melody import REFERENCE
+from speech2song.stages.melody import QUOTE_INDEX, QUOTE_MELODIES, REFERENCE
 
 MUSIC_DIR = "06_music"
 SELECTED = "06_music/selected.wav"
 ANALYSIS = "06_music/analysis.json"
 END_FADE_S = 0.05  # when a take is longer than the song and gets cut
+STOP_FADE_S = 0.005  # where the music stops for a passage played alone (the mix rings it)
+RETURN_FADE_S = 0.003  # where it comes back, on the downbeat
 
 
 def take_meta_path(number: int) -> str:
@@ -52,6 +61,16 @@ def _arrangement(ctx: Context) -> Arrangement | None:
     if not path.exists():
         return None
     return Arrangement.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def melody_files(ctx: Context) -> MelodyFiles:
+    """The melody renders that exist in this run (runs from before M7 have no quotes)."""
+    reference, quotes, index = (ctx.run.path(p) for p in (REFERENCE, QUOTE_MELODIES, QUOTE_INDEX))
+    return MelodyFiles(
+        reference=reference if reference.exists() else None,
+        quotes=quotes if quotes.exists() and index.exists() else None,
+        index=QuoteMelodies.model_validate_json(index.read_text()) if index.exists() else None,
+    )
 
 
 class GenerateStage(Stage):
@@ -70,9 +89,7 @@ class GenerateStage(Stage):
         if arrangement is None:
             return None
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
-        reference = ctx.run.path(REFERENCE)
-        return self._backend(ctx).request(arrangement, preset,
-                                          reference if reference.exists() else None)  # fmt: skip
+        return self._backend(ctx).request(arrangement, preset, melody_files(ctx))
 
     def plan(self, ctx: Context) -> StagePlan:
         takes = ctx.config.music_takes
@@ -130,6 +147,57 @@ def conform(audio: np.ndarray, frames: int, sample_rate: int) -> np.ndarray:
     return np.concatenate([audio.astype(np.float32), pad])
 
 
+def cut_at(music: np.ndarray, end: int, sr: int) -> np.ndarray:
+    """The music up to sample `end`, with a 5 ms fade so the cut never clicks (the mix
+    rings out what was sounding there)."""
+    out = np.array(music[:end], dtype=np.float32)
+    fade = min(len(out), round(STOP_FADE_S * sr))
+    if fade and len(music) > end:
+        out[len(out) - fade :] *= np.linspace(1, 0, fade, dtype=np.float32)[:, None]
+    return out
+
+
+def splice_rests(music: np.ndarray, arrangement: Arrangement, frames: int,
+                 sr: int) -> np.ndarray:  # fmt: skip
+    """The take, generated in music time, laid onto the song: each passage played alone
+    opens a silence in it, so the music on either side stays exactly as generated (a
+    build still runs into its drop as the model composed it). Music generated past the
+    song's last bar (`tail_ms`) is cut away on that bar line. Stereo, `frames` long."""
+    bar = bar_seconds(arrangement.bpm) * sr
+    if tail_ms(arrangement):  # the music generated past the last bar is cut away
+        music = cut_at(music, round(music_total_bars(arrangement) * bar), sr)
+    if not any(section.rest for section in arrangement.sections):
+        return conform(music, frames, sr)
+    music = music if music.shape[1] == 2 else np.repeat(music[:, :1], 2, axis=1)
+    starts = music_bars(arrangement)
+    out = np.zeros((frames, 2), dtype=np.float32)
+    runs: list[list[int]] = []  # neighbouring sections with music, by index
+    for i, section in enumerate(arrangement.sections):
+        if section.rest:
+            continue
+        if runs and runs[-1][-1] == i - 1:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    sections = arrangement.sections
+    for run in runs:
+        first, last = sections[run[0]], sections[run[-1]]
+        song_a = round(first.start_bar * bar)
+        rest_after = run[-1] + 1 < len(sections)
+        song_b = round((last.start_bar + last.bars) * bar) if rest_after else frames
+        source = round(starts[run[0]] * bar)
+        block = np.array(music[source : source + song_b - song_a], dtype=np.float32)
+        if run[0] > 0:  # back after a silence, on the downbeat
+            fade = min(len(block), round(RETURN_FADE_S * sr))
+            block[:fade] *= np.linspace(0, 1, fade, dtype=np.float32)[:, None]
+        cut = rest_after or len(music) - source > song_b - song_a
+        fade = min(len(block), round((STOP_FADE_S if rest_after else END_FADE_S) * sr))
+        if cut and fade:
+            block[len(block) - fade :] *= np.linspace(1, 0, fade, dtype=np.float32)[:, None]
+        out[song_a : song_a + len(block)] = block
+    return out
+
+
 def song_frames(arrangement: Arrangement, sample_rate: int = SAMPLE_RATE) -> int:
     return round((arrangement.total_seconds + SONG_TAIL_S) * sample_rate)
 
@@ -149,20 +217,22 @@ def read_take(path: Path, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
 
 
 def analysis_targets(arrangement: Arrangement) -> dict:
-    """What a take is measured against (also the take stage's cache key). Silent
-    sections are left out: the mix mutes them, whatever the music does there."""
+    """What a take is measured against (also the take stage's cache key), in music time.
+    Gaps are left out (the mix lifts them, whatever the music does there), and so are
+    passages played alone (no music is generated for them)."""
     bar = bar_seconds(arrangement.bpm)
-    measured = [(s, (a + b) / 2) for s, (a, b)
-                in zip(arrangement.sections, energy_bounds(arrangement.sections), strict=True)
-                if not s.silent]  # fmt: skip
+    measured = [(s, (a + b) / 2, first) for s, (a, b), first
+                in zip(arrangement.sections, energy_bounds(arrangement.sections),
+                       music_bars(arrangement), strict=True)
+                if not s.silent and not s.rest]  # fmt: skip
     return {
         "bpm": arrangement.bpm,
         "key": arrangement.key,
-        "sections": [s.id for s, _ in measured],
-        "spans_s": [[round(s.start_bar * bar, 4), round((s.start_bar + s.bars) * bar, 4)]
-                    for s, _ in measured],
-        "energies": [round(energy, 4) for _, energy in measured],
-        "expected_s": arrangement.total_seconds,
+        "sections": [s.id for s, _, _ in measured],
+        "spans_s": [[round(first * bar, 4), round((first + s.bars) * bar, 4)]
+                    for s, _, first in measured],
+        "energies": [round(energy, 4) for _, energy, _ in measured],
+        "expected_s": round(music_total_bars(arrangement) * bar + tail_ms(arrangement) / 1000, 4),
     }  # fmt: skip
 
 
@@ -181,8 +251,8 @@ class TakeStage(Stage):
     current request) and conforms it to the song. Free."""
 
     name: ClassVar[str] = "take"
-    version: ClassVar[int] = 3  # 3: takes of older requests that still fit
-    analysis_version: ClassVar[int] = 4  # 4: silent sections left out, mean energies
+    version: ClassVar[int] = 4  # 3: takes of older requests that still fit; 4: rests spliced
+    analysis_version: ClassVar[int] = 5  # 4: silent sections left out; 5: music time
 
     def plan(self, ctx: Context) -> StagePlan:
         inputs: dict[str, Path] = {}
@@ -255,9 +325,14 @@ class TakeStage(Stage):
         if abs(len(audio) - expected) > SAMPLE_RATE * 0.5:
             ctx.say(
                 f"[yellow]  take {number} is {len(audio) / SAMPLE_RATE:.1f} s; the "
-                f"arrangement is {expected / SAMPLE_RATE:.1f} s (padded or cut)[/]"
+                f"arrangement's music is {expected / SAMPLE_RATE:.1f} s (padded or cut)[/]"
             )
-        write_wav(ctx.run.path(SELECTED), conform(audio, frames, SAMPLE_RATE), SAMPLE_RATE)
+        arrangement = usable_arrangement(ctx)
+        rests = [s.id for s in arrangement.sections if s.rest]
+        if rests:
+            ctx.say(f"  silence spliced in for the passages played alone ({', '.join(rests)})")
+        write_wav(ctx.run.path(SELECTED), splice_rests(audio, arrangement, frames, SAMPLE_RATE),
+                  SAMPLE_RATE)  # fmt: skip
         ctx.say(f"  using take {number} ({reason})")
         return StageResult(summary={"take": number, "reason": reason,
                                     "seconds": round(frames / SAMPLE_RATE, 3)})  # fmt: skip

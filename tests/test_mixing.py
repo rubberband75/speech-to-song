@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from speech2song.arrangement import ClipInfo, build_arrangement, default_parts
+from speech2song.audio.dsp import loudness_lufs
 from speech2song.audio.mixing import (
     ENERGY_RAMP_S,
     TAIL_MAX_S,
@@ -68,11 +69,12 @@ def test_clips_land_on_their_section_starts() -> None:
     placed = _placed(arrangement, audio)
     beds = [s for s in arrangement.sections if s.clip_id]
     assert [p.clip_id for p in placed] == ["a", "b", "c"]
-    for p, bed in zip(placed, beds, strict=True):
-        assert p.start_sample == round(bed.start_bar * 2.0 * SR)
+    for p, bed in zip(placed, beds, strict=True):  # after the passage's lead-in bar
+        assert p.start_sample == round((bed.start_bar * 2.0 + bed.clip_offset_beats / 2) * SR)
         assert p.end_sample - p.start_sample == len(audio[p.clip_id])
+    assert beds[0].clip_offset_beats == 4
     shifted = arrangement.model_copy(deep=True)
-    next(s for s in shifted.sections if s.clip_id == "a").clip_offset_beats = 1.0
+    next(s for s in shifted.sections if s.clip_id == "a").clip_offset_beats = 5.0
     assert _placed(shifted, audio)[0].start_sample == placed[0].start_sample + SR // 2
 
 
@@ -123,8 +125,8 @@ def test_melody_layer_modes() -> None:
     _, under = melody_notes(arrangement, melody, "all")
     bed = next(s for s in arrangement.sections if s.clip_id == "a")
     first = [n for n in under if bed.start_bar * 2.0 <= n.start_s < (bed.start_bar + bed.bars) * 2]
-    assert len(first) == 3  # played once under its clip
-    assert first[0].start_s == pytest.approx(bed.start_bar * 2.0)
+    assert len(first) == 3  # played once under its clip, from where the clip starts
+    assert first[0].start_s == pytest.approx(bed.start_bar * 2.0 + bed.clip_offset_beats / 2)
 
 
 # --- The music's shaping ------------------------------------------------------------------
@@ -309,3 +311,172 @@ def test_soft_openings_and_disabled_fixes_are_left_alone() -> None:
     start = spans[drop.id][0]
     soft[start : start + 2 * sr] *= 0.3  # one bar 10 dB down: a soft start, not a late one
     assert late_entries(soft, arrangement, sr, max_bars=4) == []
+
+
+# --- M7: passages, stops, endings --------------------------------------------------------------
+
+
+def _bed_song(treatment: str = "under") -> tuple[Arrangement, list]:
+    """intro 4 bars, then a passage of two quotes (a lead-in bar, then the words), then a
+    build: 120 BPM, so a bar is 2 s."""
+    from speech2song.audio.mixing import WordSpan
+
+    clips = [ClipInfo("a", "hook", "a", 3.3, 3.0), ClipInfo("b", "build", "b", 3.3, 3.0)]
+    melody = Melody(key="A minor", tonic=9, mode="minor", key_source="detected",
+                    tuning_offset=0, bpm=BPM, tempo_cost=0, grid="1/8", snap_strength=0.8,
+                    octave_shift=0, loop_phrase_count=3, instrument="soft_piano",
+                    main_clip="a", clips=[_phrase(c.id) for c in clips])  # fmt: skip
+    from speech2song.models import ArcPart
+
+    parts = [ArcPart(role="intro", bars=4),
+             ArcPart(role="speech_bed", clips=["a", "b"] if treatment == "under" else ["a"],
+                     treatment=treatment),
+             ArcPart(role="build", bars=4)]  # fmt: skip
+    if treatment != "under":
+        parts.insert(2, ArcPart(role="speech_bed", clips=["b"]))
+    arrangement = build_arrangement(parts, clips, melody, PRESET, ending="fade")
+    words = []
+    for section in arrangement.sections:
+        if section.clip_id:
+            start = round((section.start_bar * 2 + section.clip_offset_beats / 2) * SR)
+            words += [WordSpan(section.clip_id, section.id, "w", start + i * SR // 2,
+                               start + i * SR // 2 + SR // 3) for i in range(5)]  # fmt: skip
+    return arrangement, words
+
+
+def _tone(frames: int, level: float, sr: int = SR, freq: float = 440.0) -> np.ndarray:
+    t = np.arange(frames) / sr
+    tone = level * np.sin(2 * np.pi * freq * t) + level * 0.5 * np.sin(2 * np.pi * 1.5 * freq * t)
+    return np.stack([tone, tone], axis=1).astype(np.float32)
+
+
+def test_a_passage_is_set_once_at_its_bar_lines_and_only_as_far_as_needed() -> None:
+    from speech2song.audio.mixing import PASSAGE_RAMP_S, passage_curve, passage_levels
+
+    arrangement, words = _bed_song()
+    spans = section_spans(arrangement, SR)
+    frames = spans[-1][2]
+    speech = np.zeros((frames, 2), dtype=np.float32)
+    for w in words:
+        speech[w.start : w.end] = _tone(w.end - w.start, 0.3, freq=300.0)
+    loud = _tone(frames, 0.1, freq=500.0)  # about 10 dB under the words
+    levels = passage_levels(loud, speech, arrangement, words, SR, margin_db=14, max_cut_db=-9)
+    assert len(levels) == 1 and levels[0].sections == ["s2", "s3"]  # one passage, two quotes
+    level = levels[0]
+    assert level.start == spans[1][1] and level.end == spans[2][2]  # bar line to bar line
+    assert -6 < level.gain_db < -2 and level.gain_db == pytest.approx(
+        level.margin_db - 14, abs=0.01
+    )
+    quiet = loud * np.float32(0.1)  # a bed the model made quiet: left alone
+    assert passage_levels(quiet, speech, arrangement, words, SR, margin_db=14,
+                          max_cut_db=-9)[0].gain_db == 0  # fmt: skip
+    curve = passage_curve(levels, frames, SR)
+    db = 20 * np.log10(curve)
+    first, last = words[0].start, max(w.end for w in words)
+    assert db[: level.start].max() == 0  # nothing moves before the passage's bar line
+    assert db[level.start + round(PASSAGE_RAMP_S * SR) : first].max() == pytest.approx(
+        level.gain_db, abs=1e-3
+    )  # settled during the lead-in bar, before the first word
+    assert np.ptp(db[first:last]) < 1e-3  # steady under the whole passage: no pumping
+    assert db[level.end :].max() == 0 and db[last + 1000] == pytest.approx(level.gain_db, abs=1e-3)
+
+
+def test_a_passage_without_a_lead_in_settles_just_before_its_first_word() -> None:
+    from speech2song.audio.mixing import PassageLevel, passage_curve
+
+    level = PassageLevel(["s2"], 1000, 9000, (1200, 8000), 5.0, -9.0)
+    db = 20 * np.log10(passage_curve([level], 10000, 1000))  # 1 kHz: 0.5 s ramps = 500
+    assert db[1100] == pytest.approx(-9, abs=1e-3)  # in place 0.1 s before the first word
+    assert db[600] == 0  # the ramp began in the section before (an M5 bed has no lead-in)
+    assert db[8100] == pytest.approx(-9, abs=1e-3) and db[8700] > -9 and db[9000] == 0
+
+
+def test_a_passage_played_alone_stops_the_music_and_swells_it_back() -> None:
+    from speech2song.audio.mixing import alone_break
+
+    sr = 8000
+    arrangement, _ = _bed_song("alone")
+    spans = section_spans(arrangement, sr)
+    alone = next((a, b) for s, a, b in spans if s.rest)
+    frames = spans[-1][2]
+    music = _tone(frames, 0.2, sr)
+    music[alone[0] : alone[1]] = 0  # the take stage spliced it open
+    last_word = alone[1] - sr  # a second before the next downbeat
+    out = alone_break(music, alone[0], alone[1], last_word, sr, ring_s=2.5, swell=0.8)
+    np.testing.assert_array_equal(out[: alone[0]], music[: alone[0]])  # untouched before
+    np.testing.assert_array_equal(out[alone[1] :], music[alone[1] :])  # and after
+    ring = [_rms(out[alone[0] + i * sr // 4 : alone[0] + (i + 1) * sr // 4]) for i in range(10)]
+    assert ring[0] > 0.02 and ring[0] > ring[3] > ring[6] and ring[9] < ring[0] / 10  # dies away
+    assert _rms(out[alone[0] + round(2.6 * sr) : last_word]) < 1e-4  # the speaker alone
+    swell = out[last_word : alone[1]]
+    assert _rms(swell[-sr // 4 :]) > 4 * _rms(swell[: sr // 4])  # grows into the downbeat
+    assert abs(swell[-1]).max() < 0.05  # and never clicks
+    crowded = alone_break(music, alone[0], alone[1], alone[1] - sr // 10, sr, ring_s=2.5,
+                          swell=0.8)  # fmt: skip
+    assert _rms(crowded[alone[1] - sr // 2 : alone[1]]) < 1e-4  # no room after the words
+
+
+def test_a_natural_ending_is_left_alone_and_an_abrupt_one_rings() -> None:
+    from speech2song.audio.mixing import ends_abruptly, settled_at
+
+    sr = 8000
+    held = _fading_music(sr, seconds=12.0, hold=99.0)  # still sounding at the end
+    assert ends_abruptly(held, sr, 4 * sr, len(held))
+    decayed = _fading_music(sr, seconds=12.0, hold=8.0)  # -30 dB a second from 8 s
+    assert not ends_abruptly(decayed, sr, 4 * sr, len(decayed))
+    assert 9 * sr < settled_at(decayed, sr, 4 * sr) < 10.5 * sr  # 50 dB down
+    assert not ends_abruptly(np.zeros((sr, 2), dtype=np.float32), sr, 0, sr)
+    faded = decayed.copy()
+    faded[10 * sr :] = 1e-4  # an ending section that is quiet throughout: not a "loud" frame
+    assert settled_at(faded, sr, 10 * sr) == 10 * sr
+
+
+def test_endings_ring_out_of_the_last_music_that_is_heard() -> None:
+    from speech2song.audio.mixing import live_start
+
+    sr = 8000
+    music = np.concatenate(
+        [_tone(4 * sr, 0.2, sr), _tone(4 * sr, 0.2, sr), _tone(4 * sr, 0.0005, sr)]
+    )  # a closing section the model left dead
+    spans = [(0, 4 * sr), (4 * sr, 8 * sr), (8 * sr, 12 * sr)]
+    reference = loudness_lufs(music, sr)
+    assert live_start(music, spans, sr, reference) == 4 * sr  # not the dead last section
+    alive = np.concatenate([music[: 8 * sr], _tone(4 * sr, 0.05, sr)])  # quieter, but heard
+    assert live_start(alive, spans, sr, loudness_lufs(alive, sr)) == 8 * sr
+    assert live_start(music, [], sr, reference) == 0
+
+
+def test_the_take_is_spliced_open_for_passages_played_alone() -> None:
+    from speech2song.arrangement import music_bars
+    from speech2song.stages.generate_music import conform, splice_rests
+
+    sr = 8000
+    arrangement, _ = _bed_song("alone")
+    bar = 2 * sr
+    music_frames = sum(s.bars for s in arrangement.sections if not s.rest) * bar
+    music = np.stack([np.arange(music_frames)] * 2, axis=1).astype(np.float32) + 1  # traceable
+    frames = (arrangement.total_bars + 1) * bar
+    song = splice_rests(music, arrangement, frames, sr)
+    starts = music_bars(arrangement)
+    for section, first in zip(arrangement.sections, starts, strict=True):
+        a, b = section.start_bar * bar, (section.start_bar + section.bars) * bar
+        if section.rest:
+            assert not song[a:b].any()
+        else:  # the music of this section, exactly as generated (away from the edge fades)
+            np.testing.assert_array_equal(
+                song[a + 100 : b - 100],
+                music[first * bar + 100 : (first + section.bars) * bar - 100],
+            )
+    rest = next(s for s in arrangement.sections if s.rest)
+    stop = rest.start_bar * bar
+    assert song[stop - 1, 0] < music[stop - 1, 0] * 0.5  # a 5 ms fade where the music stops
+    plain, _ = _bed_song()
+    np.testing.assert_array_equal(
+        splice_rests(music, plain, frames, sr), conform(music, frames, sr)
+    )  # nothing played alone
+    held = plain.model_copy(update={"ending": "held_chord"})  # generated 20 s too long
+    end = held.total_bars * bar
+    longer = np.concatenate([music, music])
+    song = splice_rests(longer, held, frames, sr)
+    np.testing.assert_array_equal(song[: end - 100], longer[: end - 100])
+    assert not song[end:].any()  # cut on the last bar line; the mix rings out the chord

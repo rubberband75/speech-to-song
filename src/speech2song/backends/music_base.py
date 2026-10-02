@@ -19,7 +19,7 @@ from typing import Any, Protocol
 from speech2song.config import AppConfig, Preset
 from speech2song.costs import CostLog, SpendEstimate
 from speech2song.errors import S2SError
-from speech2song.models import Arrangement, RunOptions, TakeMeta
+from speech2song.models import Arrangement, QuoteMelodies, RunOptions, TakeMeta
 
 
 @dataclass
@@ -28,12 +28,21 @@ class Take:
     meta: TakeMeta
 
 
+@dataclass(frozen=True)
+class MelodyFiles:
+    """The melody stage's renders a backend may condition the music on."""
+
+    reference: Path | None = None  # the main phrase, looped (M5 plans)
+    quotes: Path | None = None  # every quote's melody (M7 plans)
+    index: QuoteMelodies | None = None  # where each quote sits in `quotes`
+
+
 class MusicBackend(Protocol):
     name: str
     paid: bool
 
     def request(
-        self, arrangement: Arrangement, preset: Preset, melody_reference: Path | None
+        self, arrangement: Arrangement, preset: Preset, melody: MelodyFiles
     ) -> dict[str, Any]:
         """Everything the backend would send or use to generate (JSON-serializable)."""
         ...

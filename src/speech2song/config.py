@@ -69,6 +69,13 @@ DEFAULT_SECTION_BARS = 8
 class SectionRole(_Strict):
     energy: float = Field(ge=0, le=1)
     styles: list[str] = []
+    # Styles this section must avoid (on top of the preset's negative_styles). The model
+    # fills silence unless it is told what to leave out.
+    negative_styles: list[str] = []
+    # When a role appears more than once, its first and last occurrence get these too,
+    # so the song develops (a restrained first drop, a climactic last one).
+    first_styles: list[str] = []
+    last_styles: list[str] = []
     # Length in bars (default 8). A speech_bed is fitted to its clip instead.
     bars: int | None = Field(default=None, ge=1, le=64)
     # Energy over the section: steady, rising into the next section, or fading out.
@@ -86,15 +93,20 @@ class SpeechInteraction(_Strict):
     tail_beats: float = Field(default=2.0, ge=0)
     # Music between the parts of a long quote, after a part's last word.
     part_pause_beats: float = Field(default=4.0, ge=0)
+    # A passage's music starts this long before its first quote, so the music has settled
+    # into the quiet bed when the voice comes in (a bar = 4 beats; 0 = none).
+    lead_in_beats: float = Field(default=4.0, ge=0)
+    # Before a quote played alone, the music stops this long before the voice.
+    alone_lead_in_beats: float = Field(default=2.0, ge=0)
 
 
 class MixSpec(_Strict):
+    # The music under a speech passage is set once for the whole passage, at its bar
+    # lines (never following the voice): only as far down as it takes to sit
+    # `bed_margin_db` under the speech (speech band), and at most `sidechain_duck_db`.
+    # A bed the music model already made quiet is left alone.
     sidechain_duck_db: float = Field(default=-9.0, le=0)
-    # The music ducks per quote (a clip, first word to last word), not per word: it eases
-    # down `duck_lead_s` before the first word, stays down through the pauses, and comes
-    # back over `duck_release_s` after the last word.
-    duck_lead_s: float = Field(default=0.6, ge=0)
-    duck_release_s: float = Field(default=1.5, ge=0)
+    bed_margin_db: float = Field(default=14.0, ge=0, le=40)
     speech_highpass_hz: float = Field(default=90.0, ge=0)
     speech_reverb_send: float = Field(default=0.12, ge=0, le=1)
     speech_delay_send: float = Field(default=0.06, ge=0, le=1)
@@ -115,8 +127,13 @@ class MixSpec(_Strict):
     gap_swell: float = Field(default=0.8, ge=0, le=1)
     gap_lift_db: float = Field(default=3.0, ge=0)
     # The last chord rings out: the final audible music goes through a reverb that dies
-    # away over this long (0 = the music ends as generated).
+    # away over this long (0 = the music ends as generated). Arrangements with an ending
+    # of their own ring out only where the music stops abruptly (or ends on a final hit).
     ring_out_s: float = Field(default=6.0, ge=0)
+    # Before a quote played alone, the music stops on the bar line and its reverb dies
+    # away over this long; it comes back on the next downbeat through a reverse swell
+    # (at `gap_swell` of that music's level).
+    alone_ring_s: float = Field(default=2.5, ge=0)
     # A section after a gap whose first 1-N bars are near-silent (a generated drop that
     # opens with a silent bar and a riser) is pulled onto its downbeat (0 turns this off).
     late_entry_max_bars: int = Field(default=4, ge=0, le=8)
@@ -185,6 +202,10 @@ class Preset(_Strict):
     section_roles: dict[str, SectionRole]
     arc: list[str] = Field(min_length=1)
     speech_interaction: SpeechInteraction = SpeechInteraction()
+    # How the song's music ends (Claude's arc may choose another): "held_chord" comes home
+    # to the tonic and that chord is held and rings away, "stop" ends crisply on the
+    # tonic, "fade" lets the music fade out by itself.
+    ending: Literal["held_chord", "fade", "stop"] = "held_chord"
     mix: MixSpec = MixSpec()
     melody: MelodySpec = MelodySpec()
     clips: ClipsSpec = ClipsSpec()
@@ -361,9 +382,13 @@ class ElevenLabsConfig(_Strict):
     output_format: str = "auto"  # the API picks mp3_48000_192 for music_v2 models
     timeout_s: int = Field(default=900, ge=30)  # long songs take minutes; never retried
     context_adherence: Literal["low", "medium", "high"] = "high"
-    # Condition the first chunk on 04_melody_reference.wav (uploaded, billed like a
-    # generation). Off: the docs say references carry feel and palette, not the notes.
+    # M5 plans: condition the first chunk on 04_melody_reference.wav (uploaded, billed
+    # like a generation). Off: the docs say references carry feel and palette, not notes.
     melody_reference: bool = False
+    # M7 plans: the music around each quote (the song's first chunk and the music right
+    # after a speech passage) is conditioned on that quote's rendered melody. The
+    # melodies used are uploaded once, as one file (billed like a generation).
+    melody_conditioning: bool = True
     condition_strength: Literal["low", "medium", "high", "xhigh"] = "low"
 
     @model_validator(mode="after")

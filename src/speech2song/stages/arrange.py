@@ -89,7 +89,7 @@ class ArcStage(Stage):
     """Claude proposes the song's arc around the clips (opt-in: `--refine-arc`)."""
 
     name: ClassVar[str] = "arc"
-    version: ClassVar[int] = 1
+    version: ClassVar[int] = 2  # 2 (M7): treatments, styles per part, the ending
     paid: ClassVar[bool] = True
 
     def _prompt(self, ctx: Context) -> tuple[str, str, dict[str, object]] | None:
@@ -173,7 +173,9 @@ class ArcStage(Stage):
 
 class ArrangeStage(Stage):
     name: ClassVar[str] = "arrange"
-    version: ClassVar[int] = 2  # 2: sections carry `silent`
+    # 2: sections carry `silent`; 3 (M7): lead-ins, treatments, progressions, development,
+    # melody references, the ending (plan version 2)
+    version: ClassVar[int] = 3
 
     def plan(self, ctx: Context) -> StagePlan:
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
@@ -183,7 +185,8 @@ class ArrangeStage(Stage):
         params = {
             "arc": preset.arc,
             "section_roles": {k: v.model_dump() for k, v in preset.section_roles.items()},
-            "tail_beats": preset.speech_interaction.tail_beats,
+            "speech_interaction": preset.speech_interaction.model_dump(),
+            "ending": preset.ending,
             "layer_roles": preset.melody.layer_roles,
         }
         return StagePlan(inputs, params, [ARRANGEMENT])
@@ -201,6 +204,7 @@ class ArrangeStage(Stage):
 
         warnings: list[str] = []
         parts, source, notes = default_parts(preset, clips), "preset", clip_set.notes
+        ending = None
         if "arc" in plan.inputs:
             result = ArcResult.model_validate_json(plan.inputs["arc"].read_text())
             proposal = result.answer()
@@ -210,8 +214,10 @@ class ArrangeStage(Stage):
                                 + "; ".join(problems))  # fmt: skip
             elif proposal is not None:
                 parts, source, notes = proposal.parts, "claude", proposal.notes or notes
+                ending = proposal.ending
         arrangement = build_arrangement(parts, clips, melody, preset, arc_source=source,
-                                        notes=notes, warnings=warnings)  # fmt: skip
+                                        notes=notes, warnings=warnings,
+                                        ending=ending)  # fmt: skip
         problems = validate_arrangement(arrangement, {c.id: c for c in clips})
         if problems:  # a bug, not a user error: the builder made an invalid arrangement
             raise StageError("invalid arrangement: " + "; ".join(problems))
@@ -224,6 +230,8 @@ class ArrangeStage(Stage):
                 "bars": arrangement.total_bars,
                 "seconds": arrangement.total_seconds,
                 "arc": source,
+                "ending": arrangement.ending,
+                "alone": [x.clip_id for x in arrangement.sections if x.rest],
             }
         )
 
@@ -250,6 +258,8 @@ def show_arrangement(ctx: Context) -> None:
     ctx.console.print(table)
     for line in timeline_strip(arrangement):
         ctx.console.print(escape(line))
+    if arrangement.ending:
+        ctx.console.print(f"Ending: {arrangement.ending.replace('_', ' ')}")
     if arrangement.notes:
         ctx.console.print(f"Notes: {escape(arrangement.notes)}")
     kept = [s.clip_id for s in arrangement.sections if s.clip_id]

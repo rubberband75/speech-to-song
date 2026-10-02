@@ -12,13 +12,19 @@ selectable while their timing still fits the arrangement, and otherwise move to
 import json
 import logging
 import shutil
+import tempfile
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import soundfile as sf
+
 from speech2song.audio.io import probe, require_tool, run_tool
+from speech2song.audio.synth import write_wav
 from speech2song.backends.music_base import (
+    MelodyFiles,
     Take,
     next_take_number,
     remove_stub_takes,
@@ -34,17 +40,42 @@ from speech2song.manifest import atomic_write_text, sha256_file, write_json
 from speech2song.models import Arrangement, CostEntry, TakeMeta
 from speech2song.music_plan import (
     MAX_REFERENCE_MS,
+    MELODY_SONG,
     build_plan,
     check_inpaint_plan,
     check_plan,
+    grid_ms,
     plan_minutes,
+    plan_references,
 )
 
 log = logging.getLogger(__name__)
 
 PRICE_ITEM = "music"
 REFERENCE_FILE = "reference.json"  # the uploaded melody reference's song_id, per audio hash
+UPLOADS_FILE = "uploads.json"  # uploaded quote melodies: song_id per upload digest
+UPLOAD_GAP_MS = 500  # silence between the quotes in an upload
 ARCHIVE_DIR = "archive"
+
+
+def melody_upload(melody: MelodyFiles, clips: list[str]) -> dict[str, Any] | None:
+    """What to upload so the plan can be conditioned on these clips' melodies: their
+    ranges in the quote melodies file (`source`) and where each lands in the upload
+    (`ranges`, back to back with a short silence between). Pure but for hashing the file."""
+    if melody.quotes is None or melody.index is None:
+        return None
+    clips = [clip for clip in clips if clip in melody.index.clips]
+    if not clips:
+        return None
+    source, ranges, cursor = {}, {}, 0
+    for clip in clips:
+        start, end = melody.index.clips[clip]
+        length = min(end - start, MAX_REFERENCE_MS)
+        source[clip] = [start, start + length]
+        ranges[clip] = [cursor, cursor + length]
+        cursor += length + UPLOAD_GAP_MS
+    return {"path": str(melody.quotes), "sha256": sha256_file(melody.quotes),
+            "source": source, "ranges": ranges, "ms": cursor - UPLOAD_GAP_MS}  # fmt: skip
 
 
 def _default_client(api_key: str) -> Any:
@@ -92,26 +123,34 @@ class ElevenLabsBackend:
     # --- request and estimate (pure, no network) ---------------------------------------
 
     def request(
-        self, arrangement: Arrangement, preset: Preset, melody_reference: Path | None
+        self, arrangement: Arrangement, preset: Preset, melody: MelodyFiles
     ) -> dict[str, Any]:
         settings = self.config.elevenlabs
-        reference = None
-        if settings.melody_reference and melody_reference is not None:
-            reference = {"path": str(melody_reference), "sha256": sha256_file(melody_reference)}
+        reference = upload = None
+        if arrangement.plan_version < 2:  # M5: the main phrase conditions the first chunk
+            if settings.melody_reference and melody.reference is not None:
+                reference = {"path": str(melody.reference),
+                             "sha256": sha256_file(melody.reference)}  # fmt: skip
+        elif settings.melody_conditioning:  # M7: each quote conditions the music around it
+            upload = melody_upload(melody, plan_references(arrangement))
         plan, layout = build_plan(
             arrangement, preset, context_adherence=settings.context_adherence,
             reference_song_id="<uploaded melody reference>" if reference else None,
             condition_strength=settings.condition_strength,
+            melody_ranges={k: tuple(v) for k, v in upload["ranges"].items()} if upload else None,
         )  # fmt: skip
-        return {
+        request = {
             "backend": self.name,
             "model_id": self.config.music_model,
             "output_format": settings.output_format,
             "composition_plan": plan,
-            "grid_ms": [chunk.duration_ms for chunk in layout],
+            "grid_ms": grid_ms(arrangement),
             "layout": [vars(chunk) for chunk in layout],
             "reference": reference,
         }
+        if upload:  # only M7 requests carry the key, so M5 requests keep their digest
+            request["melody_upload"] = upload
+        return request
 
     def estimate(self, request: dict[str, Any], takes: int) -> list[SpendEstimate]:
         minutes = plan_minutes(request["composition_plan"])
@@ -124,6 +163,16 @@ class ElevenLabsBackend:
                 service="elevenlabs", model="music.upload", units={"minutes": ref_minutes},
                 usd=unit_usd(pricing, PRICE_ITEM, ref_minutes),
                 description="upload the melody reference (once; billed like a generation)",
+            ))  # fmt: skip
+        upload = request.get("melody_upload")
+        if upload:
+            up_minutes = upload["ms"] / 60_000
+            estimates.append(SpendEstimate(
+                service="elevenlabs", model="music.upload",
+                units={"minutes": round(up_minutes, 3)},
+                usd=unit_usd(pricing, PRICE_ITEM, up_minutes),
+                description=f"upload {len(upload['ranges'])} quote melodies, "
+                            f"{upload['ms'] / 1000:.0f} s (once; billed like a generation)",
             ))  # fmt: skip
         for n in range(1, takes + 1):
             estimates.append(SpendEstimate(
@@ -213,6 +262,49 @@ class ElevenLabsBackend:
         write_json(cache, {"sha256": reference["sha256"], "song_id": response.song_id})
         return response.song_id
 
+    def _melody_song(self, request: dict[str, Any], out_dir: Path) -> str | None:
+        """Upload the referenced quote melodies once (paid); return the song_id. The
+        upload is cached by its content (file hash and ranges), so later takes, other
+        requests and copies of the run reuse it."""
+        upload = request.get("melody_upload")
+        if not upload:
+            return None
+        digest = request_digest({k: upload[k] for k in ("sha256", "source")})
+        cache = out_dir / UPLOADS_FILE
+        saved = json.loads(cache.read_text()) if cache.exists() else {}
+        if digest in saved:
+            return saved[digest]["song_id"]
+        audio, rate = sf.read(upload["path"], dtype="float32", always_2d=True)
+        gap = np.zeros((round(UPLOAD_GAP_MS / 1000 * rate), audio.shape[1]), dtype=np.float32)
+        pieces = []
+        for start, end in upload["source"].values():
+            if pieces:
+                pieces.append(gap)
+            pieces.append(audio[round(start / 1000 * rate) : round(end / 1000 * rate)])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wav, mp3 = Path(tmpdir) / "quotes.wav", Path(tmpdir) / "quotes.mp3"
+            write_wav(wav, np.concatenate(pieces), rate)
+            run_tool([require_tool("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error",
+                      "-y", "-i", str(wav), "-c:a", "libmp3lame", "-b:a", "192k",
+                      str(mp3)])  # fmt: skip
+            try:
+                with mp3.open("rb") as fh:
+                    response = self._get_client().music.upload(
+                        file=fh, request_options=self._options()
+                    )
+            except API_ERRORS() as exc:
+                raise self._api_error(exc, out_dir) from exc
+        self._log_cost(
+            "music.upload",
+            "music.upload",
+            upload["ms"] / 60_000,
+            response.song_id,
+            f"quote melodies for conditioning: {', '.join(upload['ranges'])}",
+        )
+        saved[digest] = {"song_id": response.song_id, "clips": list(upload["ranges"])}
+        write_json(cache, saved)
+        return response.song_id
+
     def _archive_misfits(self, out_dir: Path, request: dict[str, Any], run_dir: Path) -> None:
         """Move paid takes whose timing no longer fits the arrangement out of the way."""
         digest = request_digest(request)
@@ -280,6 +372,10 @@ class ElevenLabsBackend:
         song_id = self._reference_song(request, out_dir)
         if song_id:
             plan = json.loads(json.dumps(plan).replace("<uploaded melody reference>", song_id))
+        melody_song = self._melody_song(request, out_dir)
+        if melody_song:
+            plan = json.loads(json.dumps(plan).replace(MELODY_SONG, melody_song))
+            song_id = melody_song
         minutes = plan_minutes(plan)
         model = request["model_id"]
         output_format = request["output_format"]

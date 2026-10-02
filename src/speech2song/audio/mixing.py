@@ -9,7 +9,11 @@ faded out before the next clip starts, so tails never run into the next line.
 The music is shaped toward the arrangement: sections whose level strays far from their
 energy are pulled back toward it, and gaps (the silent sections, with no music of their
 own) become a lift into the next section: the build's tail rising, with a reverse swell
-of it. The last chord rings out through a long reverb instead of stopping.
+of it. A passage played alone gets a stop: the music's reverb dies away from the bar
+line, and the music returns on the next downbeat through a reverse swell. Under a speech
+passage the music is set once, at the passage's bar lines, never following the voice.
+The last chord rings out through a long reverb when the music would otherwise stop
+abruptly.
 """
 
 import math
@@ -19,8 +23,20 @@ from typing import Literal
 
 import numpy as np
 
-from speech2song.arrangement import BEATS_PER_BAR, bar_seconds, beat_seconds, clip_start_s
-from speech2song.audio.dsp import db_to_gain
+from speech2song.arrangement import (
+    BEATS_PER_BAR,
+    bar_seconds,
+    beat_seconds,
+    clip_start_s,
+    passages,
+)
+from speech2song.audio.dsp import (
+    band_filter,
+    channel_levels_db,
+    db_to_gain,
+    loudness_lufs,
+    word_level_db,
+)
 from speech2song.models import (
     Arrangement,
     Clip,
@@ -112,18 +128,79 @@ def word_spans(
     return spans
 
 
-def quote_regions(placed: Sequence[PlacedClip], words: Sequence[WordSpan]) -> list[tuple[int, int]]:
-    """Where the music ducks: for each placed clip, from its first word's start to its
-    last word's end, so the duck holds through the quote's pauses. A clip without words
-    in the transcript ducks for its whole length."""
-    regions = []
-    for p in placed:
-        mine = [w for w in words if w.section_id == p.section_id]
-        if mine:
-            regions.append((min(w.start for w in mine), max(w.end for w in mine)))
-        else:
-            regions.append((p.start_sample, p.end_sample))
-    return regions
+PASSAGE_RAMP_S = 0.5  # the passage level eases in and out over this long
+PASSAGE_WORD_GAP_S = 0.1  # ...and is in place this long before the first word
+
+
+@dataclass(frozen=True)
+class PassageLevel:
+    """The music under one speech passage: where the passage runs (samples, bar line to
+    bar line), the words' span inside it, how far the music sat under the speech there
+    (speech band) and the gain the mix sets for it."""
+
+    sections: list[str]
+    start: int
+    end: int
+    words: tuple[int, int]
+    margin_db: float
+    gain_db: float
+
+
+def passage_levels(
+    music: np.ndarray, speech: np.ndarray, arrangement: Arrangement, words: Sequence[WordSpan],
+    sr: int, *, margin_db: float, max_cut_db: float,
+) -> list[PassageLevel]:  # fmt: skip
+    """One level per passage with music beneath it: the music comes down only as far as
+    it takes to sit `margin_db` under the speech over the passage's words (speech band,
+    stereo energies averaged), and at most `max_cut_db` (negative). A quiet bed is left
+    alone."""
+    spoken = heard = None
+    levels = []
+    for run in passages(arrangement):
+        if run[0].rest:
+            continue
+        ids = {section.id for section in run}
+        mine = [w for w in words if w.section_id in ids]
+        if not mine:
+            continue
+        if spoken is None:
+            spoken, heard = band_filter(speech, sr), band_filter(music, sr)
+        a, b = min(w.start for w in mine), max(w.end for w in mine)
+        speech_db = word_level_db(spoken, a, b, sr)
+        music_db = float(channel_levels_db(heard, np.array([(a + b) // 2]), max(b - a, 1))[0])
+        margin = speech_db - music_db
+        gain = -min(max(0.0, margin_db - margin), -max_cut_db)
+        bar = bar_seconds(arrangement.bpm) * sr
+        start = round(run[0].start_bar * bar)
+        end = round((run[-1].start_bar + run[-1].bars) * bar)
+        levels.append(PassageLevel([s.id for s in run], start, end, (a, b), round(margin, 2),
+                                   round(gain, 2)))  # fmt: skip
+    return levels
+
+
+def passage_curve(levels: Sequence[PassageLevel], frames: int, sr: int) -> np.ndarray:
+    """Per-sample linear gain: each passage's gain from its bar line to the next, easing
+    in over PASSAGE_RAMP_S right after the passage starts (in place before its first
+    word) and out over PASSAGE_RAMP_S before it ends (after its last word). Ramps are
+    raised cosines in dB."""
+    gain_db = np.zeros(frames, dtype=np.float32)
+    ramp, gap = round(PASSAGE_RAMP_S * sr), round(PASSAGE_WORD_GAP_S * sr)
+    for level in levels:
+        if level.gain_db >= 0:
+            continue
+        down_end = min(level.start + ramp, level.words[0] - gap)
+        up_start = max(level.end - ramp, level.words[1] + gap)
+        a, b = max(0, down_end - ramp), min(frames, up_start + ramp)
+        if b <= a:
+            continue
+        shape = np.ones(b - a, dtype=np.float32)
+        t = np.arange(a, b)
+        down = t < down_end
+        shape[down] = 0.5 - 0.5 * np.cos(np.pi * (t[down] - (down_end - ramp)) / ramp)
+        up = t >= up_start
+        shape[up] = 0.5 + 0.5 * np.cos(np.pi * (t[up] - up_start) / ramp)
+        gain_db[a:b] = np.minimum(gain_db[a:b], level.gain_db * shape)
+    return (10 ** (gain_db / 20)).astype(np.float32)
 
 
 def highpass(audio: np.ndarray, sr: int, hz: float) -> np.ndarray:
@@ -271,15 +348,18 @@ def bar_levels_db(music: np.ndarray, start: int, bars: int, bar: float) -> list[
 def late_entries(
     music: np.ndarray, arrangement: Arrangement, sr: int, max_bars: int
 ) -> list[EntryFix]:
-    """Sections right after a silent one that open near-silent and reach their full
-    level within `max_bars` bars: generated drops often open with a silent bar and a
-    riser, which after the mix's own gap leaves seconds of near-silence. Soft (not
-    near-silent) or longer openings are left alone as deliberate."""
+    """Sections right after a gap (or a passage played alone) that open near-silent and
+    reach their full level within `max_bars` bars: generated drops often open with a
+    silent bar and a riser, which after the mix's own gap leaves seconds of
+    near-silence. Soft (not near-silent) or longer openings are left alone as
+    deliberate."""
     bar = bar_seconds(arrangement.bpm) * sr
     spans = section_spans(arrangement, sr)
     fixes = []
     for i, (section, start, end) in enumerate(spans):
-        if i == 0 or not spans[i - 1][0].silent or section.silent or max_bars <= 0:
+        before = spans[i - 1][0] if i else None
+        if before is None or not (before.silent or before.rest) or section.silent \
+                or section.rest or max_bars <= 0:  # fmt: skip
             continue
         levels = bar_levels_db(music, start, section.bars, bar)
         reference = float(np.median(levels))
@@ -446,36 +526,158 @@ def audible_end(music: np.ndarray, sr: int, start: int, within_db: float) -> int
     return start + int(loud[-1] + 1) * window
 
 
-def ring_out(music: np.ndarray, sr: int, start: int, seconds: float) -> tuple[np.ndarray, int]:
-    """The last chord rings out. The music after the point where it stops being audible
-    (see `audible_end`, searched from `start`, the last section's first sample) fades
-    out over RING_HANDOVER_S, and the last RING_SOURCE_S before that point go through a
-    long reverb at the same level, which dies away over `seconds`. Returns the music
-    (longer, when the ring runs past its end) and the sample where the ring begins; the
-    music is returned unchanged, with the end of the music, when `seconds` is 0 or it is
-    silent."""
-    stop = audible_end(music, sr, start, RING_WITHIN_DB) if seconds > 0 else None
-    if stop is None:
-        return music, len(music)
+def ring_tail(
+    music: np.ndarray, sr: int, stop: int, seconds: float, *, hold: float
+) -> np.ndarray | None:
+    """The reverb ring of the RING_SOURCE_S of music before `stop`, at the level that
+    music was heard at, `seconds` long: it keeps its natural decay for `hold` of its
+    length, then tapers to nothing. None when there is nothing to ring."""
     length = round(seconds * sr)
+    if length <= 0 or stop <= 0:
+        return None
     wash = reverb_wash(music, stop, length, sr, source_s=RING_SOURCE_S, room=RING_ROOM,
                        damping=RING_ROOM_DAMPING)  # fmt: skip
     near = _rms(wash[: round(0.5 * sr)])
     heard = _rms(stereo(music[max(0, stop - round(RING_SOURCE_S * sr)) : stop]))
     if near <= 0 or heard <= 0:
-        return music, len(music)
+        return None
     t = np.linspace(0, 1, length, dtype=np.float32)
-    taper = np.clip((t - RING_HOLD) / (1 - RING_HOLD), 0, 1)
+    taper = np.clip((t - hold) / (1 - hold), 0, 1)
     envelope = (0.5 + 0.5 * np.cos(np.pi * taper)) * np.minimum(1, t * seconds / 0.05)
-    out = np.zeros((max(len(music), stop + length), 2), dtype=np.float32)
+    return wash * (envelope * np.float32(heard / near))[:, None]
+
+
+def ring_out(
+    music: np.ndarray, sr: int, start: int, seconds: float, hold: float = RING_HOLD
+) -> tuple[np.ndarray, int]:
+    """The last chord rings out. The music after the point where it stops being audible
+    (see `audible_end`, searched from `start`, the last music section's first sample)
+    fades out over RING_HANDOVER_S, and the last RING_SOURCE_S before that point go
+    through a long reverb at the same level, which keeps its natural decay for `hold` of
+    `seconds` and then dies away. Returns the music (longer, when the ring runs past its
+    end) and the sample where the ring begins; the music is returned unchanged, with the
+    end of the music, when `seconds` is 0 or it is silent."""
+    stop = audible_end(music, sr, start, RING_WITHIN_DB) if seconds > 0 else None
+    if stop is None:
+        return music, len(music)
+    ring = ring_tail(music, sr, stop, seconds, hold=hold)
+    if ring is None:
+        return music, len(music)
+    out = np.zeros((max(len(music), stop + len(ring)), 2), dtype=np.float32)
     out[: len(music)] = music
     hand = min(len(music) - stop, round(RING_HANDOVER_S * sr))
     fade = np.zeros(len(out) - stop, dtype=np.float32)
     fade[:hand] = 0.5 + 0.5 * np.cos(np.pi * np.arange(hand) / max(hand, 1))
     out[stop:] *= fade[:, None]
-    ring = wash * (envelope * np.float32(heard / near))[:, None]
-    out[stop : stop + length] += ring
+    out[stop : stop + len(ring)] += ring
     return out, stop
+
+
+DEAD_LU = 25.0  # a closing section this far under the music's loudness has died away
+
+
+def live_start(
+    music: np.ndarray, spans: Sequence[tuple[int, int]], sr: int, reference_lufs: float | None
+) -> int:
+    """Where the song's last audible music begins: the start of the last span (sections
+    with music, in order) whose loudness is within DEAD_LU of `reference_lufs`. The
+    music model tends to make closing sections near-silent; the ending is rung out of
+    the last music that is actually heard. The last span's start when none qualifies."""
+    if not spans:
+        return 0
+    for start, end in reversed(spans):
+        level = loudness_lufs(music[start:end], sr)
+        if level is not None and (reference_lufs is None or level >= reference_lufs - DEAD_LU):
+            return start
+    return spans[-1][0]
+
+
+ABRUPT_DB = 20.0  # music still this close to its loudest in its last half second stops abruptly
+ABRUPT_TAIL_S = 0.5
+SETTLED_DB = 50.0  # the music has died away once it stays this far under its loudest
+
+
+def ends_abruptly(music: np.ndarray, sr: int, start: int, end: int) -> bool:
+    """Whether the music from `start` to `end` (the last music section) is still sounding
+    in its last half second, within ABRUPT_DB of its loudest 250 ms: it would stop dead
+    rather than die away."""
+    window = max(1, round(RING_WINDOW_S * sr))
+    count = (end - start) // window
+    if count <= 0:
+        return False
+    frames = music[start : start + count * window].reshape(count, window, -1)
+    levels = 10 * np.log10(np.mean(np.square(frames), axis=(1, 2)) + 1e-12)
+    if levels.max() < -80:
+        return False
+    last = music[max(start, end - round(ABRUPT_TAIL_S * sr)) : end]
+    tail = 10 * np.log10(np.mean(np.square(last)) + 1e-12)
+    return bool(tail >= levels.max() - ABRUPT_DB)
+
+
+def settled_at(music: np.ndarray, sr: int, start: int) -> int:
+    """The sample after which the music (from `start`) stays SETTLED_DB under the whole
+    song's loudest 250 ms: where a natural ending has died away. (Measured against the
+    song, not the last section: a model that fades out early leaves a last section that
+    is quiet throughout, and its "ending" would otherwise keep seconds of near-silence.)"""
+    window = max(1, round(RING_WINDOW_S * sr))
+    count = len(music) // window
+    if count <= 0 or start >= len(music):
+        return min(start, len(music))
+    frames = music[: count * window].reshape(count, window, -1)
+    levels = 10 * np.log10(np.mean(np.square(frames), axis=(1, 2)) + 1e-12)
+    first = start // window
+    loud = np.flatnonzero(levels[first:] >= levels.max() - SETTLED_DB)
+    return start if len(loud) == 0 else (first + int(loud[-1]) + 1) * window
+
+
+ALONE_RETURN_S = 1.5  # the longest reverse swell into the music's return
+ALONE_RETURN_MIN_S = 0.3  # shorter room than this after the last word: no swell
+ALONE_WORD_GAP_S = 0.15  # the swell starts at least this long after the last word
+SWELL_SOURCE_S = 1.0  # how much of the returning music feeds its reverse swell
+
+
+def reverse_swell(music: np.ndarray, at: int, length: int, sr: int) -> np.ndarray:
+    """A reverse reverb of the music that starts at `at`: the music after `at`, reversed,
+    through a reverb, reversed back, so its reverb grows toward the downbeat. `length`
+    samples (stereo) ending at `at`, at the level the room returns (not rescaled)."""
+    source = stereo(music[at : at + round(SWELL_SOURCE_S * sr)])[::-1]
+    if length <= 0 or len(source) == 0:
+        return np.zeros((max(length, 0), 2), dtype=np.float32)
+    feed = np.concatenate([source, np.zeros((length, 2), dtype=np.float32)])
+    return reverb_wash(feed, len(source), length, sr, source_s=SWELL_SOURCE_S,
+                       room=GAP_ROOM)[::-1].astype(np.float32)  # fmt: skip
+
+
+def alone_break(
+    music: np.ndarray, start: int, end: int, last_word_end: int | None, sr: int, *,
+    ring_s: float, swell: float,
+) -> np.ndarray:  # fmt: skip
+    """The music around a passage played alone (`start` to `end`, bar lines; the take
+    is already silent there). From `start`, the reverb of the music before it dies away
+    over `ring_s` (tapering at once, so the speaker is soon alone); before `end`, if the
+    passage leaves room after its last word, a reverse swell of the returning music
+    grows into the downbeat at `swell` times that music's level. Returns the music."""
+    out = music.copy()
+    ring = ring_tail(music, sr, start, ring_s, hold=0.0) if ring_s > 0 else None
+    if ring is not None:
+        stop = min(len(out), start + len(ring))
+        out[start:stop] += ring[: stop - start]
+    room = end - (last_word_end if last_word_end is not None else start) \
+        - round(ALONE_WORD_GAP_S * sr)  # fmt: skip
+    length = min(round(ALONE_RETURN_S * sr), room, end)
+    after = stereo(music[end : end + round(SWELL_SOURCE_S * sr)])
+    if swell <= 0 or length < round(ALONE_RETURN_MIN_S * sr) or _rms(after) <= 0:
+        return out
+    wash = reverse_swell(music, end, length, sr)
+    near = _rms(wash[-round(0.25 * sr) :])
+    if near <= 0:
+        return out
+    t = np.linspace(0, 1, length, dtype=np.float32)
+    envelope = np.sin(0.5 * np.pi * t) ** 2
+    fade = min(length, round(GAP_END_FADE_S * sr))
+    envelope[length - fade :] *= np.linspace(1, 0, fade, dtype=np.float32)
+    out[end - length : end] += wash * (envelope * np.float32(_rms(after) / near * swell))[:, None]
+    return out
 
 
 # --- Melody layer ------------------------------------------------------------------------------

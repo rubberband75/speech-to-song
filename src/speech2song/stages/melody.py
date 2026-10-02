@@ -2,8 +2,10 @@
 
 Per clip: pYIN pitch track, notes at syllables. Across clips: the speaker's tuning
 offset, the key, scale snapping, an octave that suits a melody, and the tempo that best
-fits the clips. Then rhythm quantizing, chords per bar, MIDI, and a short rendered
-reference (two loops of the main phrase) for the music generator.
+fits the clips. Then rhythm quantizing, chords per bar, MIDI, a short rendered reference
+(two loops of the main phrase), and every quote's own melody rendered into one file
+(04_quote_melodies.wav, indexed by 04_quote_melodies.json) for the music generator to be
+conditioned on.
 """
 
 import math
@@ -15,7 +17,15 @@ import soundfile as sf
 from rich.markup import escape
 
 from speech2song.audio.pitch import Segment, segment_notes, track_pitch
-from speech2song.audio.synth import build_midi, find_soundfont, render, write_midi
+from speech2song.audio.synth import (
+    build_midi,
+    find_soundfont,
+    normalize_peak,
+    render,
+    render_array,
+    write_midi,
+    write_wav,
+)
 from speech2song.audio.theory import (
     PITCH_CLASS,
     Key,
@@ -41,6 +51,7 @@ from speech2song.models import (
     ClipSet,
     Melody,
     MelodyNote,
+    QuoteMelodies,
     Transcript,
 )
 from speech2song.pipeline import Context, Stage, StagePlan, StageResult
@@ -51,6 +62,12 @@ MELODY = "04_melody.json"
 MELODY_MIDI = "04_melody.mid"
 REFERENCE = "04_melody_reference.wav"
 REFERENCE_LOOPS = 2  # the reference is short: it guides music generation
+QUOTE_MELODIES = "04_quote_melodies.wav"
+QUOTE_INDEX = "04_quote_melodies.json"
+QUOTE_MIN_S = 8.0  # each quote's melody loops until it lasts at least this long...
+QUOTE_MAX_S = 30.0  # ...and no longer than a conditioning reference may be
+QUOTE_GAP_S = 0.5  # silence between the quotes in the file
+PEAK_DB = -3.0
 ANALYSIS_VERSION = 1  # bump when pitch tracking or segmentation changes
 
 
@@ -196,9 +213,43 @@ def build_melody(
     )
 
 
+def quote_loops(phrase: ClipMelody, bpm: float) -> int:
+    """How many times a quote's phrase plays in its rendered melody."""
+    seconds = phrase.bars * 4 * 60.0 / bpm
+    loops = max(1, math.ceil(QUOTE_MIN_S / seconds - 1e-9))
+    return max(1, min(loops, math.floor(QUOTE_MAX_S / seconds)))
+
+
+def render_quote_melodies(
+    melody: Melody, soundfont: Path, sample_rate: int
+) -> tuple[np.ndarray, dict[str, tuple[int, int]]]:
+    """Every quote's melody (with its chords), one after another with a short silence
+    between, peak-normalized together; and where each one sits (ms)."""
+    blocks: list[np.ndarray] = []
+    index: dict[str, tuple[int, int]] = {}
+    gap = np.zeros((round(QUOTE_GAP_S * sample_rate), 2), dtype=np.float32)
+    cursor = 0
+    for phrase in melody.clips:
+        if not phrase.notes:
+            continue
+        midi = build_midi([phrase], bpm=melody.bpm, instrument_name=melody.instrument,
+                          loops=quote_loops(phrase, melody.bpm), gap_bars=0)  # fmt: skip
+        audio = render_array(midi, soundfont, sample_rate)
+        start = cursor
+        cursor += len(audio)
+        end = min(cursor, start + round(QUOTE_MAX_S * sample_rate))
+        index[phrase.clip_id] = (round(start / sample_rate * 1000),
+                                 round(end / sample_rate * 1000))  # fmt: skip
+        blocks += [audio, gap]
+        cursor += len(gap)
+    if not blocks:
+        return np.zeros((0, 2), dtype=np.float32), {}
+    return normalize_peak(np.concatenate(blocks), PEAK_DB), index
+
+
 class MelodyStage(Stage):
     name: ClassVar[str] = "melody"
-    version: ClassVar[int] = 4  # 4: whole-number tempos
+    version: ClassVar[int] = 5  # 4: whole-number tempos; 5 (M7): each quote's melody rendered
 
     def plan(self, ctx: Context) -> StagePlan:
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
@@ -217,7 +268,8 @@ class MelodyStage(Stage):
             "soundfont": str(ctx.config.soundfont) if ctx.config.soundfont else "auto",
             "analysis": ANALYSIS_VERSION,
         }
-        return StagePlan(inputs, params, [MELODY, MELODY_MIDI, REFERENCE])
+        return StagePlan(inputs, params,
+                         [MELODY, MELODY_MIDI, REFERENCE, QUOTE_MELODIES, QUOTE_INDEX])  # fmt: skip
 
     def run(self, ctx: Context, plan: StagePlan) -> StageResult:
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
@@ -252,6 +304,15 @@ class MelodyStage(Stage):
         reference = build_midi([main], bpm=melody.bpm, instrument_name=melody.instrument,
                                loops=REFERENCE_LOOPS)  # fmt: skip
         seconds = render(reference, ctx.run.path(REFERENCE), soundfont)
+        rate = clip_set.sample_rate
+        quotes, index = render_quote_melodies(melody, soundfont, rate)
+        write_wav(ctx.run.path(QUOTE_MELODIES), quotes, rate)
+        write_json(
+            ctx.run.path(QUOTE_INDEX),
+            QuoteMelodies(
+                file=QUOTE_MELODIES, sample_rate=rate, instrument=melody.instrument, clips=index
+            ),
+        )
 
         confidence = f", confidence {melody.key_confidence:.2f}" if melody.key_confidence else ""
         ctx.say(
@@ -265,6 +326,8 @@ class MelodyStage(Stage):
                     f"{escape(chords)}")  # fmt: skip
         ctx.say(f"  reference: {melody.main_clip} x{REFERENCE_LOOPS}, {seconds:.1f} s "
                 f"({melody.instrument}, {soundfont.name})")  # fmt: skip
+        ctx.say(f"  quote melodies: {len(index)} in {QUOTE_MELODIES} "
+                f"({len(quotes) / rate:.1f} s)")  # fmt: skip
         return StageResult(
             summary={
                 "key": melody.key,

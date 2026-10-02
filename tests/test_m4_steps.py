@@ -60,6 +60,7 @@ def test_arrange_generate_mix(cli: Cli, talk: Talk, install: Callable, short_son
     arrangement = _arrangement(talk)
     assert [s.clip_id for s in arrangement.sections if s.clip_id] == ["c2", "c1"]
     assert [s.role for s in arrangement.sections][-2:] == ["speech_bed", "outro"]
+    assert arrangement.ending == "held_chord" and "Ending: held chord" in result.output
     assert arrangement.arc_source == "preset"
 
     result = cli("generate")
@@ -77,7 +78,10 @@ def test_arrange_generate_mix(cli: Cli, talk: Talk, install: Callable, short_son
     assert not run.path("07_mix/stems/melody_layer.wav").exists()
     gaps = [s.id for s in arrangement.sections if s.silent]
     assert gaps and report.lifted == gaps  # lifted into the drop, not muted
-    assert report.ring_out_at_s is not None  # the last chord rings out
+    assert report.ending == "held_chord"
+    # a held chord: the music is cut on the last bar line and its chord rings out
+    assert report.ended == "ring" and report.ring_out_at_s is not None
+    assert report.passages and all(p["gain_db"] <= 0 for p in report.passages)
     assert report.speech_margin_db == 10.0  # every word stays this far over the music
     assert all(w["margin_db"] < 10 for w in report.guarded_words)
     assert [level.section_id for level in report.section_levels] == [
