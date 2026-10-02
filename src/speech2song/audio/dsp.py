@@ -2,6 +2,7 @@
 and limiting (mix). Pure numpy/scipy; no file I/O."""
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -139,6 +140,90 @@ def duck_gain(
     times = np.arange(len(smoothed)) * hop
     gain_db = np.interp(np.arange(frames), times, smoothed)
     return (10 ** (gain_db / 20)).astype(np.float32)
+
+
+GUARD_BAND_HZ = (200.0, 5000.0)  # where music masks words
+GUARD_FRAME_S = 0.1  # speech level frames inside a word
+GUARD_CORE_DB = 10.0  # a word's level: the mean of its frames within this of its loudest
+GUARD_HOP_S = 0.01
+GUARD_ATTACK_DB_S = 150.0  # how fast the music dips, ahead of the word
+GUARD_RELEASE_DB_S = 30.0  # how fast it comes back after it
+
+
+def band_filter(audio: np.ndarray, sr: int) -> np.ndarray:
+    """`audio` (frames x channels) band-passed to GUARD_BAND_HZ, as float64."""
+    from scipy.signal import butter, sosfilt
+
+    sos = butter(2, GUARD_BAND_HZ, btype="bandpass", fs=sr, output="sos")
+    signal = _as_2d(audio).astype(np.float64)
+    signal[0::2] -= 1e-12  # keeps the filter out of subnormal floats (see loudness_lufs)
+    signal[1::2] += 1e-12
+    return sosfilt(sos, signal, axis=0)
+
+
+def channel_levels_db(filtered: np.ndarray, centers: np.ndarray, frame: int) -> np.ndarray:
+    """Level (dB) of a `frame`-sample window at each centre, with the channels' energies
+    averaged (a mono sum would cancel wide stereo content)."""
+    energy = np.mean([10 ** (frame_levels_db(filtered[:, c], centers, frame) / 10)
+                      for c in range(filtered.shape[1])], axis=0)  # fmt: skip
+    return 10 * np.log10(energy + 1e-12)
+
+
+def word_level_db(filtered: np.ndarray, start: int, end: int, sr: int) -> float:
+    """A word's speech level: the mean energy of its 100 ms frames within GUARD_CORE_DB
+    of its loudest, so silence inside loose word timings doesn't count."""
+    hop = max(1, round(GUARD_HOP_S * sr))
+    levels = channel_levels_db(filtered, np.arange(start, max(end, start + 1), hop),
+                               max(2, round(GUARD_FRAME_S * sr)))  # fmt: skip
+    core = levels[levels >= levels.max() - GUARD_CORE_DB]
+    return float(10 * np.log10(np.mean(10 ** (core / 10))))
+
+
+def speech_guard(
+    speech: np.ndarray,
+    music: np.ndarray,
+    sr: int,
+    words: Sequence[tuple[int, int]],
+    *,
+    margin_db: float,
+) -> tuple[np.ndarray, list[float]]:
+    """Per-sample gain (at most 1) for the music, and each word's margin before it:
+    under every word (sample spans in `words`), the music in the speech band stays at
+    least `margin_db` under the word's level. The dip is rate-limited, so it starts
+    ahead of the word and recovers after it."""
+    frames = len(music)
+    hop = max(1, round(GUARD_HOP_S * sr))
+    centers = np.arange(0, frames, hop)
+    gain = np.zeros(len(centers))
+    if not words or len(centers) == 0:
+        return np.ones(frames, dtype=np.float32), []
+    spoken, heard = band_filter(speech, sr), band_filter(music, sr)
+    margins = []
+    for start, end in words:
+        end = max(end, start + 1)
+        under = channel_levels_db(heard, np.array([(start + end) // 2]), end - start)[0]
+        margin = word_level_db(spoken, start, end, sr) - under
+        margins.append(float(margin))
+        a, b = np.searchsorted(centers, [start, end])
+        gain[a:b] = np.minimum(gain[a:b], min(0.0, margin - margin_db))
+    attack, release = GUARD_ATTACK_DB_S * GUARD_HOP_S, GUARD_RELEASE_DB_S * GUARD_HOP_S
+    values = gain.tolist()
+    for i in range(len(values) - 2, -1, -1):  # dip ahead of the word
+        values[i] = min(values[i], values[i + 1] + attack)
+    for i in range(1, len(values)):  # recover after it
+        values[i] = min(values[i], values[i - 1] + release)
+    gain_db = np.interp(np.arange(frames), centers, np.array(values))
+    return (10 ** (gain_db / 20)).astype(np.float32), margins
+
+
+def dips(gain: np.ndarray, sr: int, below_db: float = -0.5) -> list[tuple[float, float, float]]:
+    """(start s, end s, deepest dB) of each stretch where `gain` is below `below_db`."""
+    with np.errstate(divide="ignore"):
+        level = 20 * np.log10(np.maximum(gain, 1e-9))
+    low = level < below_db
+    edges = np.flatnonzero(np.diff(np.r_[0, low.astype(np.int8), 0]))
+    return [(a / sr, b / sr, float(level[a:b].min())) for a, b in zip(edges[::2], edges[1::2],
+                                                                      strict=True)]  # fmt: skip
 
 
 # --- Loudness and peaks ----------------------------------------------------------------------

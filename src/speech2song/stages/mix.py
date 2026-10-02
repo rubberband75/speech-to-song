@@ -16,7 +16,14 @@ import numpy as np
 import soundfile as sf
 
 from speech2song.arrangement import energy_bounds
-from speech2song.audio.dsp import db_to_gain, duck_gain, loudness_lufs, master
+from speech2song.audio.dsp import (
+    db_to_gain,
+    dips,
+    duck_gain,
+    loudness_lufs,
+    master,
+    speech_guard,
+)
 from speech2song.audio.io import require_tool
 from speech2song.audio.mixing import (
     COMP_ABOVE_LU,
@@ -34,13 +41,22 @@ from speech2song.audio.mixing import (
     section_spans,
     speech_bus,
     speech_stem,
+    word_spans,
 )
 from speech2song.audio.synth import find_soundfont, instrument, render_array, write_wav
 from speech2song.config import SAMPLE_RATE, MixSpec, load_preset
 from speech2song.errors import S2SError, StageError
 from speech2song.manifest import temp_path_for, write_json
-from speech2song.models import Arrangement, ClipSet, Melody, MixReport, SectionLevel
+from speech2song.models import (
+    Arrangement,
+    ClipSet,
+    Melody,
+    MixReport,
+    SectionLevel,
+    Transcript,
+)
 from speech2song.pipeline import Context, Stage, StagePlan, StageResult
+from speech2song.stages.align import TRANSCRIPT
 from speech2song.stages.arrange import ARRANGEMENT, usable_arrangement
 from speech2song.stages.generate_music import SELECTED, song_frames
 from speech2song.stages.melody import MELODY, kept_clips
@@ -153,7 +169,7 @@ def _db(value: float | None) -> str:
 
 class MixStage(Stage):
     name: ClassVar[str] = "mix"
-    version: ClassVar[int] = 3  # 2: energy shaping and silent gaps; 3: late entries
+    version: ClassVar[int] = 4  # 2: energy shaping, gaps; 3: late entries; 4: speech guard
 
     def plan(self, ctx: Context) -> StagePlan:
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
@@ -162,6 +178,7 @@ class MixStage(Stage):
             "arrangement": ctx.run.path(ARRANGEMENT),
             "music": ctx.run.path(SELECTED),
             "clips": ctx.run.path(CLIPS),
+            "transcript": ctx.run.path(TRANSCRIPT),  # word timings for the speech guard
         }
         if mode != "off":
             inputs["melody"] = ctx.run.path(MELODY)
@@ -257,6 +274,19 @@ class MixStage(Stage):
 
         music_bus = music * duck
         layer_bus = layer * duck
+        # The guard: under every word, the music stays speech_margin_db below it.
+        transcript = Transcript.model_validate_json(plan.inputs["transcript"].read_text())
+        words = word_spans(placed, clips, transcript.words, sr)
+        guard, margins = speech_guard(bus.dry, music_bus + layer_bus, sr,
+                                      [(w.start, w.end) for w in words],
+                                      margin_db=spec.speech_margin_db)  # fmt: skip
+        music_bus *= guard[:, None]
+        layer_bus *= guard[:, None]
+        guarded = [
+            {"clip_id": w.clip_id, "word": w.word, "at_s": round(w.start / sr, 3),
+             "margin_db": round(m, 1)}
+            for w, m in zip(words, margins, strict=True) if m < spec.speech_margin_db
+        ]  # fmt: skip
         mastered = master(music_bus + layer_bus + bus.dry + bus.wet, sr, spec.target_lufs,
                           CEILING_DBTP)  # fmt: skip
 
@@ -290,6 +320,9 @@ class MixStage(Stage):
             silenced=silenced, warnings=warnings,
             late_entries=[{"section_id": f.section_id, "bars": f.bars, "mode": f.mode}
                           for f in fixes],
+            speech_margin_db=spec.speech_margin_db, guarded_words=guarded,
+            guard_dips=[{"start_s": round(a, 3), "end_s": round(b, 3), "db": round(d, 2)}
+                        for a, b, d in dips(guard, sr)],
         )  # fmt: skip
         write_json(ctx.run.path(MIX_REPORT), report)
         for warning in warnings:
@@ -303,6 +336,12 @@ class MixStage(Stage):
                     f"{how}")  # fmt: skip
         ctx.say(f"  music shaped toward the arrangement: {', '.join(changed) or 'no changes'}"
                 + (f"; silenced {', '.join(silenced)}" if silenced else ""))  # fmt: skip
+        if guarded:
+            worst = min(guarded, key=lambda w: w["margin_db"])
+            ctx.say(f"  speech guard: {len(guarded)} of {len(words)} words were less than "
+                    f"{spec.speech_margin_db:g} dB clear of the music, which now dips under "
+                    f"them (the closest: '{worst['word']}' at {worst['at_s']:.1f} s, "
+                    f"{worst['margin_db']:+.1f} dB)")  # fmt: skip
         ctx.say(f"  music {_db(music_lufs)} LUFS · speech {_db(speech_lufs)} LUFS dry, "
                 f"{gain_db:+.1f} dB to sit {spec.speech_level_lu:+g} LU above the music · "
                 f"melody layer: {mode}")  # fmt: skip

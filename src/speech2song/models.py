@@ -568,4 +568,7 @@ class MixReport(BaseModel):
     section_levels: list[SectionLevel] = []
     silenced: list[str] = []  # silent sections (gaps), muted in the mix
     late_entries: list[dict[str, Any]] = []  # sections pulled onto their downbeat
+    speech_margin_db: float | None = None
+    guarded_words: list[dict[str, Any]] = []  # words that were less than the margin clear
+    guard_dips: list[dict[str, float]] = []  # where the music dipped further under them
     warnings: list[str] = []

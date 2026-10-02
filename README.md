@@ -152,7 +152,11 @@ section after a gap opens near-silent and reaches full level within
 on the downbeat (and its spill into the next section goes back with it). The speech bus
 sits `mix.speech_level_lu` above the music's
 loudness, with a high-pass, gentle compression, and reverb/delay sends whose tails fade
-out before the next clip. The music ducks by `sidechain_duck_db` while speech plays.
+out before the next clip. The music ducks by `sidechain_duck_db` while speech plays, and
+the speech guard makes sure every word (from the transcript's timings) stays at least
+`speech_margin_db` (10 dB) above the music in the speech band (200 Hz-5 kHz): under
+words that are softer than that, the music dips further, smoothly and only as far as
+needed. `mix.json` lists those words.
 `--melody-layer` (on `mix` and `run`, sticky) adds the MIDI melody: `off` (the preset's
 default), `replay` (breakdowns and drops replay the line just heard) or `all` (also
 quietly under the speech).

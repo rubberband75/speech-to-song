@@ -77,6 +77,8 @@ def test_arrange_generate_mix(cli: Cli, talk: Talk, install: Callable, short_son
     assert not run.path("07_mix/stems/melody_layer.wav").exists()
     gaps = [s.id for s in arrangement.sections if s.silent]
     assert gaps and report.silenced == gaps
+    assert report.speech_margin_db == 10.0  # every word stays this far over the music
+    assert all(w["margin_db"] < 10 for w in report.guarded_words)
     assert [level.section_id for level in report.section_levels] == [
         s.id for s in arrangement.sections]  # fmt: skip
     assert report.integrated_lufs == pytest.approx(-14.0, abs=0.2)

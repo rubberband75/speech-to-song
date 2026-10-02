@@ -176,3 +176,54 @@ def test_master_hits_the_loudness_target_under_the_ceiling() -> None:
     assert result.lufs == pytest.approx(-14.0, abs=0.1)
     assert result.true_peak_db <= -1.0
     assert true_peak_db(result.audio) <= -1.0
+
+
+# --- The speech guard ---------------------------------------------------------------------
+
+
+def test_the_guard_keeps_every_word_clear_of_the_music() -> None:
+    from speech2song.audio.dsp import (
+        GUARD_ATTACK_DB_S,
+        band_filter,
+        channel_levels_db,
+        speech_guard,
+        word_level_db,
+    )
+
+    sr = 16000
+    rng = np.random.default_rng(4)
+    music = (0.05 * rng.standard_normal((6 * sr, 2))).astype(np.float32)
+    speech = np.zeros_like(music)
+    loud, soft = (sr, 2 * sr), (4 * sr, 5 * sr)  # a word 20 dB over the music, one at par
+    speech[loud[0] : loud[1]] = 0.5 * rng.standard_normal((sr, 2))
+    speech[soft[0] : soft[1]] = 0.05 * rng.standard_normal((sr, 2))
+    gain, margins = speech_guard(speech, music, sr, [loud, soft], margin_db=10)
+    assert margins[0] == pytest.approx(20, abs=1) and margins[1] == pytest.approx(0, abs=1)
+    db = 20 * np.log10(gain)
+    assert db[loud[0] : loud[1]].min() > -0.01  # clear already: untouched
+    inside = db[soft[0] : soft[1] - sr // 50]  # the last frames start to recover
+    assert np.allclose(inside, margins[1] - 10, atol=0.05)  # down by exactly the shortfall
+    lead = round(5 / GUARD_ATTACK_DB_S * sr)  # the dip is half-way down this far ahead
+    assert db[soft[0] - lead] < -2 and db[soft[0] - sr // 2] > -0.01
+    guarded = music * gain[:, None]
+    mid = np.array([(soft[0] + soft[1]) // 2])
+    under = channel_levels_db(band_filter(guarded, sr), mid, soft[1] - soft[0])[0]
+    after = word_level_db(band_filter(speech, sr), *soft, sr) - under
+    assert after == pytest.approx(10, abs=0.3)
+    assert speech_guard(speech, music, sr, [], margin_db=10)[0].min() == 1.0
+
+
+def test_word_spans_follow_the_clips() -> None:
+    from speech2song.audio.mixing import WORD_TAIL_S, word_spans
+    from speech2song.models import Clip, PlacedClip, Word
+
+    clip = Clip.model_construct(id="c1", start_s=10.0, end_s=12.0)
+    placed = [PlacedClip(clip_id="c1", section_id="s2", file="x.wav", start_sample=1000,
+                         end_sample=1000 + 2 * 100, start_s=10.0)]  # fmt: skip
+    words = [Word(w="before", start=9.0, end=9.5), Word(w="hello", start=10.5, end=11.0),
+             Word(w="end", start=11.9, end=12.0)]  # fmt: skip
+    spans = word_spans(placed, {"c1": clip}, words, 100)
+    assert [(s.word, s.start, s.end) for s in spans] == [
+        ("hello", 1050, 1000 + round((1.0 + WORD_TAIL_S) * 100)),
+        ("end", 1190, 1200),  # kept inside the clip
+    ]  # fmt: skip

@@ -108,6 +108,10 @@ class MixSpec(_Strict):
     # A section after a gap whose first 1-N bars are near-silent (a generated drop that
     # opens with a silent bar and a riser) is pulled onto its downbeat (0 turns this off).
     late_entry_max_bars: int = Field(default=4, ge=0, le=8)
+    # Wherever a word is spoken, the music in the speech band (200 Hz-5 kHz) stays at
+    # least this far under it: on top of the fixed duck, the music dips further under
+    # quiet words.
+    speech_margin_db: float = Field(default=10.0, ge=0, le=30)
 
 
 class MelodySpec(_Strict):

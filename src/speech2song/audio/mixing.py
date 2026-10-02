@@ -20,7 +20,15 @@ import numpy as np
 
 from speech2song.arrangement import BEATS_PER_BAR, bar_seconds, beat_seconds, clip_start_s
 from speech2song.audio.dsp import db_to_gain
-from speech2song.models import Arrangement, ClipMelody, Melody, PlacedClip, Section
+from speech2song.models import (
+    Arrangement,
+    Clip,
+    ClipMelody,
+    Melody,
+    PlacedClip,
+    Section,
+    Word,
+)
 
 TAIL_MAX_S = 6.0  # longest reverb/delay tail after a clip
 TAIL_FADE_S = 0.3  # tails fade out over this long before they are cut
@@ -71,6 +79,33 @@ def speech_stem(
             raise ValueError(f"{p.clip_id} runs past the end of the mix")
         out[p.start_sample : p.end_sample] = clip
     return out
+
+
+WORD_TAIL_S = 0.15  # ASR word ends come early: speech and room tone ring on after them
+
+
+@dataclass(frozen=True)
+class WordSpan:
+    clip_id: str
+    word: str
+    start: int  # mix samples
+    end: int
+
+
+def word_spans(
+    placed: Sequence[PlacedClip], clips: dict[str, Clip], words: Sequence[Word], sr: int
+) -> list[WordSpan]:
+    """Where each spoken word of the placed clips lands in the mix (transcript times,
+    extended by WORD_TAIL_S and kept inside the clip)."""
+    spans = []
+    for p in placed:
+        clip = clips[p.clip_id]
+        for word in words:
+            if clip.start_s <= word.start < clip.end_s:
+                start = p.start_sample + round((word.start - clip.start_s) * sr)
+                end = p.start_sample + round((word.end + WORD_TAIL_S - clip.start_s) * sr)
+                spans.append(WordSpan(p.clip_id, word.w, start, min(end, p.end_sample)))
+    return spans
 
 
 def highpass(audio: np.ndarray, sr: int, hz: float) -> np.ndarray:
