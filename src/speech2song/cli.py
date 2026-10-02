@@ -8,7 +8,7 @@ import functools
 import logging
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
@@ -720,11 +720,22 @@ def generate(
         bool, typer.Option("--dry-run", help="Show the estimated cost; call nothing.")
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Don't ask before paid calls.")] = False,
+    takes: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            max=8,
+            help="Takes to have for the arrangement (default: the "
+            "config's music_takes, 2); ones already made for it are reused.",
+        ),
+    ] = None,
     force: Force = False,
     run_ref: RunRef = None,
 ) -> None:
     """Generate backing-track takes for the arrangement (`mix` picks one)."""
     env = _env(ctx)
+    if takes is not None:
+        env = replace(env, config=env.config.model_copy(update={"music_takes": takes}))
     run = _open_run(env, run_ref)
     _update_options(run, music_backend=music_backend.value if music_backend else None)
     _run_step_command(env, run, "generate", force=force, dry_run=dry_run, yes=yes)

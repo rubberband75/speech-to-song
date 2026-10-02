@@ -13,8 +13,9 @@ its bars, or a speech passage with its clips, how the music meets it and a few s
 words). Its plan is checked here, and the preset's arc is used whenever it can't be.
 
 M7 song form: a passage's music starts `lead_in_beats` before its first quote, so the
-music has settled when the voice comes in; a passage played "alone" has no music at all
-(the music stops on its bar line and returns on the next downbeat). Music sections take
+music has settled when the voice comes in. A passage Claude plays "alone" becomes a
+"break": its quiet bed runs until the last phrase, which lands in silence, and the music
+returns a beat or two after the last word (the mix does that). Music sections take
 a progression that fits the nearby speech melody, and a role's first and last
 occurrence get styles of their own. The ending is realized by the plan and the mix
 (the music model fades out at the end of any generation, whatever it is asked): a song
@@ -294,15 +295,18 @@ def build_arrangement(
 ) -> Arrangement:
     """Sections on the bar grid (an M7 arrangement, plan version 2).
 
-    A passage's first clip starts `lead_in_beats` into its bed (`alone_lead_in_beats`
-    when it plays alone). Beds take their clip's chords; music sections take a
+    A passage's first clip starts `lead_in_beats` into its bed; a passage played alone
+    gets a bed too ("break": the mix stops the music for its last phrase). Beds take
+    their clip's chords; music sections take a
     progression for their role that fits the melody heard last, different from the
     role's previous section. A role's first and last occurrence add their styles, and a
     part's own styles (Claude's) come last. The song's first music section and the music
     right after each passage are conditioned on a quote's melody (`melody_ref`). With
     `ending` (else the preset's) "fade", the last music section falls; otherwise it
     holds steady and lands on the tonic in its last bar, where the mix rings it out.
-    Sections in `melody.layer_roles` note the clip heard last, for the melody layer."""
+    When the song closes on a passage, the music runs on into it (an outro before it
+    holds instead of falling). Sections in `melody.layer_roles` note the clip heard
+    last, for the melody layer."""
     bpm = melody.bpm
     speech = preset.speech_interaction
     tail, pause = speech.tail_beats, speech.part_pause_beats
@@ -346,21 +350,18 @@ def build_arrangement(
 
     for part in parts:
         if part.role == SPEECH_ROLE:
-            alone = part.treatment == "alone"
-            lead = speech.alone_lead_in_beats if alone else speech.lead_in_beats
+            treatment = "under" if part.treatment == "under" else "break"
             for n, clip_id in enumerate(part.clips):
-                offset = lead if n == 0 else 0.0
+                offset = speech.lead_in_beats if n == 0 else 0.0
                 bars = bed_bars(by_id[clip_id], bpm, tail, pause, offset)
-                styles = [*preset.section_roles[SPEECH_ROLE].styles, *part.styles]
                 add(
                     part.role,
                     bars,
                     chords=_bed_chords(melody, clip_id, bars, offset),
                     clip_id=clip_id,
                     clip_offset_beats=offset,
-                    treatment=part.treatment,
-                    styles=[] if alone else styles,
-                    **({"energy": 0.0} if alone else {}),
+                    treatment=treatment,
+                    styles=[*preset.section_roles[SPEECH_ROLE].styles, *part.styles],
                 )
                 last_heard = clip_id
             answer = part.clips[-1] if part.clips else answer
@@ -389,6 +390,9 @@ def build_arrangement(
             update = {"shape": "flat" if last.shape == "fall" else last.shape,
                       "chords": [*last.chords[:-1], _tonic_chord(melody)]}  # fmt: skip
         sections[music[-1]] = last.model_copy(update=update)
+        before = [i for i in music[:-1] if sections[i].clip_id is None]
+        if last.clip_id is not None and before and sections[before[-1]].shape == "fall":
+            sections[before[-1]] = sections[before[-1]].model_copy(update={"shape": "flat"})
     return Arrangement(
         bpm=bpm,
         key=melody.key,
@@ -562,7 +566,9 @@ def timeline_rows(
         if section.clip_id:
             text = clip_texts.get(section.clip_id, "")
             text = text if len(text) <= 48 else text[:47] + "…"
-            what = f"{section.clip_id}  {text}" + ("  (alone)" if section.rest else "")
+            what = f"{section.clip_id}  {text}" + {"alone": "  (alone)",
+                                                  "break": "  (last phrase alone)",
+                                                  }.get(section.treatment, "")  # fmt: skip
         elif section.silent:
             what = "(lift into the next section)"
         elif section.melody_phrase and melody_layer:

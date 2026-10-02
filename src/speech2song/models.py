@@ -444,9 +444,11 @@ class QuoteMelodies(BaseModel):
 
 # --- 05_arc.json (optional: Claude refines the arc) -------------------------------------
 
-# How the music meets a speech passage: "under" plays a quiet bed beneath it, "alone"
-# stops the music for it (the speaker alone, the music returning on the next downbeat).
-Treatment = Literal["under", "alone"]
+# How the music meets a speech passage: "under" plays a quiet bed beneath it; "break"
+# plays the bed until the passage's last phrase, which lands alone, the music returning a
+# beat or two after the last word (what Claude's "alone" becomes since M7.1); "alone"
+# stops the music for the whole passage (M7 arrangements: nothing is generated there).
+Treatment = Literal["under", "break", "alone"]
 # How the music ends: its last chord held and ringing away, fading out by itself, or a
 # crisp stop (see the mix).
 Ending = Literal["held_chord", "fade", "stop"]
@@ -511,7 +513,7 @@ class Section(BaseModel):
     clip_offset_beats: float = 0.0  # where the clip starts, from the section start
     melody_phrase: str | None = None  # clip whose melody the melody layer replays here
     silent: bool = False  # a gap: nothing is generated for it; the mix lifts the music on
-    treatment: Treatment = "under"  # a speech bed: music beneath it, or none ("alone")
+    treatment: Treatment = "under"  # a speech bed: music beneath it, all or part of the way
     melody_ref: str | None = None  # clip whose rendered melody conditions this music (M7)
     start_s: float = 0.0  # informational: start_bar at the arrangement's tempo
     seconds: float = 0.0
@@ -638,6 +640,7 @@ class MixReport(BaseModel):
     ended: Literal["ring", "natural"] | None = None  # rung out, or left to die away
     passages: list[dict[str, Any]] = []  # the music's level under each speech passage
     alone: list[str] = []  # speech beds played without music
+    breaks: list[dict[str, Any]] = []  # passages whose last phrase lands alone
     late_entries: list[dict[str, Any]] = []  # sections pulled onto their downbeat
     speech_margin_db: float | None = None
     guarded_words: list[dict[str, Any]] = []  # words that were less than the margin clear

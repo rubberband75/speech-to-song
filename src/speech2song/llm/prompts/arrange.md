@@ -11,11 +11,12 @@ like someone turning a volume knob down whenever the speaker talks. Instead, the
 leads into each passage: it settles into a quiet bed a bar before the first word (the
 arrangement adds that lead-in bar for you), stays naturally quiet under the words, and
 swells after an idea lands rather than under it. For the one or two lines that matter
-most, the music can stop completely: the speaker is heard alone, and the music returns on
-the next downbeat. That works best for the most climactic line right before a drop (in
-place of the short gap before it: the build stops dead, the line lands in silence, and
-the drop hits), or for the closing line at the very end. Use it sparingly, or it loses
-its force. Quieter, reflective lines suit the breakdown side of the song.
+most, the passage can be played alone: its quiet bed carries the line until its last
+phrase, then the music drops out so those final words land in silence, and the music
+returns a beat or two after the line ends. That works best for the most climactic line
+right before a drop (in place of the short gap before it: the punchline lands in
+silence and the drop hits), or for the closing line at the very end. Use it sparingly,
+or it loses its force. Quieter, reflective lines suit the breakdown side of the song.
 
 Give the song a beginning, a middle and an end: an opening that sets the mood and
 introduces the main motif, a middle that develops (vary the sections rather than
@@ -51,13 +52,12 @@ $default_parts
 Return `parts`, the song from start to end. Each part is either:
 - a speech passage: role "speech_bed", `clips` lists the clip IDs it plays back to back,
   `bars` is 0 (a passage is as long as its clips need, plus a lead-in of $lead_in beats),
-  and `treatment` is "under" (a quiet bed of music beneath the words) or "alone" (no
-  music at all: the music stops on the bar line before it and returns after it), or
+  and `treatment` is "under" (a quiet bed of music beneath the words) or "alone" (the
+  quiet bed until the last phrase, which is heard without music), or
 - a music section: any other role, `bars` from 1 to 32, `clips` empty, and `treatment`
   "under" (it has no meaning for music sections).
 Every part has `styles`: 0 to $max_styles short descriptors that this part adds to its
-role's styles (for a speech passage, they describe its quiet bed; a passage played alone
-has no music, so leave them empty).
+role's styles (for a speech passage, they describe its quiet bed).
 
 Rules:
 - every clip appears exactly once, in the order given above
@@ -72,6 +72,6 @@ home and its last chord is held and rings away; the preset's default is $ending)
 (it fades out gradually by itself), or "stop" (it stops crisply on the last downbeat,
 with only a short ring). Choose what suits the closing line and the song's mood: a stop
 makes a strong last line stand out, a fade suits a reflective close. If the closing line
-is played alone at the very end, the music ends this way just before it.
+is played alone at the very end, the music ends this way just before its last phrase.
 
 Then give `notes`: one or two sentences on the shape you chose.

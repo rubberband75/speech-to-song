@@ -139,6 +139,9 @@ def test_energy_gains_fix_only_large_deviations() -> None:
     anchor = float(np.median([-17.5, -15.0, -34.0, -21.0, -13.7, -14.0]))
     assert targets[0] == pytest.approx(anchor + 1.5)
     assert gains[2] == 6.0  # 15 dB too quiet: capped
+    lifted, _ = energy_gains(levels, energies, range_db=10, tolerance_db=3, max_db=6,
+                             max_boost_db=12)  # fmt: skip
+    assert lifted[2] == 12.0 and lifted[4] == gains[4]  # lifted further, cut no further
     assert gains[3] == 0.0 and targets[3] is None  # silent: left to the lift
     assert gains[4] == pytest.approx((anchor + 10) - (-11.0) - 3)  # beyond the tolerance only
     assert gains[0] == 0.0 and gains[1] == 0.0  # close enough: untouched
@@ -316,9 +319,10 @@ def test_soft_openings_and_disabled_fixes_are_left_alone() -> None:
 # --- M7: passages, stops, endings --------------------------------------------------------------
 
 
-def _bed_song(treatment: str = "under") -> tuple[Arrangement, list]:
+def _bed_song(treatment: str = "under", m7: bool = False) -> tuple[Arrangement, list]:
     """intro 4 bars, then a passage of two quotes (a lead-in bar, then the words), then a
-    build: 120 BPM, so a bar is 2 s."""
+    build: 120 BPM, so a bar is 2 s. With treatment "alone", the first quote plays alone
+    (`m7`: as M7 stored it, with no music at all)."""
     from speech2song.audio.mixing import WordSpan
 
     clips = [ClipInfo("a", "hook", "a", 3.3, 3.0), ClipInfo("b", "build", "b", 3.3, 3.0)]
@@ -335,6 +339,10 @@ def _bed_song(treatment: str = "under") -> tuple[Arrangement, list]:
     if treatment != "under":
         parts.insert(2, ArcPart(role="speech_bed", clips=["b"]))
     arrangement = build_arrangement(parts, clips, melody, PRESET, ending="fade")
+    if m7:
+        from .test_arrangement import as_m7_alone
+
+        arrangement = as_m7_alone(arrangement)
     words = []
     for section in arrangement.sections:
         if section.clip_id:
@@ -395,7 +403,7 @@ def test_a_passage_played_alone_stops_the_music_and_swells_it_back() -> None:
     from speech2song.audio.mixing import alone_break
 
     sr = 8000
-    arrangement, _ = _bed_song("alone")
+    arrangement, _ = _bed_song("alone", m7=True)
     spans = section_spans(arrangement, sr)
     alone = next((a, b) for s, a, b in spans if s.rest)
     frames = spans[-1][2]
@@ -414,6 +422,65 @@ def test_a_passage_played_alone_stops_the_music_and_swells_it_back() -> None:
     crowded = alone_break(music, alone[0], alone[1], alone[1] - sr // 10, sr, ring_s=2.5,
                           swell=0.8)  # fmt: skip
     assert _rms(crowded[alone[1] - sr // 2 : alone[1]]) < 1e-4  # no room after the words
+
+
+def _words(spec: list[tuple[str, float, float]], clip: str = "c") -> list:
+    from speech2song.audio.mixing import WordSpan
+
+    return [WordSpan(clip, "s1", w, round(a * SR), round(b * SR)) for w, a, b in spec]
+
+
+def test_the_last_phrase_starts_at_a_mark_that_leaves_two_to_six_seconds() -> None:
+    from speech2song.audio.mixing import last_phrase
+
+    words = _words([("Above", 0.0, 0.4), ("all,", 0.5, 0.9), ("why", 1.6, 2.0), ("not?", 2.1, 2.5),
+                    ("Because", 3.2, 3.6), ("you", 3.7, 3.9), ("are", 4.0, 4.2),
+                    ("unique;", 4.3, 4.9), ("you", 5.2, 5.4), ("matter.", 5.5, 6.1)])  # fmt: skip
+    assert last_phrase(words, SR) == 4  # "Because you are unique; you matter." (2.9 s)
+    # (after "unique;" only 0.9 s would be left: too short to land; after "all," 5.2 s fits
+    # too, but the latest mark wins)
+    flat = _words([(w, i * 0.5, i * 0.5 + 0.4) for i, w in enumerate("abcdefgh")])
+    flat[2] = flat[2].__class__("c", "s1", "c", round(1.25 * SR), round(1.4 * SR))  # a pause
+    assert last_phrase(flat, SR) == 2  # no marks: the longest pause that leaves 2-6 s
+    two_clips = _words([("first", 0.0, 1.0), ("line", 1.1, 2.0)], "a") + \
+        _words([("second", 2.6, 3.4), ("line", 3.5, 4.4), ("here", 4.5, 5.0)], "b")  # fmt: skip
+    assert last_phrase(two_clips, SR) == 2  # the next clip starts a phrase
+    assert last_phrase(_words([("short", 0.0, 0.5), ("line.", 0.6, 1.2)]), SR) is None
+    assert last_phrase(_words([("one", 0.0, 3.0)]), SR) is None
+
+
+def test_the_music_stops_in_the_pause_and_returns_a_beat_or_two_later() -> None:
+    from speech2song.audio.mixing import BREAK_LEAD_S, break_stop, return_point
+
+    words = _words([("a,", 1.0, 1.5), ("b", 2.0, 2.5), ("c", 2.55, 3.0)])
+    lead = round(BREAK_LEAD_S * SR)
+    assert break_stop(words, 1, 0, SR) == 2 * SR - lead  # in the pause before "b"
+    assert break_stop(words, 2, 0, SR) == round(2.5 * SR)  # a short pause: right after "b"
+    assert break_stop(words, None, 0, SR) == SR - lead  # no phrase: before the first word
+    assert break_stop(words, None, SR, SR) == SR  # never before the passage
+    beat = SR // 2  # 120 BPM
+    assert return_point(10 * SR, 10 * SR + 3 * beat, BPM, SR) == 10 * SR + beat  # a breath
+    assert return_point(round(10.2 * SR), 13 * SR, BPM, SR) == 11 * SR  # 1.6 beats of breath
+    assert return_point(10 * SR, 10 * SR + 2 * beat, BPM, SR) == 10 * SR + 2 * beat  # downbeat
+    assert return_point(10 * SR, 10 * SR + beat // 2, BPM, SR) == 10 * SR + beat // 2
+
+
+def test_a_last_phrase_lands_alone_and_the_music_comes_back() -> None:
+    from speech2song.audio.mixing import BREAK_FADE_S, phrase_break
+
+    sr = 8000
+    music = _tone(20 * sr, 0.2, sr)
+    stop, last_word, back = 8 * sr, 12 * sr, 13 * sr
+    out = phrase_break(music, stop, back, last_word, sr, ring_s=1.5, swell=0.8)
+    before = stop - round(BREAK_FADE_S * sr)
+    np.testing.assert_array_equal(out[:before], music[:before])  # the bed until the phrase
+    np.testing.assert_array_equal(out[back + 100 :], music[back + 100 :])  # and back after it
+    ring = [_rms(out[stop + i * sr // 4 : stop + (i + 1) * sr // 4]) for i in range(6)]
+    assert ring[0] > 0.02 and ring[0] > ring[2] > ring[4] and ring[5] < ring[0] / 5  # dies away
+    assert _rms(out[stop + round(1.6 * sr) : last_word]) < 1e-4  # the last words alone
+    swell = out[last_word:back]
+    assert _rms(swell[-sr // 4 :]) > 4 * _rms(swell[: sr // 4])  # grows into the return
+    assert _rms(out[back : back + sr // 4]) > 0.1  # the bed is back
 
 
 def test_a_natural_ending_is_left_alone_and_an_abrupt_one_rings() -> None:
@@ -451,7 +518,7 @@ def test_the_take_is_spliced_open_for_passages_played_alone() -> None:
     from speech2song.stages.generate_music import conform, splice_rests
 
     sr = 8000
-    arrangement, _ = _bed_song("alone")
+    arrangement, _ = _bed_song("alone", m7=True)
     bar = 2 * sr
     music_frames = sum(s.bars for s in arrangement.sections if not s.rest) * bar
     music = np.stack([np.arange(music_frames)] * 2, axis=1).astype(np.float32) + 1  # traceable

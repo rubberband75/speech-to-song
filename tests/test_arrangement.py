@@ -24,7 +24,14 @@ from speech2song.arrangement import (
     validate_arrangement,
 )
 from speech2song.config import load_preset
-from speech2song.models import ArcPart, BarChord, ClipMelody, Melody, MelodyNote
+from speech2song.models import (
+    ArcPart,
+    Arrangement,
+    BarChord,
+    ClipMelody,
+    Melody,
+    MelodyNote,
+)
 
 from .conftest import PRESETS_DIR
 
@@ -160,28 +167,64 @@ def _sung(melody: Melody) -> Melody:
     return melody.model_copy(update={"clips": clips})
 
 
-def test_alone_passages_stop_the_music_and_leads_in_settle_it() -> None:
+def as_m7_alone(arrangement: Arrangement) -> Arrangement:
+    """The arrangement as M7 stored passages played alone: no music at all ("alone")."""
+    sections = [s.model_copy(update={"treatment": "alone", "energy": 0.0, "styles": []})
+                if s.treatment == "break" else s for s in arrangement.sections]  # fmt: skip
+    return arrangement.model_copy(update={"sections": sections})
+
+
+ALONE_PARTS = [ArcPart(role="intro", bars=4), ArcPart(role="speech_bed", clips=["a"]),
+               ArcPart(role="build", bars=8), ArcPart(role="speech_bed", clips=["b"],
+                                                      treatment="alone"),
+               ArcPart(role="drop", bars=16), ArcPart(role="speech_bed", clips=["c"],
+                                                      treatment="alone")]  # fmt: skip
+
+
+def test_alone_passages_keep_a_bed_until_their_last_phrase() -> None:
     clips = [_clip("a", 5), _clip("b", 4), _clip("c", 3, "outro")]
-    parts = [ArcPart(role="intro", bars=4), ArcPart(role="speech_bed", clips=["a"]),
-             ArcPart(role="build", bars=8), ArcPart(role="speech_bed", clips=["b"],
-                                                    treatment="alone"),
-             ArcPart(role="drop", bars=16), ArcPart(role="speech_bed", clips=["c"],
-                                                    treatment="alone")]  # fmt: skip
-    arrangement = build_arrangement(parts, clips, _melody(clips), PRESET)
+    arrangement = build_arrangement(ALONE_PARTS, clips, _melody(clips), PRESET)
     roles = [(s.role, s.clip_id, s.treatment) for s in arrangement.sections]
     assert roles == [
         ("intro", None, "under"),
         ("speech_bed", "a", "under"),
         ("build", None, "under"),
-        ("speech_bed", "b", "alone"),
+        ("speech_bed", "b", "break"),
         ("drop", None, "under"),
-        ("speech_bed", "c", "alone"),
+        ("speech_bed", "c", "break"),
     ]
-    assert arrangement.sections[4].chords[-1] == "Am"  # the drop comes home before the last line
     a, b, c = (s for s in arrangement.sections if s.clip_id)
-    assert a.clip_offset_beats == 4 and b.clip_offset_beats == 2  # the stop sinks in first
-    assert b.bars == bed_bars(clips[1], BPM, 2, lead_in_beats=2) == 3  # 2 + 8 + 2 = 12 beats
-    assert b.energy == 0 and b.styles == [] and b.rest and not a.rest
+    assert a.clip_offset_beats == b.clip_offset_beats == 4  # the music leads into both
+    assert b.bars == bed_bars(clips[1], BPM, 2, lead_in_beats=4) == 4  # 4 + 8 + 2 = 14 beats
+    assert b.energy == a.energy == 0.2 and b.styles == a.styles and not b.rest
+    assert c.chords[-1] == "Am"  # the music runs on under the closing line and comes home
+    assert music_bars(arrangement) == [s.start_bar for s in arrangement.sections]  # no splices
+    assert music_total_bars(arrangement) == arrangement.total_bars
+    assert [[s.clip_id for s in run] for run in passages(arrangement)] == [["a"], ["b"], ["c"]]
+    rows = timeline_rows(arrangement, {"b": "the key line"})
+    assert rows[3][-1] == "b  the key line  (last phrase alone)"
+
+
+def test_an_outro_runs_on_into_a_closing_line() -> None:
+    clips = [_clip("a", 5), _clip("b", 4, "outro")]
+    parts = [ArcPart(role="intro", bars=4), ArcPart(role="speech_bed", clips=["a"]),
+             ArcPart(role="outro", bars=8),
+             ArcPart(role="speech_bed", clips=["b"], treatment="alone")]  # fmt: skip
+    arrangement = build_arrangement(parts, clips, _melody(clips), PRESET, ending="fade")
+    outro, closing = arrangement.sections[-2:]
+    assert outro.shape == "flat" and closing.shape == "fall"  # it fades under the last line
+    held = build_arrangement(parts, clips, _melody(clips), PRESET, ending="held_chord")
+    assert held.sections[-2].shape == "flat" and held.sections[-1].chords[-1] == "Am"
+    ending_on_outro = build_arrangement(parts[:3], clips[:1], _melody(clips[:1]), PRESET,
+                                        ending="fade")  # fmt: skip
+    assert ending_on_outro.sections[-1].shape == "fall"
+
+
+def test_m7_alone_passages_take_no_music_time() -> None:
+    clips = [_clip("a", 5), _clip("b", 4), _clip("c", 3, "outro")]
+    arrangement = as_m7_alone(build_arrangement(ALONE_PARTS, clips, _melody(clips), PRESET))
+    a, b, c = (s for s in arrangement.sections if s.clip_id)
+    assert b.rest and c.rest and not a.rest
     build = next(s for s in arrangement.sections if s.role == "build")
     assert energy_bounds(arrangement.sections)[2] == (0.6, 1.0)  # rises through the stop
     assert build.bars == 8
@@ -189,7 +232,6 @@ def test_alone_passages_stop_the_music_and_leads_in_settle_it() -> None:
     starts = music_bars(arrangement)
     assert starts[4] == starts[2] + 8 and starts[3] == starts[4]
     assert music_total_bars(arrangement) == arrangement.total_bars - b.bars - c.bars
-    assert [[s.clip_id for s in run] for run in passages(arrangement)] == [["a"], ["b"], ["c"]]
     rows = timeline_rows(arrangement, {"b": "the key line"})
     assert rows[3][-1] == "b  the key line  (alone)"
 

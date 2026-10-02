@@ -4,9 +4,10 @@ The speech stem holds the clips verbatim (sample-exact apart from their edge fad
 mix hears the speech bus instead: the clips set to the music's loudness plus
 `speech_level_lu`, high-passed, gently compressed, with reverb and delay sends. The music
 is first shaped toward the arrangement's energy, its gaps become lifts into the next
-section, and the passages played alone become stops (the music rings away on the bar
-line and swells back on the next downbeat). It rings out at the end when it would
-otherwise stop abruptly. Under each speech passage the music and melody layer are set
+section, and a passage played alone keeps its bed until its last phrase, which lands in
+silence (the music rings away just before it and swells back a beat or two after the
+last word; a song closing on such a passage ends there). It rings out at the end when it
+would otherwise stop abruptly. Under each speech passage the music and melody layer are set
 once, at the passage's bar lines and only as far as needed, and a guard keeps every word
 clear of them. The master is normalized to the preset's loudness with true peaks at or
 below -1 dBTP.
@@ -18,6 +19,7 @@ from typing import ClassVar, Literal
 
 import numpy as np
 import soundfile as sf
+from rich.markup import escape
 
 from speech2song.arrangement import energy_bounds, passages
 from speech2song.audio.dsp import (
@@ -30,21 +32,28 @@ from speech2song.audio.dsp import (
 from speech2song.audio.io import require_tool
 from speech2song.audio.mixing import (
     COMP_ABOVE_LU,
+    RING_HOLD,
     EntryFix,
     NoteEvent,
+    WordSpan,
     alone_break,
     apply_entry_fix,
+    break_stop,
+    cut_music,
     delay_seconds,
     ends_abruptly,
     energy_gains,
     gain_curve,
     gap_lift,
+    last_phrase,
     late_entries,
     live_start,
     melody_notes,
     passage_curve,
     passage_levels,
+    phrase_break,
     place_clips,
+    return_point,
     ring_out,
     section_spans,
     settled_at,
@@ -134,7 +143,8 @@ def shape_music(
               for section, start, end in spans]  # fmt: skip
     gains, targets = energy_gains(levels, energies, range_db=spec.energy_range_db,
                                   tolerance_db=spec.energy_tolerance_db,
-                                  max_db=spec.energy_max_db)  # fmt: skip
+                                  max_db=spec.energy_max_db,
+                                  max_boost_db=spec.energy_max_boost_db)  # fmt: skip
     for i, (section, _, _) in enumerate(spans):  # change gain inside the gap, not before it
         if (section.silent or section.rest) and i:
             gains[i] = gains[i - 1]
@@ -182,8 +192,9 @@ class MixStage(Stage):
     # 2: energy shaping, gaps; 3: late entries; 4: speech guard; 5: guard words by midpoint;
     # 6 (M6): gaps lift instead of muting, a duck per quote, a gentler guard, a ring-out;
     # 7 (M7): a level per passage at its bar lines, stops for passages played alone, a
-    # ring-out only where the music would stop abruptly
-    version: ClassVar[int] = 7
+    # ring-out only where the music would stop abruptly; 8 (M7.1): a passage played
+    # alone loses its music only for its last phrase, quiet sections can be lifted more
+    version: ClassVar[int] = 8
 
     def plan(self, ctx: Context) -> StagePlan:
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
@@ -244,21 +255,43 @@ class MixStage(Stage):
         transcript = Transcript.model_validate_json(plan.inputs["transcript"].read_text())
         words = word_spans(placed, clips, transcript.words, sr)
         spans = section_spans(arrangement, sr)
-        alone = []
-        last_music = max((i for i, s in enumerate(arrangement.sections) if not s.rest), default=-1)
-        for run in passages(arrangement):  # the music stops for a passage played alone
-            if not run[0].rest:
-                continue
+        alone, breaks = [], []
+        sections = arrangement.sections
+        last_music = max((i for i, s in enumerate(sections) if not s.rest), default=-1)
+        alone_words: set[WordSpan] = set()  # the last phrases, heard without music
+        closing_stop = None
+        for run in passages(arrangement):
             ids = {section.id for section in run}
             start = next(a for s, a, _ in spans if s.id == run[0].id)
             end = next(b for s, _, b in spans if s.id == run[-1].id)
-            last_word = max((w.end for w in words if w.section_id in ids), default=None)
-            closing = arrangement.sections.index(run[0]) > last_music  # the ending rings it
-            music = alone_break(music, start, end, last_word, sr,
-                                ring_s=0.0 if closing else spec.alone_ring_s,
-                                swell=spec.gap_swell)  # fmt: skip
-            alone += [section.id for section in run]
+            mine = [w for w in words if w.section_id in ids]
+            last_word = max((w.end for w in mine), default=None)
+            if run[0].rest:  # an M7 passage played alone: the music stops on its bar line
+                closing = sections.index(run[0]) > last_music  # the ending rings it
+                music = alone_break(music, start, end, last_word, sr,
+                                    ring_s=0.0 if closing else spec.alone_ring_s,
+                                    swell=spec.gap_swell)  # fmt: skip
+                alone += [section.id for section in run]
+                continue
+            if run[0].treatment != "break" or not mine:
+                continue
+            phrase = last_phrase(mine, sr)
+            stop = break_stop(mine, phrase, start, sr)
+            alone_words |= set(mine[phrase or 0 :])
+            closing = sections.index(run[-1]) == last_music
+            back = None if closing else return_point(last_word, end, arrangement.bpm, sr)
+            if back is None:  # the song ends on this line: the ending is made from here
+                music, closing_stop = cut_music(music, stop, None, sr), stop
+            else:
+                music = phrase_break(music, stop, back, last_word, sr,
+                                     ring_s=spec.alone_ring_s, swell=spec.gap_swell)  # fmt: skip
+            breaks.append({"sections": [section.id for section in run],
+                           "phrase": " ".join(w.word for w in mine[phrase or 0 :]),
+                           "stop_s": round(stop / sr, 3),
+                           "back_s": None if back is None else round(back / sr, 3)})  # fmt: skip
         music_spans = [(a, b) for s, a, b in spans if not s.rest]
+        if closing_stop is not None:
+            music_spans = [(a, min(b, closing_stop)) for a, b in music_spans if a < closing_stop]
         music_end = music_spans[-1][1] if music_spans else len(music)
         ended, ring_s = None, spec.ring_out_s
         if arrangement.ending is None:  # an M5 arrangement: the last chord always rings out
@@ -271,7 +304,10 @@ class MixStage(Stage):
                 music, ring_at = ring_out(music, sr, start, ring_s, hold=0.0)
             elif arrangement.ending == "held_chord" or ends_abruptly(music, sr, start,
                                                                       music_end):  # fmt: skip
-                music, ring_at = ring_out(music, sr, start, ring_s)
+                hold = RING_HOLD
+                if closing_stop is not None and arrangement.ending == "fade":
+                    ring_s, hold = spec.alone_ring_s, 0.0  # the closing line lands alone
+                music, ring_at = ring_out(music, sr, start, ring_s, hold=hold)
             else:  # the music fades away by itself: leave its ending as it is
                 ring_at, ended = len(music), "natural"
             ended = ended or ("ring" if ring_at < len(music) else None)
@@ -309,8 +345,10 @@ class MixStage(Stage):
             bus = type(bus)(bus.dry * makeup, bus.wet * makeup)
             gain_db += speech_target - processed
 
-        # Under each passage the music and melody layer are set once, at its bar lines.
-        beds = passage_levels(music, bus.dry, arrangement, words, sr,
+        # Under each passage the music and melody layer are set once, at its bar lines
+        # (measured under the words the music plays beneath: not a last phrase alone).
+        beds = passage_levels(music, bus.dry, arrangement,
+                              [w for w in words if w not in alone_words], sr,
                                margin_db=spec.bed_margin_db,
                                max_cut_db=spec.sidechain_duck_db)  # fmt: skip
         duck = passage_curve(beds, frames, sr)[:, None]
@@ -376,7 +414,7 @@ class MixStage(Stage):
             integrated_lufs=round(mastered.lufs, 3),
             true_peak_dbtp=round(mastered.true_peak_db, 3), section_levels=levels,
             lifted=lifted, ring_out_at_s=round(ring_at / sr, 3) if ring_at < frames else None,
-            ending=arrangement.ending, ended=ended, alone=alone,
+            ending=arrangement.ending, ended=ended, alone=alone, breaks=breaks,
             passages=[{"sections": p.sections, "start_s": round(p.start / sr, 3),
                        "end_s": round(p.end / sr, 3), "margin_db": p.margin_db,
                        "gain_db": p.gain_db} for p in beds],
@@ -402,6 +440,11 @@ class MixStage(Stage):
         if alone:
             ctx.say(f"  the music stops for the passages played alone ({', '.join(alone)}) "
                     "and swells back after them")  # fmt: skip
+        for item in breaks:
+            back = ("the song ends there" if item["back_s"] is None
+                    else f"back at {item['back_s']:.1f} s")  # fmt: skip
+            ctx.say(f"  {item['sections'][0]}: the music drops out at {item['stop_s']:.1f} s for "
+                    f"\"{escape(item['phrase'])}\" ({back})")  # fmt: skip
         if ring_at < frames:
             ctx.say(f"  the last chord rings out from {ring_at / sr:.1f} s, "
                     f"over {ring_s:g} s")  # fmt: skip

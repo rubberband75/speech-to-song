@@ -19,7 +19,8 @@ key:
 
 # Global style words sent to the music generator (the first chunk, which sets the tone of
 # the whole song): genre, palette and mood. Density (drums, bass, leads) belongs to the
-# sections that have it, so the quiet sections can stay quiet.
+# sections that have it, so the quiet sections can stay quiet. (Words like "near-empty"
+# or "negative space" gave beds the model left near-silent, for seconds on end.)
 positive_styles:
   - cinematic psychedelic electronic
   - melodic future bass
@@ -27,8 +28,8 @@ positive_styles:
   - ambient electronica
   - lush wide synth chords
   - granular textures, reversed sounds, pitch bends, ear candy
-  - instrumental arrangement with large negative space in the quiet sections
-  - dynamic arrangement, near-empty quiet passages and huge drops
+  - instrumental
+  - dynamic arrangement, soft pad-led quiet passages and huge drops
   - bittersweet, awe-filled, polished, spacious, immersive
 
 negative_styles:
@@ -37,6 +38,7 @@ negative_styles:
   - harsh or metallic bass
   - busy arpeggios or leads during narration
   - sung vocals or lyrics
+  - long silences
 
 # Section roles. The arrangement builder maps each speech clip onto the timeline,
 # then picks section roles around it. "energy" is 0-1 and guides density. "bars" is the
@@ -50,12 +52,12 @@ section_roles:
   intro:
     energy: 0.15
     bars: 8
-    styles: [spacious ambient pads, soft granular textures, distant reversed sounds, filtered noise, sparse piano or bell fragments]
+    styles: [spacious ambient pads, soft granular textures, distant reversed sounds, filtered noise, sparse bell fragments]
     negative_styles: [drums, heavy bass]
-  speech_bed:           # plays under a spoken clip (unless the clip plays alone)
+  speech_bed:           # plays under a spoken clip (and drops out for a lone last phrase)
     energy: 0.2
-    styles: [just a soft sustained pad, minimal and sparse, lots of open space, quiet and still]
-    negative_styles: [drums, percussion, beat, bassline, sub-bass, lead melody, arpeggios, busy, loud, build-up, risers]
+    styles: [warm sustained pads, soft but always present, slow gentle chord changes, calm]
+    negative_styles: [drums, percussion, beat, bassline, sub-bass, lead melody, arpeggios, busy, build-up, risers, silence]
   build:
     energy: 0.6
     bars: 8
@@ -75,7 +77,7 @@ section_roles:
   breakdown:
     energy: 0.3
     bars: 8
-    styles: [quiet introspective, soft chords, gentle melodic motif]
+    styles: [introspective, soft chords, gentle melodic motif]
     negative_styles: [heavy drums, sub drop]
   outro:
     energy: 0.1
@@ -114,11 +116,10 @@ speech_interaction:
   tail_beats: 2                     # beats after a clip's last word before the next section
   part_pause_beats: 4               # music between the parts of a long quote
   lead_in_beats: 4                  # a passage's quiet bed starts a bar before its first word
-  alone_lead_in_beats: 2            # the music stops this long before a quote played alone
 
 # Local mix settings (pedalboard)
 mix:
-  bed_margin_db: 14                 # under a passage the music sits this far under the speech
+  bed_margin_db: 16                 # under a passage the music sits this far under the speech
   sidechain_duck_db: -9             # (set once, at the passage's bar lines), coming down at
                                     # most this much; a bed that is already quiet is left alone
   speech_highpass_hz: 90
@@ -131,12 +132,14 @@ mix:
   energy_range_db: 20               # level from energy 0 to 1 when shaping the music (M7
                                     # beds are composed quiet: about 16 dB under the drops)
   energy_tolerance_db: 3            # deviations within this are left alone
-  energy_max_db: 6                  # largest correction per section (0 = no shaping)
+  energy_max_db: 6                  # largest correction per section (0 = no shaping)...
+  energy_max_boost_db: 12           # ...or lift, for a section the model made too quiet
   gap_swell: 0.8                    # a gap lifts into the drop: reverse swell of the build's
   gap_lift_db: 3                    # tail (level, 0 = none) and a rise of this much (dB)
   ring_out_s: 6                     # the last chord rings out this long, where the music
                                     # would stop abruptly (0 = as generated)
-  alone_ring_s: 2.5                 # before a quote played alone the music rings away this long
+  alone_ring_s: 1.5                 # a passage played alone: the music rings away this long
+                                    # before its last phrase, which lands in silence
   late_entry_max_bars: 4            # pull a drop that opens silent after a gap onto its
                                     # downbeat, if it is at most this late (0 = off)
   speech_margin_db: 10              # music stays this far under every word (speech band)
@@ -146,7 +149,7 @@ melody:
   quantize_grid: 1/8
   scale_snap_strength: 0.8          # 0 = raw speech contour, 1 = fully snapped to scale
   loop_phrase_count: 3              # repetition drives the speech-to-song illusion
-  render_instrument: soft_piano     # rendered for the (optional) audio reference
+  render_instrument: soft_piano     # rendered for the (optional, off) audio references
   layer: "off"                      # MIDI melody in the mix: off | replay (the line just
                                     # heard returns as the tune in layer_roles) | all
                                     # (also quietly under speech)

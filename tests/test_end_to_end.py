@@ -89,9 +89,36 @@ def test_whole_pipeline_keeps_speech_exact(
     for stage in ("arrange", "generate", "take", "mix"):
         assert any(stage in line and "complete" in line for line in status.output.splitlines())
 
-    # A passage played alone (a hand edit): the music stops for it; the speech stays exact.
+    # A passage played alone (a hand edit): its bed runs until its last phrase, which
+    # lands in silence; the take still fits (the plan doesn't change), so only the mix runs.
     path = run.path("05_arrangement.json")
-    arrangement = Arrangement.model_validate_json(path.read_text())
+    original = path.read_text()
+    arrangement = Arrangement.model_validate_json(original)
+    bed = [s for s in arrangement.sections if s.clip_id][1]
+    bed.treatment = "break"
+    path.write_text(arrangement.model_dump_json(indent=2))
+    result = cli("mix", "--run", "latest")
+    assert result.exit_code == 0, result.output
+    assert "the music drops out at" in result.output
+    report = MixReport.model_validate_json(run.path("07_mix/mix.json").read_text())
+    (item,) = report.breaks
+    assert item["sections"] == [bed.id] and item["back_s"] > item["stop_s"]
+    speech, _ = sf.read(str(run.path("07_mix/stems/speech.wav")), dtype="float32", always_2d=True)
+    for placed in report.clips:
+        assert np.array_equal(speech[placed.start_sample : placed.end_sample],
+                              clips[placed.clip_id])  # fmt: skip
+    music, sr = sf.read(str(run.path("07_mix/stems/music.wav")), dtype="float32")
+    start = round(bed.start_bar * 4 * 60 / arrangement.bpm * sr)
+    stop, back = round(item["stop_s"] * sr), round(item["back_s"] * sr)
+    assert np.abs(music[start : stop - sr // 10]).max() > 1e-3  # the bed under the words
+    lone = music[
+        stop + round(1.6 * sr) : back - round(1.5 * sr)
+    ]  # after the ring, before the swell
+    assert len(lone) and np.abs(lone).max() < 1e-4  # the last phrase alone
+    assert np.abs(music[back : back + sr // 4]).max() > 1e-3  # and the music is back
+
+    # As M7 stored it ("alone"): the music stops for the whole passage.
+    arrangement = Arrangement.model_validate_json(original)
     bed = [s for s in arrangement.sections if s.clip_id][1]
     bed.treatment = "alone"
     path.write_text(arrangement.model_dump_json(indent=2))

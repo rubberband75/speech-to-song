@@ -174,8 +174,9 @@ class ArcStage(Stage):
 class ArrangeStage(Stage):
     name: ClassVar[str] = "arrange"
     # 2: sections carry `silent`; 3 (M7): lead-ins, treatments, progressions, development,
-    # melody references, the ending (plan version 2)
-    version: ClassVar[int] = 3
+    # melody references, the ending (plan version 2); 4 (M7.1): a passage played alone
+    # keeps a bed ("break", music until its last phrase)
+    version: ClassVar[int] = 4
 
     def plan(self, ctx: Context) -> StagePlan:
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
@@ -231,7 +232,9 @@ class ArrangeStage(Stage):
                 "seconds": arrangement.total_seconds,
                 "arc": source,
                 "ending": arrangement.ending,
-                "alone": [x.clip_id for x in arrangement.sections if x.rest],
+                "alone": [
+                    x.clip_id for x in arrangement.sections if x.treatment in ("alone", "break")
+                ],
             }
         )
 

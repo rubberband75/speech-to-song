@@ -18,6 +18,8 @@ REFINE = 0.04  # refine the tempogram's guess within ±4% of its beat period
 TEMPO_DEADBAND = 0.005  # estimates this close count as on tempo
 KEY_PENALTY = {"same": 0.0, "relative": 0.15, "other": 0.3}
 ENERGY_FLOOR = 0.5  # flag takes whose section levels barely follow the arrangement
+DEAD_DB = 32.0  # a section this far under the take's loudest one is near-silent...
+DEAD_PENALTY = 0.5  # ...and costs this much score times its share of the music's time
 
 
 def _mono(audio: np.ndarray, rate: int) -> np.ndarray:
@@ -101,6 +103,15 @@ def energy_correlation(levels_db: Sequence[float], energies: Sequence[float]) ->
     return float(np.corrcoef(levels_db, energies)[0, 1])
 
 
+def dead_sections(levels_db: Sequence[float]) -> list[int]:
+    """Indexes of the sections (all but the last) that are DEAD_DB or more under the
+    loudest one."""
+    if len(levels_db) < 2:
+        return []
+    loudest = max(levels_db)
+    return [i for i, level in enumerate(levels_db[:-1]) if level <= loudest - DEAD_DB]
+
+
 def analyze_take(
     audio: np.ndarray,
     rate: int,
@@ -112,7 +123,12 @@ def analyze_take(
     energies: Sequence[float],
     tolerance_bpm: float,
     expected_s: float,
+    section_ids: Sequence[str] | None = None,
 ) -> TakeAnalysis:
+    """Tempo, key, section levels and loudness of a take against the arrangement, with
+    flags and a score (1 is best). Sections that came out near-silent (DEAD_DB under the
+    loudest; the last one is left out, as the ending may fade) are flagged and cost
+    score: the mix can lift a quiet bed, not one the model left empty."""
     mono = _mono(audio, rate)
     flags = []
     tempo = estimate_tempo(mono)
@@ -131,6 +147,11 @@ def analyze_take(
     correlation = energy_correlation(levels, energies)
     if correlation is not None and correlation < ENERGY_FLOOR:
         flags.append(f"section levels follow the arrangement weakly (r={correlation:.2f})")
+    dead = dead_sections(levels)
+    if dead:
+        names = [section_ids[i] if section_ids else f"#{i + 1}" for i in dead]
+        flags.append(f"near-silent where music was asked for: {', '.join(names)} "
+                     f"({DEAD_DB:g}+ dB under the loudest section)")  # fmt: skip
     seconds = len(audio) / rate
     if abs(seconds - expected_s) > 1.0:
         flags.append(f"{seconds:.1f} s long; the arrangement is {expected_s:.1f} s")
@@ -139,6 +160,9 @@ def analyze_take(
     score -= 0.4 * min(1.0, excess / max(tolerance_bpm / bpm - TEMPO_DEADBAND, 1e-9))
     score -= KEY_PENALTY.get(relation or "other", 0.3)
     score -= 0.3 * (1 - max(0.0, correlation if correlation is not None else 0.0))
+    total = sum(b - a for a, b in spans_s)
+    if dead and total > 0:
+        score -= DEAD_PENALTY * sum(spans_s[i][1] - spans_s[i][0] for i in dead) / total
     return TakeAnalysis(
         take=take,
         seconds=round(seconds, 3),

@@ -96,8 +96,6 @@ class SpeechInteraction(_Strict):
     # A passage's music starts this long before its first quote, so the music has settled
     # into the quiet bed when the voice comes in (a bar = 4 beats; 0 = none).
     lead_in_beats: float = Field(default=4.0, ge=0)
-    # Before a quote played alone, the music stops this long before the voice.
-    alone_lead_in_beats: float = Field(default=2.0, ge=0)
 
 
 class MixSpec(_Strict):
@@ -117,10 +115,12 @@ class MixSpec(_Strict):
     # Energy shaping: each section's level is pulled toward a line through the sections'
     # median, `energy_range_db` louder at energy 1 than at energy 0. Only the part of a
     # deviation beyond `energy_tolerance_db` is corrected, by at most `energy_max_db`
-    # (0 turns shaping off).
+    # (0 turns shaping off), or `energy_max_boost_db` when a section is too quiet (None:
+    # the same; the music model sometimes makes a quiet bed near-silent).
     energy_range_db: float = Field(default=10.0, ge=0)
     energy_tolerance_db: float = Field(default=3.0, ge=0)
     energy_max_db: float = Field(default=6.0, ge=0)
+    energy_max_boost_db: float | None = Field(default=None, ge=0)
     # A gap (silent section) is a lift into the next one: its music rises by `gap_lift_db`
     # and a reverse swell of the build's tail (at `gap_swell` of that music's level) peaks
     # on the downbeat. `gap_swell` 0 and `gap_lift_db` 0 leave the gap as generated.
@@ -130,10 +130,10 @@ class MixSpec(_Strict):
     # away over this long (0 = the music ends as generated). Arrangements with an ending
     # of their own ring out only where the music stops abruptly (or ends on a final hit).
     ring_out_s: float = Field(default=6.0, ge=0)
-    # Before a quote played alone, the music stops on the bar line and its reverb dies
-    # away over this long; it comes back on the next downbeat through a reverse swell
-    # (at `gap_swell` of that music's level).
-    alone_ring_s: float = Field(default=2.5, ge=0)
+    # A passage played alone: the music stops just before its last phrase and its reverb
+    # dies away over this long, and it comes back a beat or two after the last word
+    # through a reverse swell (at `gap_swell` of that music's level).
+    alone_ring_s: float = Field(default=1.5, ge=0)
     # A section after a gap whose first 1-N bars are near-silent (a generated drop that
     # opens with a silent bar and a riser) is pulled onto its downbeat (0 turns this off).
     late_entry_max_bars: int = Field(default=4, ge=0, le=8)
@@ -387,8 +387,10 @@ class ElevenLabsConfig(_Strict):
     melody_reference: bool = False
     # M7 plans: the music around each quote (the song's first chunk and the music right
     # after a speech passage) is conditioned on that quote's rendered melody. The
-    # melodies used are uploaded once, as one file (billed like a generation).
-    melody_conditioning: bool = True
+    # melodies used are uploaded once, as one file (billed like a generation). Off: on
+    # the first real run the conditioned sections did not follow the melodies (chroma
+    # correlation at chance), but the rendered piano's sound came through.
+    melody_conditioning: bool = False
     condition_strength: Literal["low", "medium", "high", "xhigh"] = "low"
 
     @model_validator(mode="after")

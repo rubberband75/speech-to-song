@@ -119,9 +119,12 @@ balance speech time (a `hook` clip leans to the first slot, an `outro` clip to t
 and each clip gets its own speech bed, starting on a bar and long enough for the clip
 plus `speech_interaction.tail_beats`. A passage (the beds of neighbouring clips) starts
 `lead_in_beats` (4, a bar) before its first word, so the music has settled into the quiet
-bed when the voice comes in. A passage can also be played **alone**: no music at all, the
-music stopping on the bar line `alone_lead_in_beats` (2) before the voice and coming back
-on the next downbeat (Claude's arc chooses this for the line or two that matter most).
+bed when the voice comes in. A passage can also be played **alone** (Claude's arc
+chooses this for the line or two that matter most): its quiet bed carries it until its
+last phrase, which then lands in silence, and the music comes back a beat or two after
+the last word (see `mix`; the timeline marks it "last phrase alone"). When the song
+closes on such a passage, the music runs on into it (an outro before it holds instead of
+fading).
 Other sections take their `bars` from the preset. Beds use their clip's chords from the
 melody; music sections take a progression for their role that best fits the melody heard
 last, and a different one from the role's previous section. A role that appears more than
@@ -152,11 +155,15 @@ is retried once with feedback, and the preset's arc is used if it still can't be
   section or merged run of sections, each stating the tempo, key and "instrumental only",
   with the section's styles, its role's `negative_styles`, and its chords as words).
   Silent sections and anything under 3 s ride along with the chunk before them; nothing
-  is generated for a gap or for a passage played alone (the take is spliced open there,
-  so a build still runs straight into its drop). The music around each quote is
-  conditioned on that quote's rendered melody (`conditioning_ref`, `condition_strength`
-  low); the quote melodies used are uploaded once per run, as one file (billed like a
-  generation). The model fades out at the end of any generation, so a song that ends on a
+  is generated for a gap (nor, in arrangements made before M7.1, for a passage played
+  alone: the take is spliced open there). With `elevenlabs.melody_conditioning: true` in
+  `config.yaml`, the music around each quote is conditioned on that quote's rendered
+  melody (`conditioning_ref`, `condition_strength` low; the melodies are uploaded once per
+  run, billed like a generation). It is off by default: the conditioned music did not
+  follow the melodies, but the rendered piano's sound came through. `generate --takes N`
+  makes (or keeps) N takes for this arrangement instead of `music_takes`. The take
+  analysis flags sections the model left near-silent (32 dB or more under the loudest)
+  and scores them down. The model fades out at the end of any generation, so a song that ends on a
   held chord or a stop is generated 20 s longer and cut on its last bar line. Each take
   is one paid call ($0.15
   per generated minute at API rates, about $0.51 for a 3.4-minute song); it estimates and
@@ -198,10 +205,14 @@ generated for it) is a lift into the drop: the build's music runs on, rises by
 on the downbeat. Generated drops often open with a silent bar and a riser; when the
 section after a gap opens near-silent and reaches full level within
 `late_entry_max_bars` (4), its music is taken from that many bars later, so it starts
-on the downbeat (and its spill into the next section goes back with it). Before a
-passage played alone, the music stops on the bar line and its reverb dies away over
-`alone_ring_s` (2.5); after it, a reverse swell of the returning music grows into the
-next downbeat. At the end, a held chord rings out: the last music that is actually heard
+on the downbeat (and its spill into the next section goes back with it). A passage
+played alone keeps its bed until its last phrase (the latest comma, full stop or new
+clip that leaves 2–6 s of speech, else the longest pause there): the music stops just
+before that phrase and its reverb dies away over `alone_ring_s` (1.5), and it comes back
+on the first beat at least one beat after the last word (or on the next downbeat, if
+that comes within two beats) through a reverse swell. A song that closes on such a
+passage ends there, with the ending's ring. Sections the model made too quiet are lifted
+by up to `energy_max_boost_db` (12). At the end, a held chord rings out: the last music that is actually heard
 goes through a long reverb that dies away over `ring_out_s` (6); a stop gets a short
 ring; a fade is left as the model made it (it is rung out only if it would stop
 abruptly). The file ends where the music has died away, or 3 s after the last line. The
@@ -209,7 +220,7 @@ speech bus sits `mix.speech_level_lu` above the music's loudness, with a high-pa
 gentle compression, and reverb/delay sends whose tails fade out before the next clip.
 The music is never turned down word by word: under each passage it is set once, at the
 passage's bar lines (easing in during the lead-in bar, back out after the last word),
-and only as far as it takes to sit `bed_margin_db` (14 dB) under the speech, at most
+and only as far as it takes to sit `bed_margin_db` (16 dB) under the speech, at most
 `sidechain_duck_db`; a bed the music model made quiet is left alone. The speech guard
 makes sure every word (from the transcript's timings) stays at least
 `speech_margin_db` (10 dB) above the music in the speech band (200 Hz-5 kHz): under

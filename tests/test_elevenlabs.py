@@ -39,7 +39,7 @@ from speech2song.stages.generate_music import choose_take
 from .conftest import PRESETS_DIR, Talk
 from .fixtures.fake_claude import clip_answer, response
 from .fixtures.fake_elevenlabs import FakeElevenLabs
-from .test_arrangement import _melody
+from .test_arrangement import ALONE_PARTS, _melody, as_m7_alone
 
 Cli = Callable[..., Result]
 PRESET = load_preset("cinematic_future_bass", PRESETS_DIR)
@@ -139,6 +139,8 @@ def test_m5_arrangements_keep_their_plan_and_timing() -> None:
     assert arrangement.plan_version == 1 and arrangement.ending is None
     plan, _ = build_plan(arrangement, PRESET)
     assert grid_ms(arrangement) == expected["grid_ms"]  # its takes still fit
+    for chunk in plan["chunks"]:  # a global negative added to the preset for M7.1
+        chunk["negative_styles"].remove("long silences")
     assert plan["chunks"][1:] == expected["plan"]["chunks"][1:]  # no chords, no negatives...
     first, old = plan["chunks"][0], expected["plan"]["chunks"][0]
     assert {k: v for k, v in first.items() if k != "positive_styles"} == \
@@ -171,7 +173,7 @@ def test_m7_chunks_carry_chords_negatives_and_the_development() -> None:
         by_text.setdefault(chunk["text"], []).append(chunk)
     bed = by_text["[Ambient Bed]"][0]
     assert {"drums", "bassline", "lead melody"} <= set(bed["negative_styles"])
-    assert "just a soft sustained pad" in bed["positive_styles"]
+    assert "warm sustained pads" in bed["positive_styles"]
     assert any(s.startswith("slow chord changes") for s in bed["positive_styles"])
     first_drop, last_drop = by_text["[Drop]"]
     assert "restrained first drop" in first_drop["positive_styles"]
@@ -183,13 +185,24 @@ def test_m7_chunks_carry_chords_negatives_and_the_development() -> None:
     assert by_text["[Intro]"][0]["positive_styles"].count("chord progression Am - F") == 1
 
 
-def test_alone_passages_take_no_music_time() -> None:
-    parts = [ArcPart(role="intro", bars=4), ArcPart(role="speech_bed", clips=["a"]),
-             ArcPart(role="build", bars=8),
-             ArcPart(role="speech_bed", clips=["b"], treatment="alone"),
-             ArcPart(role="drop", bars=16),
-             ArcPart(role="speech_bed", clips=["c"], treatment="alone")]  # fmt: skip
-    arrangement = _arrangement(parts)
+def test_alone_passages_keep_their_bed_in_the_plan() -> None:
+    arrangement = _arrangement(ALONE_PARTS)
+    plan, _ = build_plan(arrangement, PRESET)
+    texts = [c["text"] for c in plan["chunks"]]
+    assert texts == [
+        "[Intro]",
+        "[Ambient Bed]",
+        "[Build]",
+        "[Ambient Bed]",
+        "[Drop]",
+        "[Ambient Bed]",
+        "[Ambient Bed]",
+    ]  # fmt: skip (the last: the ending's tail)
+    assert total_ms(plan) == arrangement.total_bars * 2000 + ENDING_TAIL_MS
+
+
+def test_m7_alone_passages_take_no_music_time() -> None:
+    arrangement = as_m7_alone(_arrangement(ALONE_PARTS))
     plan, layout = build_plan(arrangement, PRESET)
     alone = {s.id for s in arrangement.sections if s.rest}
     assert not alone & {s for chunk in layout for s in chunk.sections}
@@ -361,6 +374,16 @@ def test_take_analysis_reads_tempo_key_and_energy() -> None:
     assert wrong.score < result.score
     assert any("off the 97 BPM target" in f for f in wrong.flags)
     assert any("long; the arrangement is 10.0 s" in f for f in wrong.flags)
+    ids = [s.id for s in arrangement.sections]
+    dead = audio.copy()
+    bed = next(i for i, s in enumerate(arrangement.sections) if s.clip_id)
+    dead[round(spans[bed][0] * 44100) : round(spans[bed][1] * 44100)] *= 0.001  # -60 dB
+    empty = analyze_take(dead, 44100, take=3, bpm=120.0, key="A minor", spans_s=spans,
+                         energies=[s.energy for s in arrangement.sections], tolerance_bpm=6,
+                         expected_s=arrangement.total_seconds + 2.0, section_ids=ids)  # fmt: skip
+    assert any(f.startswith(f"near-silent where music was asked for: {ids[bed]} ")
+               for f in empty.flags)  # fmt: skip
+    assert empty.score < result.score
 
 
 # --- The paid generate stage, with a fake client ---------------------------------------------
@@ -415,15 +438,14 @@ def test_generate_with_elevenlabs(cli: Cli, talk: Talk, eleven: Callable) -> Non
     assert json.loads(run.path("06_music/take_001.response.json").read_text())["song_metadata"]
     entries = [e for e in CostLog(run.costs_path).read() if e.service == "elevenlabs"]
     minutes = sum(c["duration_ms"] for c in call["composition_plan"]["chunks"]) / 60_000
-    # the quote melodies the plan is conditioned on are uploaded once, before the takes
-    assert [e.operation for e in entries] == ["music.upload", *["music.compose_detailed"] * 2]
-    assert len(fake.upload_calls) == 1 and entries[0].note.endswith("c2")
-    conditioned = [c for c in call["composition_plan"]["chunks"] if "conditioning_ref" in c]
-    assert conditioned and all(c["conditioning_ref"]["song_id"] == "ref_1" for c in conditioned)
-    assert entries[1].usd == pytest.approx(minutes * 0.15, abs=1e-6)
-    assert entries[1].units == {"minutes": pytest.approx(minutes, abs=1e-4)}
+    # nothing is uploaded: melody conditioning is off unless the config turns it on
+    assert [e.operation for e in entries] == ["music.compose_detailed"] * 2
+    assert fake.upload_calls == []
+    assert all("conditioning_ref" not in c for c in call["composition_plan"]["chunks"])
+    assert entries[0].usd == pytest.approx(minutes * 0.15, abs=1e-6)
+    assert entries[0].units == {"minutes": pytest.approx(minutes, abs=1e-4)}
     assert "generate: cached" in cli("generate", "--yes").output  # no second payment
-    assert len(fake.compose_calls) == 2 and len(fake.upload_calls) == 1
+    assert len(fake.compose_calls) == 2
 
     result = cli("mix")  # picks a take (free), then mixes
     assert result.exit_code == 0, result.output
@@ -447,7 +469,7 @@ def test_a_failed_take_does_not_repeat_the_paid_one(cli: Cli, talk: Talk, eleven
     assert result.exit_code == 1
     assert "ElevenLabs error 500" in result.output and "boom" in result.output
     paid = [e.operation for e in CostLog(run.costs_path).read() if e.service == "elevenlabs"]
-    assert paid == ["music.upload", "music.compose_detailed"]
+    assert paid == ["music.compose_detailed"]
     fake.responses = []
     result = cli("generate", "--yes")
     assert result.exit_code == 0, result.output
@@ -539,7 +561,7 @@ def test_copyright_rejection_is_explained(cli: Cli, talk: Talk, eleven: Callable
     saved = json.loads(run.path("06_music/plan_suggestion.json").read_text())
     assert saved["suggestion"] == suggestion
     paid = [e.operation for e in CostLog(run.costs_path).read() if e.service == "elevenlabs"]
-    assert paid == ["music.upload"]  # the quote melodies (kept for the next try); no take
+    assert paid == []  # no take
 
 
 def test_missing_key_and_confirmation(
@@ -554,12 +576,12 @@ def test_missing_key_and_confirmation(
     assert fake.compose_calls == []
 
 
-def test_melody_reference_is_uploaded_once(
+def test_quote_melodies_are_uploaded_once_when_conditioning_is_on(
     cli: Cli, talk: Talk, eleven: Callable, short_song: Path
 ) -> None:
     run = talk[0]
     config = Path("config.yaml")
-    config.write_text(config.read_text() + "elevenlabs:\n  melody_reference: true\n")
+    config.write_text(config.read_text() + "elevenlabs:\n  melody_conditioning: true\n")
     fake = eleven()
     result = cli("generate", "--music-backend", "elevenlabs", "--yes")
     assert result.exit_code == 0, result.output
@@ -567,8 +589,10 @@ def test_melody_reference_is_uploaded_once(
     first = fake.compose_calls[0]["composition_plan"]["chunks"][0]
     assert first["conditioning_ref"]["song_id"] == "ref_1"
     assert first["condition_strength"] == "low"
-    operations = [e.operation for e in CostLog(run.costs_path).read() if e.service == "elevenlabs"]
-    assert operations == ["music.upload", "music.compose_detailed", "music.compose_detailed"]
+    entries = [e for e in CostLog(run.costs_path).read() if e.service == "elevenlabs"]
+    assert [e.operation for e in entries] == ["music.upload", "music.compose_detailed",
+                                              "music.compose_detailed"]  # fmt: skip
+    assert entries[0].note.endswith("c2")  # the quotes the plan is conditioned on
     preset = short_song / "cinematic_future_bass.yaml"
     data = yaml.safe_load(preset.read_text())
     data["section_roles"]["drop"]["styles"] = ["bigger drop"]
@@ -624,7 +648,7 @@ def test_regenerate_one_section(cli: Cli, talk: Talk, eleven: Callable) -> None:
     assert "▶ take" in result.output and "▶ mix" in result.output  # remixed with the new take
     assert "▶ generate" not in result.output
     stages = [e.stage for e in CostLog(run.costs_path).read() if e.service == "elevenlabs"]
-    assert stages == ["generate", "generate", "generate", "regenerate"]  # upload, two takes
+    assert stages == ["generate", "generate", "regenerate"]  # two takes
 
     bad = cli("regenerate", "--section", "s99", "--yes")
     assert bad.exit_code == 1 and "no section 's99'" in bad.output

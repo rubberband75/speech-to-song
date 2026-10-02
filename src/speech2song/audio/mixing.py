@@ -9,8 +9,10 @@ faded out before the next clip starts, so tails never run into the next line.
 The music is shaped toward the arrangement: sections whose level strays far from their
 energy are pulled back toward it, and gaps (the silent sections, with no music of their
 own) become a lift into the next section: the build's tail rising, with a reverse swell
-of it. A passage played alone gets a stop: the music's reverb dies away from the bar
-line, and the music returns on the next downbeat through a reverse swell. Under a speech
+of it. A passage played alone keeps its quiet bed until its last phrase: the music stops
+just before that phrase and its reverb dies away, and the music returns a beat or two
+after the last word through a reverse swell. (M7 arrangements had no music at all
+under such a passage: a stop on the bar line, back on the next downbeat.) Under a speech
 passage the music is set once, at the passage's bar lines, never following the voice.
 The last chord rings out through a long reverb when the music would otherwise stop
 abruptly.
@@ -408,11 +410,13 @@ def energy_gains(
     range_db: float,
     tolerance_db: float,
     max_db: float,
+    max_boost_db: float | None = None,
 ) -> tuple[list[float], list[float | None]]:
     """(gain dB, target level) per section. The targets lie on a line `range_db` steeper
     from energy 0 to 1, through the median section. Only the part of a deviation beyond
-    `tolerance_db` is corrected, by at most `max_db`. Sections without a level (silent,
-    or too short to measure) get no target and no gain."""
+    `tolerance_db` is corrected, by at most `max_db` (`max_boost_db` upward, if given).
+    Sections without a level (silent, or too short to measure) get no target and no
+    gain."""
     offsets = [lv - range_db * e for lv, e in zip(levels, energies, strict=True) if lv is not None]
     if len(offsets) < 2 or max_db <= 0:
         return [0.0] * len(levels), [None] * len(levels)
@@ -426,7 +430,8 @@ def energy_gains(
             continue
         target = anchor + range_db * energy
         excess = abs(target - level) - tolerance_db
-        gains.append(math.copysign(min(excess, max_db), target - level) if excess > 0 else 0.0)
+        limit = max_boost_db if target > level and max_boost_db is not None else max_db
+        gains.append(math.copysign(min(excess, limit), target - level) if excess > 0 else 0.0)
         targets.append(target)
     return gains, targets
 
@@ -648,35 +653,133 @@ def reverse_swell(music: np.ndarray, at: int, length: int, sr: int) -> np.ndarra
                        room=GAP_ROOM)[::-1].astype(np.float32)  # fmt: skip
 
 
+def _return_swell(
+    out: np.ndarray, music: np.ndarray, back: int, last_word_end: int | None, floor: int,
+    sr: int, swell: float,
+) -> None:  # fmt: skip
+    """Adds (in place) a reverse swell of the music that returns at `back`, growing into
+    it from after the last word (or `floor`), at `swell` times that music's level."""
+    room = back - (last_word_end if last_word_end is not None else floor) \
+        - round(ALONE_WORD_GAP_S * sr)  # fmt: skip
+    length = min(round(ALONE_RETURN_S * sr), room, back)
+    after = stereo(music[back : back + round(SWELL_SOURCE_S * sr)])
+    if swell <= 0 or length < round(ALONE_RETURN_MIN_S * sr) or _rms(after) <= 0:
+        return
+    wash = reverse_swell(music, back, length, sr)
+    near = _rms(wash[-round(0.25 * sr) :])
+    if near <= 0:
+        return
+    t = np.linspace(0, 1, length, dtype=np.float32)
+    envelope = np.sin(0.5 * np.pi * t) ** 2
+    fade = min(length, round(GAP_END_FADE_S * sr))
+    envelope[length - fade :] *= np.linspace(1, 0, fade, dtype=np.float32)
+    out[back - length : back] += wash * (envelope * np.float32(_rms(after) / near * swell))[:, None]
+
+
 def alone_break(
     music: np.ndarray, start: int, end: int, last_word_end: int | None, sr: int, *,
     ring_s: float, swell: float,
 ) -> np.ndarray:  # fmt: skip
-    """The music around a passage played alone (`start` to `end`, bar lines; the take
-    is already silent there). From `start`, the reverb of the music before it dies away
-    over `ring_s` (tapering at once, so the speaker is soon alone); before `end`, if the
-    passage leaves room after its last word, a reverse swell of the returning music
-    grows into the downbeat at `swell` times that music's level. Returns the music."""
+    """The music around a passage played alone in an M7 arrangement (`start` to `end`,
+    bar lines; the take is already silent there). From `start`, the reverb of the music
+    before it dies away over `ring_s` (tapering at once, so the speaker is soon alone);
+    before `end`, if the passage leaves room after its last word, a reverse swell of the
+    returning music grows into the downbeat at `swell` times that music's level. Returns
+    the music."""
     out = music.copy()
     ring = ring_tail(music, sr, start, ring_s, hold=0.0) if ring_s > 0 else None
     if ring is not None:
         stop = min(len(out), start + len(ring))
         out[start:stop] += ring[: stop - start]
-    room = end - (last_word_end if last_word_end is not None else start) \
-        - round(ALONE_WORD_GAP_S * sr)  # fmt: skip
-    length = min(round(ALONE_RETURN_S * sr), room, end)
-    after = stereo(music[end : end + round(SWELL_SOURCE_S * sr)])
-    if swell <= 0 or length < round(ALONE_RETURN_MIN_S * sr) or _rms(after) <= 0:
-        return out
-    wash = reverse_swell(music, end, length, sr)
-    near = _rms(wash[-round(0.25 * sr) :])
-    if near <= 0:
-        return out
-    t = np.linspace(0, 1, length, dtype=np.float32)
-    envelope = np.sin(0.5 * np.pi * t) ** 2
-    fade = min(length, round(GAP_END_FADE_S * sr))
-    envelope[length - fade :] *= np.linspace(1, 0, fade, dtype=np.float32)
-    out[end - length : end] += wash * (envelope * np.float32(_rms(after) / near * swell))[:, None]
+    _return_swell(out, music, end, last_word_end, start, sr, swell)
+    return out
+
+
+PHRASE_MIN_S = 2.0  # a passage's last phrase, heard alone, is at least this long...
+PHRASE_MAX_S = 6.0  # ...and at most this long (where its words allow)
+PHRASE_ENDS = (",", ";", ":", ".", "!", "?", "\u2014", "\u2013", "\u2026")  # dashes, ellipsis
+CLOSING_MARKS = "\"')\u201d\u2019\u00bb"  # quotes and brackets after the mark
+BREAK_LEAD_S = 0.12  # the music stops this long before the last phrase's first word...
+BREAK_FADE_S = 0.08  # ...fading out over this long
+BREATH_BEATS = 1.0  # it returns on the first beat at least this long after the last word...
+RETURN_MAX_BEATS = 2.0  # ...or on the next section's downbeat, if that comes within this
+RETURN_FADE_S = 0.003
+
+
+def _ends_phrase(word: str) -> bool:
+    return word.rstrip(CLOSING_MARKS).endswith(PHRASE_ENDS)
+
+
+def last_phrase(words: Sequence[WordSpan], sr: int) -> int | None:
+    """Index into `words` (a passage's words, in order) of the first word of its last
+    phrase: the latest punctuation mark (or the start of the passage's next clip) that
+    leaves PHRASE_MIN_S to PHRASE_MAX_S of speech after it; failing that, the longest
+    pause in that range. None when the passage is too short to split."""
+    if len(words) < 2:
+        return None
+    end = words[-1].end
+    fits = [i for i in range(1, len(words))
+            if PHRASE_MIN_S <= (end - words[i].start) / sr <= PHRASE_MAX_S]  # fmt: skip
+    marked = [i for i in fits if _ends_phrase(words[i - 1].word)
+              or words[i].clip_id != words[i - 1].clip_id]  # fmt: skip
+    if marked:
+        return marked[-1]
+    if fits:
+        return max(fits, key=lambda i: (words[i].start - words[i - 1].end, i))
+    return None
+
+
+def break_stop(words: Sequence[WordSpan], phrase: int | None, floor: int, sr: int) -> int:
+    """Where the music stops for a passage's last phrase (`phrase`, from `last_phrase`):
+    BREAK_LEAD_S before its first word, in the pause before it where there is one (never
+    before `floor`, the passage's first sample). Without a phrase, before the first word."""
+    first = words[phrase or 0].start
+    stop = first - round(BREAK_LEAD_S * sr)
+    if phrase:
+        stop = max(stop, min(words[phrase - 1].end, first))
+    return max(floor, stop)
+
+
+def return_point(last_word_end: int, passage_end: int, bpm: float, sr: int) -> int:
+    """Where the music comes back after a passage's last phrase: on the next section's
+    downbeat (`passage_end`) when that comes within RETURN_MAX_BEATS of the last word,
+    else on the first beat at least BREATH_BEATS after it, so the silence after the
+    words lasts a beat or two."""
+    beat = beat_seconds(bpm) * sr
+    if passage_end - last_word_end <= RETURN_MAX_BEATS * beat:
+        return passage_end
+    return min(passage_end, round(math.ceil((last_word_end + BREATH_BEATS * beat) / beat
+                                            - 1e-9) * beat))  # fmt: skip
+
+
+def cut_music(music: np.ndarray, stop: int, back: int | None, sr: int) -> np.ndarray:
+    """The music silenced from `stop` (fading out over BREAK_FADE_S before it) to `back`
+    (where it returns, with a 3 ms fade in), or to the end when `back` is None."""
+    out = music.copy()
+    fade = min(round(BREAK_FADE_S * sr), stop)
+    out[stop - fade : stop] *= np.linspace(1, 0, fade, dtype=np.float32)[:, None]
+    end = len(out) if back is None else min(back, len(out))
+    out[stop:end] = 0
+    if back is not None:
+        rise = min(round(RETURN_FADE_S * sr), len(out) - back)
+        out[back : back + rise] *= np.linspace(0, 1, rise, dtype=np.float32)[:, None]
+    return out
+
+
+def phrase_break(
+    music: np.ndarray, stop: int, back: int, last_word_end: int, sr: int, *, ring_s: float,
+    swell: float,
+) -> np.ndarray:  # fmt: skip
+    """A passage's last phrase lands alone: the music stops at `stop` and its reverb dies
+    away over `ring_s` (tapering at once), and it comes back at `back` with a reverse
+    swell growing into it from after the last word (at `swell` times its level). Returns
+    the music."""
+    out = cut_music(music, stop, back, sr)
+    ring = ring_tail(music, sr, stop, ring_s, hold=0.0) if ring_s > 0 else None
+    if ring is not None:
+        n = min(len(ring), len(out) - stop)
+        out[stop : stop + n] += ring[:n]
+    _return_swell(out, music, back, last_word_end, stop, sr, swell)
     return out
 
 

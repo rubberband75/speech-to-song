@@ -252,7 +252,8 @@ class TakeStage(Stage):
 
     name: ClassVar[str] = "take"
     version: ClassVar[int] = 4  # 3: takes of older requests that still fit; 4: rests spliced
-    analysis_version: ClassVar[int] = 5  # 4: silent sections left out; 5: music time
+    # 4: silent sections left out; 5: music time; 6: near-silent sections flagged
+    analysis_version: ClassVar[int] = 6
 
     def plan(self, ctx: Context) -> StagePlan:
         inputs: dict[str, Path] = {}
@@ -302,7 +303,7 @@ class TakeStage(Stage):
                 audio, SAMPLE_RATE, take=meta.take, bpm=targets["bpm"], key=targets["key"],
                 spans_s=[tuple(span) for span in targets["spans_s"]],
                 energies=targets["energies"], tolerance_bpm=params["tolerance_bpm"],
-                expected_s=targets["expected_s"],
+                expected_s=targets["expected_s"], section_ids=targets["sections"],
             ).model_copy(update={"sections": targets["sections"],
                                  "current": meta.request_sha256 == digest})  # fmt: skip
             analyses.append(analysis)
