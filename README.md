@@ -7,7 +7,8 @@ sample-exactly from the source.
 
 `docs/SPEC.md` is the source of truth; accepted changes are logged in `docs/DECISIONS.md`.
 
-**Status:** M5 — the whole pipeline runs: ingest, voice isolation, transcription,
+**Status:** M5 done; next M6–M9 (mix polish, song form, song lengths; see `docs/SPEC.md`
+section 11). The whole pipeline runs: ingest, voice isolation, transcription,
 alignment, clip selection, the speech melody, arrangement, the backing track (Eleven Music,
 or the free `stub` placeholder), take analysis, section regeneration and the mix.
 

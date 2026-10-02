@@ -282,7 +282,11 @@ Every command prints what it read, what it wrote, and any estimated or actual sp
 - **M3 Melody:** pitch tracking, key detection, MIDI and reference WAV output; a small listening-test notebook or script.
 - **M4 Offline end-to-end:** arrangement, stub music backend, mixer. A full song from a talk with zero music-API spend.
 - **M5 ElevenLabs:** composition-plan generation, analysis, take selection, inpainting regeneration.
-- **M6 Styles and polish:** soft piano and lofi presets, stylize mode, README, better review UX.
+- **M6 Mix polish (free, local):** no muted sections (the pre-drop `gap` becomes a short lift: the build's tail and a swell, never silence); ducking per quote, not per word (the music eases down about 0.6 s before a quote's first word, stays down through its pauses and comes back over about 1.5 s after its last word); a gentler speech guard (slower slopes, nearby words handled together); a ring-out of the last chord so a song never just stops. Checked on the existing "Timing" take at no cost.
+- **M7 Song form and melody (paid probe first):** a beginning, middle and end (opening acts, a developing middle, a climax that differs from the first drop, a resolution); per-section style words and richer chord progressions instead of one loop repeated; each quote's speech melody, rendered on a soft instrument and uploaded once, as a `conditioning_ref` (at most 30 s, `low`/`medium` strength) for the music around that quote; an ending that resolves on the tonic with a held final chord, not a fade to silence. Proven with one ~60 s probe before full takes, then compared with the current "Timing" song (its quotes reused).
+- **M8 Lengths `short`, `highlights`, `summary`:** `--length` on `run`/`select`. `short`: 2–4 quotes, a one-drop form fitted to 61–75 s. `highlights`: 3–7 key quotes, 2–3.5 minutes. `summary`: today's behaviour (about 6–10 quotes, 4–6 minutes). Each length lives in its own folder inside the run; ingest, transcribe, align and the talk's melody analysis are shared. Lengths of one run share tempo, key and chords; a new length's selection sees the quotes of lengths already made and keeps the strongest; its music is conditioned on a 30 s slice of the chosen take of an earlier length, so the versions sound like one song. Existing runs' songs become their `summary` length.
+- **M9 Length `full`:** the whole talk in order, no selection. Claude splits the transcript into points and phrases and marks each point's weight; phrases stay sample-exact cuts of the source, with music between them. A minor point gets a short gap, a key point a swell, a major point a build and drop. A 28-minute talk makes a ~35–40 minute song, over the 10-minute limit of one composition plan, so the music is several generations joined on the bar grid, each conditioned on the end of the one before. One take by default (about $5–6 of music for a 28-minute talk).
+- **M10 Styles and polish:** soft piano and lofi presets, stylize mode, README, better review UX.
 
 Work one milestone at a time. After each, summarize what was built, what was tested, and what is uncertain.
 
@@ -291,6 +295,8 @@ Work one milestone at a time. After each, summarize what was built, what was tes
 ## 12. Risks and open questions
 
 - Whether Audio Reference meaningfully follows a supplied melody (likely a soft guide only). Keep the local melody layer as a fallback so the melody is guaranteed.
+- Whether the music model follows chords given as words (undocumented) and per-section melody conditioning from a rendered speech melody (M7 probes both before building on them).
+- Joining several generations into one long `full` song without audible seams (M9).
 - Whether preserved audio chunks in inpainting can sit under speech inside a generation. Not assumed; speech is mixed locally.
 - Pitch tracking on noisy or reverberant recordings. Voice isolation helps; expose a confidence threshold.
 - Tempo ambiguity (half-time vs double-time) in generated music. Analysis must handle both.
