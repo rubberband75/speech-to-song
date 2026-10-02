@@ -220,10 +220,12 @@ def test_word_spans_follow_the_clips() -> None:
     clip = Clip.model_construct(id="c1", start_s=10.0, end_s=12.0)
     placed = [PlacedClip(clip_id="c1", section_id="s2", file="x.wav", start_sample=1000,
                          end_sample=1000 + 2 * 100, start_s=10.0)]  # fmt: skip
-    words = [Word(w="before", start=9.0, end=9.5), Word(w="hello", start=10.5, end=11.0),
-             Word(w="end", start=11.9, end=12.0)]  # fmt: skip
+    words = [Word(w="before", start=9.0, end=9.5), Word(w="early", start=9.9, end=10.3),
+             Word(w="hello", start=10.5, end=11.0), Word(w="end", start=11.9, end=12.0),
+             Word(w="If", start=11.97, end=12.4)]  # fmt: skip
     spans = word_spans(placed, {"c1": clip}, words, 100)
     assert [(s.word, s.start, s.end) for s in spans] == [
+        ("early", 1000, 1000 + round((0.3 + WORD_TAIL_S) * 100)),  # starts inside the clip
         ("hello", 1050, 1000 + round((1.0 + WORD_TAIL_S) * 100)),
         ("end", 1190, 1200),  # kept inside the clip
-    ]  # fmt: skip
+    ]  # "If", the next sentence's first word, only grazes the clip's end cut  # fmt: skip

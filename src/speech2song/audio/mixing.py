@@ -96,15 +96,17 @@ def word_spans(
     placed: Sequence[PlacedClip], clips: dict[str, Clip], words: Sequence[Word], sr: int
 ) -> list[WordSpan]:
     """Where each spoken word of the placed clips lands in the mix (transcript times,
-    extended by WORD_TAIL_S and kept inside the clip)."""
+    extended by WORD_TAIL_S and kept inside the clip). A word belongs to the clip that
+    holds its midpoint: the next sentence's first word, which a cut can graze, does not."""
     spans = []
     for p in placed:
         clip = clips[p.clip_id]
         for word in words:
-            if clip.start_s <= word.start < clip.end_s:
+            if clip.start_s <= (word.start + word.end) / 2 < clip.end_s:
                 start = p.start_sample + round((word.start - clip.start_s) * sr)
                 end = p.start_sample + round((word.end + WORD_TAIL_S - clip.start_s) * sr)
-                spans.append(WordSpan(p.clip_id, word.w, start, min(end, p.end_sample)))
+                spans.append(WordSpan(p.clip_id, word.w, max(start, p.start_sample),
+                                      min(end, p.end_sample)))  # fmt: skip
     return spans
 
 

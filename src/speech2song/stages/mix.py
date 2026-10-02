@@ -169,7 +169,8 @@ def _db(value: float | None) -> str:
 
 class MixStage(Stage):
     name: ClassVar[str] = "mix"
-    version: ClassVar[int] = 4  # 2: energy shaping, gaps; 3: late entries; 4: speech guard
+    # 2: energy shaping, gaps; 3: late entries; 4: speech guard; 5: guard words by midpoint
+    version: ClassVar[int] = 5
 
     def plan(self, ctx: Context) -> StagePlan:
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
