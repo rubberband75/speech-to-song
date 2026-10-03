@@ -6,11 +6,15 @@ backend's request (built from the arrangement), not the arrangement file's bytes
 edits that don't change what would be generated (clip offsets, melody-layer choices)
 never repeat it. Takes of older requests stay available while their timing fits; `take`
 picks among the newest by default, and `--take N` can pick any of them.
+
+Both work on one length (files in <run>/<length>/06_music/). A length that isn't the
+run's anchor is conditioned on the anchor's chosen take (ElevenLabs), so its music waits
+for the anchor's take to be chosen; the take it was made with is kept in its options.
 """
 
 import tempfile
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 import numpy as np
 import soundfile as sf
@@ -37,12 +41,13 @@ from speech2song.config import SAMPLE_RATE, load_preset
 from speech2song.costs import CostLog, SpendEstimate, unit_usd
 from speech2song.errors import S2SError, StageError
 from speech2song.llm.claude import request_digest
-from speech2song.manifest import write_json
+from speech2song.manifest import Song, write_json
 from speech2song.models import Arrangement, QuoteMelodies, TakeAnalysis, TakeChoice, TakeMeta
-from speech2song.music_plan import grid_ms, plan_minutes, tail_ms
+from speech2song.music_plan import AnchorRef, anchor_spans, grid_ms, plan_minutes, tail_ms
 from speech2song.pipeline import Context, Stage, StagePlan, StageResult
 from speech2song.stages.arrange import ARRANGEMENT, usable_arrangement
-from speech2song.stages.melody import QUOTE_INDEX, QUOTE_MELODIES, REFERENCE
+from speech2song.stages.melody import QUOTE_INDEX, QUOTE_MELODIES, REFERENCE, anchor_song
+from speech2song.stages.select_clips import length_preset
 
 MUSIC_DIR = "06_music"
 SELECTED = "06_music/selected.wav"
@@ -56,16 +61,58 @@ def take_meta_path(number: int) -> str:
     return f"{MUSIC_DIR}/take_{number:03d}.meta.json"
 
 
-def _arrangement(ctx: Context) -> Arrangement | None:
-    path = ctx.run.path(ARRANGEMENT)
+def _arrangement(song: Song) -> Arrangement | None:
+    path = song.path(ARRANGEMENT)
     if not path.exists():
         return None
     return Arrangement.model_validate_json(path.read_text(encoding="utf-8"))
 
 
+def chosen_take(song: Song) -> int | None:
+    """The take a length mixes: its `--take`, else the one its take stage chose."""
+    if song.options.take is not None:
+        return song.options.take
+    path = song.path(ANALYSIS)
+    if not path.exists():
+        return None
+    return TakeChoice.model_validate_json(path.read_text(encoding="utf-8")).chosen
+
+
+def find_take(song: Song, number: int) -> TakeMeta | None:
+    """A take's meta, also when it has moved to the archive."""
+    paths = [song.path(take_meta_path(number)),
+             *song.path(MUSIC_DIR).glob(f"archive/*/take_{number:03d}.meta.json")]  # fmt: skip
+    path = next((p for p in paths if p.exists()), None)
+    return TakeMeta.model_validate_json(path.read_text(encoding="utf-8")) if path else None
+
+
+def _conditions_on_anchor(ctx: Context) -> Song | None:
+    """The anchor whose take this length's music is conditioned on, if it is."""
+    anchor = anchor_song(ctx)
+    if anchor is None or not ctx.config.elevenlabs.anchor_conditioning:
+        return None
+    if backend_name(ctx.config, ctx.run.manifest.options) != "elevenlabs":
+        return None
+    return anchor
+
+
+def anchor_ref(ctx: Context) -> AnchorRef | None:
+    """The anchor's take this length's music is conditioned on (the one it was made with
+    first, else the anchor's chosen take), with where each role sits in it."""
+    anchor = _conditions_on_anchor(ctx)
+    if anchor is None:
+        return None
+    number = ctx.song.options.anchor_take or chosen_take(anchor)
+    meta = find_take(anchor, number) if number is not None else None
+    arrangement = _arrangement(anchor)
+    if meta is None or not meta.song_id or meta.backend != "elevenlabs" or arrangement is None:
+        return None
+    return AnchorRef(anchor.length, meta.take, meta.song_id, anchor_spans(arrangement))
+
+
 def melody_files(ctx: Context) -> MelodyFiles:
     """The melody renders that exist in this run (runs from before M7 have no quotes)."""
-    reference, quotes, index = (ctx.run.path(p) for p in (REFERENCE, QUOTE_MELODIES, QUOTE_INDEX))
+    reference, quotes, index = (ctx.song.path(p) for p in (REFERENCE, QUOTE_MELODIES, QUOTE_INDEX))
     return MelodyFiles(
         reference=reference if reference.exists() else None,
         quotes=quotes if quotes.exists() and index.exists() else None,
@@ -76,20 +123,22 @@ def melody_files(ctx: Context) -> MelodyFiles:
 class GenerateStage(Stage):
     name: ClassVar[str] = "generate"
     version: ClassVar[int] = 1
+    scope: ClassVar[Literal["run", "song"]] = "song"
 
     def is_paid(self, ctx: Context) -> bool:
         return backend_name(ctx.config, ctx.run.manifest.options) != "stub"
 
     def _backend(self, ctx: Context) -> MusicBackend:
         options = ctx.run.manifest.options
-        return make_backend(ctx.config, options, CostLog(ctx.run.costs_path), ctx.run.id)
+        return make_backend(ctx.config, options, CostLog(ctx.run.costs_path), ctx.run.id,
+                            length=ctx.length)  # fmt: skip
 
     def _request(self, ctx: Context) -> dict | None:
-        arrangement = _arrangement(ctx)
+        arrangement = _arrangement(ctx.song)
         if arrangement is None:
             return None
-        preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
-        return self._backend(ctx).request(arrangement, preset, melody_files(ctx))
+        return self._backend(ctx).request(arrangement, length_preset(ctx), melody_files(ctx),
+                                          anchor=anchor_ref(ctx))  # fmt: skip
 
     def plan(self, ctx: Context) -> StagePlan:
         takes = ctx.config.music_takes
@@ -99,8 +148,12 @@ class GenerateStage(Stage):
             "takes": takes,
             "request": request_digest(request) if request is not None else None,
         }
+        waits = {"arrangement": ctx.song.path(ARRANGEMENT)}
+        anchor = _conditions_on_anchor(ctx)
+        if anchor is not None and ctx.song.options.anchor_take is None:
+            waits["the anchor's chosen take"] = anchor.path(ANALYSIS)
         # The take numbers are known only after running (see StageResult.outputs).
-        return StagePlan({}, params, [], waits_for={"arrangement": ctx.run.path(ARRANGEMENT)})
+        return StagePlan({}, params, [], waits_for=waits)
 
     def estimate(self, ctx: Context, plan: StagePlan) -> list[SpendEstimate]:
         request = self._request(ctx)
@@ -117,13 +170,22 @@ class GenerateStage(Stage):
         ctx.say(f"  generating {plan.params['takes']} take(s) with the {backend.name} backend")
         if ctx.force and self.is_paid(ctx):
             ctx.say("  --force: making new takes (the current ones move to 06_music/archive/)")
-        takes = backend.generate(request, ctx.run.path(MUSIC_DIR), plan.params["takes"],
-                                 ctx.run.root, say=ctx.say, fresh=ctx.force)  # fmt: skip
+        anchor = anchor_ref(ctx)
+        if anchor is not None:
+            ctx.say(f"  conditioned on take {anchor.take} of {anchor.length} (the run's anchor), "
+                    "section by section")  # fmt: skip
+        elif _conditions_on_anchor(ctx) is not None:
+            ctx.say("[yellow]  the anchor's chosen take is not a stored ElevenLabs take; this "
+                    "music is not conditioned on it[/]")  # fmt: skip
+        takes = backend.generate(request, ctx.song.path(MUSIC_DIR), plan.params["takes"],
+                                 ctx.song.root, say=ctx.say, fresh=ctx.force)  # fmt: skip
+        if anchor is not None and ctx.song.options.anchor_take is None:
+            ctx.song.set_options(anchor_take=anchor.take)  # later anchor choices keep this music
         outputs = []
         for take in takes:
             outputs += [take.meta.file, take_meta_path(take.meta.take)]
             ctx.say(f"  take {take.meta.take}: {take.meta.seconds:.1f} s -> {take.meta.file}")
-        pinned = ctx.run.manifest.options.take
+        pinned = ctx.song.options.take
         if pinned is not None and pinned not in {take.meta.take for take in takes}:
             ctx.say(f"[yellow]  take {pinned} is still the one mixed (--take); use "
                     "`mix --take auto` for the best of these[/]")  # fmt: skip
@@ -254,16 +316,17 @@ class TakeStage(Stage):
     version: ClassVar[int] = 4  # 3: takes of older requests that still fit; 4: rests spliced
     # 4: silent sections left out; 5: music time; 6: near-silent sections flagged
     analysis_version: ClassVar[int] = 6
+    scope: ClassVar[Literal["run", "song"]] = "song"
 
     def plan(self, ctx: Context) -> StagePlan:
         inputs: dict[str, Path] = {}
-        for meta in take_metas(ctx.run.path(MUSIC_DIR)):
-            inputs[f"take {meta.take} meta"] = ctx.run.path(take_meta_path(meta.take))
-            inputs[f"take {meta.take}"] = ctx.run.path(meta.file)
-        arrangement = _arrangement(ctx)
+        for meta in take_metas(ctx.song.path(MUSIC_DIR)):
+            inputs[f"take {meta.take} meta"] = ctx.song.path(take_meta_path(meta.take))
+            inputs[f"take {meta.take}"] = ctx.song.path(meta.file)
+        arrangement = _arrangement(ctx.song)
         request = GenerateStage()._request(ctx)
         params = {
-            "take": ctx.run.manifest.options.take,
+            "take": ctx.song.options.take,
             "backend": backend_name(ctx.config, ctx.run.manifest.options),
             "request": request_digest(request) if request is not None else None,
             "grid_ms": grid_ms(arrangement) if arrangement is not None else None,
@@ -275,7 +338,7 @@ class TakeStage(Stage):
             "analysis": self.analysis_version,
         }  # fmt: skip
         return StagePlan(inputs, params, [SELECTED, ANALYSIS],
-                         waits_for={"arrangement": ctx.run.path(ARRANGEMENT)})  # fmt: skip
+                         waits_for={"arrangement": ctx.song.path(ARRANGEMENT)})  # fmt: skip
 
     def run(self, ctx: Context, plan: StagePlan) -> StageResult:
         usable_arrangement(ctx)
@@ -283,8 +346,8 @@ class TakeStage(Stage):
         grid, digest = params["grid_ms"], params["request"]
         metas = [
             m
-            for m in take_metas(ctx.run.path(MUSIC_DIR))
-            if m.backend == params["backend"] and take_fits(m, ctx.run.root, grid, digest)
+            for m in take_metas(ctx.song.path(MUSIC_DIR))
+            if m.backend == params["backend"] and take_fits(m, ctx.song.root, grid, digest)
         ]
         if not metas:
             raise StageError("no take fits the arrangement; run `speech2song generate`")
@@ -297,7 +360,7 @@ class TakeStage(Stage):
         audio_by_take: dict[int, np.ndarray] = {}
         analyses = []
         for meta in metas:
-            audio = read_take(ctx.run.path(meta.file))
+            audio = read_take(ctx.song.path(meta.file))
             audio_by_take[meta.take] = audio
             analysis = analyze_take(
                 audio, SAMPLE_RATE, take=meta.take, bpm=targets["bpm"], key=targets["key"],
@@ -319,8 +382,8 @@ class TakeStage(Stage):
                 ctx.say(f"[yellow]    {flag}[/]")
         newest = [a for a in analyses if a.current]
         number, reason = choose_take(newest or analyses, requested)
-        write_json(ctx.run.path(ANALYSIS), TakeChoice(chosen=number, reason=reason,
-                                                      takes=analyses))  # fmt: skip
+        write_json(ctx.song.path(ANALYSIS), TakeChoice(chosen=number, reason=reason,
+                                                       takes=analyses))  # fmt: skip
         audio = audio_by_take[number]
         expected = round(targets["expected_s"] * SAMPLE_RATE)  # the mix adds its own tail
         if abs(len(audio) - expected) > SAMPLE_RATE * 0.5:
@@ -332,7 +395,7 @@ class TakeStage(Stage):
         rests = [s.id for s in arrangement.sections if s.rest]
         if rests:
             ctx.say(f"  silence spliced in for the passages played alone ({', '.join(rests)})")
-        write_wav(ctx.run.path(SELECTED), splice_rests(audio, arrangement, frames, SAMPLE_RATE),
+        write_wav(ctx.song.path(SELECTED), splice_rests(audio, arrangement, frames, SAMPLE_RATE),
                   SAMPLE_RATE)  # fmt: skip
         ctx.say(f"  using take {number} ({reason})")
         return StageResult(summary={"take": number, "reason": reason,
@@ -341,13 +404,10 @@ class TakeStage(Stage):
 
 def current_take(ctx: Context) -> TakeMeta:
     """The take the mix uses: `--take`, else the one the take stage chose."""
-    number = ctx.run.manifest.options.take
+    number = chosen_take(ctx.song)
     if number is None:
-        path = ctx.run.path(ANALYSIS)
-        if not path.exists():
-            raise S2SError("No take has been chosen yet; run `speech2song generate` first.")
-        number = TakeChoice.model_validate_json(path.read_text(encoding="utf-8")).chosen
-    meta_path = ctx.run.path(take_meta_path(number))
+        raise S2SError("No take has been chosen yet; run `speech2song generate` first.")
+    meta_path = ctx.song.path(take_meta_path(number))
     if not meta_path.exists():
         raise S2SError(f"Take {number} does not exist; run `speech2song generate` first.")
     return TakeMeta.model_validate_json(meta_path.read_text(encoding="utf-8"))
@@ -369,12 +429,13 @@ def regenerate_sections(
     if meta.backend != "elevenlabs" or not meta.song_id:
         raise S2SError(f"Take {meta.take} was not generated with ElevenLabs (stored for "
                        "inpainting); regenerate needs `--music-backend elevenlabs`.")  # fmt: skip
-    arrangement = _arrangement(ctx)
+    arrangement = _arrangement(ctx.song)
     if arrangement is None:
         raise S2SError("No arrangement; run `speech2song arrange` first.")
-    preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
-    backend = ElevenLabsBackend(ctx.config, CostLog(ctx.run.costs_path), ctx.run.id)
-    if take_grid(meta, ctx.run.root) != grid_ms(arrangement):
+    preset = length_preset(ctx)
+    backend = ElevenLabsBackend(ctx.config, CostLog(ctx.run.costs_path), ctx.run.id,
+                                length=ctx.length)  # fmt: skip
+    if take_grid(meta, ctx.song.root) != grid_ms(arrangement):
         raise S2SError(f"The arrangement's timing changed since take {meta.take} was "
                        "generated, so its sections no longer line up. Run `speech2song "
                        "generate` first.")  # fmt: skip
@@ -399,7 +460,7 @@ def regenerate_sections(
             "it is.")  # fmt: skip
     if not confirm_spend([estimate], console=ctx.console, yes=ctx.yes, dry_run=ctx.dry_run):
         return None
-    return backend.inpaint(plan, meta, ctx.run.path(MUSIC_DIR), ctx.run.root,
+    return backend.inpaint(plan, meta, ctx.song.path(MUSIC_DIR), ctx.song.root,
                            section=label, note=note, span_ms=span, say=ctx.say)  # fmt: skip
 
 
@@ -415,12 +476,12 @@ def undo_regeneration(ctx: Context) -> TakeMeta:
     last_edit = edits.pop() if edits else {}
     undone = [*meta.params.get("undone", []),
               {"file": meta.file, "song_id": meta.song_id, **last_edit}]  # fmt: skip
-    info = probe(ctx.run.path(previous["file"]))
+    info = probe(ctx.song.path(previous["file"]))
     updated = meta.model_copy(update={
         "file": previous["file"], "song_id": previous["song_id"],
         "seconds": round(info.duration_s or meta.seconds, 3),
         "params": {**meta.params, "history": history, "edits": edits, "undone": undone},
     })  # fmt: skip
-    write_json(ctx.run.path(take_meta_path(meta.take)), updated)
+    write_json(ctx.song.path(take_meta_path(meta.take)), updated)
     ctx.say(f"Take {meta.take} is back to {previous['file']} (undid {meta.file}).")
     return updated

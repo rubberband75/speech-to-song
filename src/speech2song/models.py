@@ -76,10 +76,10 @@ class AudioInfo(BaseModel):
 
 
 class RunOptions(BaseModel):
-    """Per-run choices. CLI flags update them, and they stick for later commands."""
+    """Per-run choices, shared by every length of the run. CLI flags update them, and
+    they stick for later commands (a length's own choices are in SongOptions)."""
 
     isolate_voice: bool = False
-    clips: int | None = None
     music_backend: Literal["stub", "elevenlabs"] | None = None
     whisper_model: str | None = None
     language: str | None = None
@@ -87,11 +87,46 @@ class RunOptions(BaseModel):
     key: str | None = None  # e.g. "D minor": overrides key detection
     refine_arc: bool = False  # ask Claude to refine the arrangement (a paid call)
     melody_layer: Literal["replay", "all", "off"] | None = None  # None: the preset's
-    take: int | None = None  # which music take to mix (1-based); None: the first
+
+
+class SongOptions(BaseModel):
+    """Choices for one length of a run (sticky, like RunOptions)."""
+
+    clips: int | None = None  # exactly this many quotes (None: the length's targets)
+    take: int | None = None  # which music take to mix (1-based); None: the take stage's pick
+    # The anchor's take this length's music was conditioned on (kept, so choosing another
+    # anchor take later doesn't ask for this length's music again).
+    anchor_take: int | None = None
+
+
+class SongState(BaseModel):
+    """One length of a run: its options and its stages (outputs in <run>/<length>/)."""
+
+    options: SongOptions = SongOptions()
+    stages: dict[str, StageRecord] = {}
+
+
+class SharedMusic(BaseModel):
+    """What the lengths of a run share, taken from its anchor (the first length whose
+    melody was made): the tempo, the key, the speaker's tuning offset and the melody's
+    octave. The anchor's arrangement also gives the other lengths their chords, and its
+    chosen take conditions their music."""
+
+    anchor: str  # the length these come from
+    bpm: float
+    key: str  # e.g. "C minor"
+    tonic: int
+    mode: Literal["major", "minor"]
+    key_source: Literal["detected", "preset", "override", "fallback"]
+    key_confidence: float | None = None
+    tuning_offset: float
+    octave_shift: int
 
 
 class Manifest(BaseModel):
-    schema_version: Literal[1] = 1
+    # 2 (M8): a run holds songs of several lengths, each in its own folder; schema 1 runs
+    # (one song at the run root) become their summary length when opened.
+    schema_version: Literal[2] = 2
     run_id: str
     created_at: datetime
     tool_version: str
@@ -101,11 +136,14 @@ class Manifest(BaseModel):
     quotes: FileRef | None = None  # passages the song must include (--quotes)
     preset: str
     options: RunOptions = RunOptions()
+    length: str = "summary"  # the length commands act on without --length (sticky)
     settings: dict[str, Any] = {}
     source_probe: SourceProbe | None = None
     source: AudioInfo | None = None
     clean: AudioInfo | None = None
-    stages: dict[str, StageRecord] = {}
+    stages: dict[str, StageRecord] = {}  # the run's shared stages (ingest to align)
+    songs: dict[str, SongState] = {}  # per length: its options and stages
+    shared: SharedMusic | None = None
     hash_memo: dict[str, HashMemo] = {}
 
 
@@ -125,6 +163,7 @@ class CostEntry(BaseModel):
     price_ref: str | None = None
     request_id: str | None = None
     note: str | None = None
+    length: str | None = None  # the song length the call was for (None: before M8)
 
 
 # --- 02_asr.json -------------------------------------------------------------------------
@@ -273,6 +312,30 @@ class ClipSelection(BaseModel):
     notes: str | None = None
 
 
+class VersionPicks(BaseModel):
+    length: str
+    order: list[str]  # the clips this version plays, in play order
+    notes: str | None = None
+
+
+class VersionsAnswer(BaseModel):
+    """The JSON Claude returns when it chooses the quotes for one or more song lengths in
+    one call (M8): every quote once, and per length the quotes it plays."""
+
+    clips: list[SelectedClip]
+    versions: list[VersionPicks]
+
+    def selection(self, length: str) -> ClipSelection | None:
+        """One length's quotes as a plain selection (unknown IDs left out)."""
+        picks = next((v for v in self.versions if v.length == length), None)
+        if picks is None:
+            return None
+        by_id = {clip.id: clip for clip in self.clips}
+        order = [i for i in dict.fromkeys(picks.order) if i in by_id]
+        return ClipSelection(clips=[by_id[i] for i in order], suggested_order=order,
+                             notes=picks.notes)  # fmt: skip
+
+
 class RequiredQuote(BaseModel):
     """A passage the user asked for (`--quotes`), matched to transcript sentences."""
 
@@ -311,19 +374,29 @@ class SelectionAttempt(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     usd: float | None = None
-    answer: ClipSelection | None = None
+    answer: ClipSelection | None = None  # this length's quotes
     problems: list[str] = []
+    versions: VersionsAnswer | None = None  # the whole answer, when it chose versions (M8)
 
 
 class SelectionResult(BaseModel):
     """Claude's raw answers. Clean-up happens in the free `clips` stage, so changing
-    those rules never repeats a paid call."""
+    those rules never repeats a paid call.
+
+    One call can choose several lengths (M8): the first length's file holds the call,
+    and the others copy their part of it (`shared_from`)."""
 
     schema_version: Literal[2] = 2
     model: str  # requested model
     targets: ClipTargets
     attempts: list[SelectionAttempt]
     chosen: int  # index of the attempt whose answer is used
+    length: str | None = None  # None: made before M8, for the run's one song (its summary)
+    lengths: list[str] = []  # every length chosen in the same call
+    targets_by_length: dict[str, ClipTargets] = {}  # what each of them was asked for
+    shared_from: str | None = None  # the length whose call chose these quotes
+    transcript_sha256: str | None = None  # the transcript the call saw
+    prompt: str | None = None  # digest of the prompt template it used
 
     def answer(self) -> ClipSelection:
         answer = self.attempts[self.chosen].answer

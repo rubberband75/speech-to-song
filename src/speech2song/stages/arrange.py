@@ -5,17 +5,23 @@ are laid out on the bar grid (free).
 cache key is the request it would send, so it repeats the call only when the prompt
 changes. `arrange` writes 05_arrangement.json; it checks Claude's plan again and uses the
 preset's arc whenever the plan can't be used.
+
+Both work on one length (files in its folder), with that length's form. A length with a
+time window has its music sections fitted to it, and a length that isn't the run's
+anchor takes the anchor's chords (so it waits for the anchor's arrangement).
 """
 
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from rich.markup import escape
 from rich.table import Table
 
 from speech2song.arrangement import (
     ARC_OUTPUT_TOKENS,
+    FIT_VERSION,
     ClipInfo,
+    anchor_progressions,
     arc_feedback_prompt,
     arc_schema,
     arrangement_warnings,
@@ -25,6 +31,8 @@ from speech2song.arrangement import (
     clip_info,
     default_parts,
     estimate_arc_input_tokens,
+    fit_parts,
+    song_seconds,
     timeline_rows,
     timeline_strip,
     validate_arrangement,
@@ -36,15 +44,15 @@ from speech2song.llm.claude import ClaudeJson, request_digest
 from speech2song.manifest import write_json
 from speech2song.models import ArcAttempt, ArcPlan, ArcResult, Arrangement, ClipSet, Melody
 from speech2song.pipeline import Context, Stage, StagePlan, StageResult
-from speech2song.stages.melody import MELODY, kept_clips
-from speech2song.stages.select_clips import CLIPS, claude_model
+from speech2song.stages.melody import MELODY, anchor_song, kept_clips
+from speech2song.stages.select_clips import CLIPS, claude_model, length_preset
 
 ARC = "05_arc.json"
 ARRANGEMENT = "05_arrangement.json"
 
 
 def _clips(ctx: Context) -> tuple[ClipSet, list[ClipInfo]]:
-    clip_set = ClipSet.model_validate_json(ctx.run.path(CLIPS).read_text(encoding="utf-8"))
+    clip_set = ClipSet.model_validate_json(ctx.song.path(CLIPS).read_text(encoding="utf-8"))
     return clip_set, [clip_info(clip) for clip in kept_clips(clip_set)]
 
 
@@ -52,9 +60,9 @@ def usable_arrangement(ctx: Context) -> Arrangement:
     """05_arrangement.json, checked for hand-edit mistakes before music is generated,
     chosen or mixed for it."""
     arrangement = Arrangement.model_validate_json(
-        ctx.run.path(ARRANGEMENT).read_text(encoding="utf-8")
+        ctx.song.path(ARRANGEMENT).read_text(encoding="utf-8")
     )
-    clip_set = ClipSet.model_validate_json(ctx.run.path(CLIPS).read_text(encoding="utf-8"))
+    clip_set = ClipSet.model_validate_json(ctx.song.path(CLIPS).read_text(encoding="utf-8"))
     problems = validate_arrangement(arrangement, {c.id: clip_info(c) for c in clip_set.clips})
     if problems:
         raise StageError(f"{ARRANGEMENT} can't be used: " + "; ".join(problems))
@@ -62,7 +70,17 @@ def usable_arrangement(ctx: Context) -> Arrangement:
 
 
 def _melody(ctx: Context) -> Melody:
-    return Melody.model_validate_json(ctx.run.path(MELODY).read_text(encoding="utf-8"))
+    return Melody.model_validate_json(ctx.song.path(MELODY).read_text(encoding="utf-8"))
+
+
+def anchor_chords(ctx: Context) -> dict[str, list[list[str]]] | None:
+    """The anchor's chords for this length's music sections (None for the anchor, or
+    while the anchor has no arrangement yet)."""
+    anchor = anchor_song(ctx)
+    if anchor is None or not anchor.path(ARRANGEMENT).exists():
+        return None
+    arrangement = Arrangement.model_validate_json(anchor.path(ARRANGEMENT).read_text())
+    return anchor_progressions(arrangement)
 
 
 ARC_GUESS_INPUT_TOKENS = 3000  # before the clips exist (the prompt is about 2,000)
@@ -91,11 +109,12 @@ class ArcStage(Stage):
     name: ClassVar[str] = "arc"
     version: ClassVar[int] = 2  # 2 (M7): treatments, styles per part, the ending
     paid: ClassVar[bool] = True
+    scope: ClassVar[Literal["run", "song"]] = "song"
 
     def _prompt(self, ctx: Context) -> tuple[str, str, dict[str, object]] | None:
-        if not (ctx.run.path(CLIPS).exists() and ctx.run.path(MELODY).exists()):
+        if not (ctx.song.path(CLIPS).exists() and ctx.song.path(MELODY).exists()):
             return None
-        preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
+        preset = length_preset(ctx)
         clip_set, clips = _clips(ctx)
         system, user = build_arc_prompt(preset, clips, _melody(ctx).bpm, clip_set.notes)
         return system, user, arc_schema(list(preset.section_roles), [c.id for c in clips])
@@ -107,7 +126,7 @@ class ArcStage(Stage):
         if prompt is not None:
             claude = ClaudeJson(ctx.config, CostLog(ctx.run.costs_path), ctx.run.id, model)
             request = request_digest(claude.request(*prompt))
-        waits = {"clips": ctx.run.path(CLIPS), "melody": ctx.run.path(MELODY)}
+        waits = {"clips": ctx.song.path(CLIPS), "melody": ctx.song.path(MELODY)}
         params = {"model": model, "request": request}
         return StagePlan({}, params, [ARC], waits_for=waits)
 
@@ -123,10 +142,11 @@ class ArcStage(Stage):
         if prompt is None:
             raise StageError("arc: the clips and melody must exist first")
         system, user, schema = prompt
-        preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
+        preset = length_preset(ctx)
         _, clips = _clips(ctx)
         load_secrets()
-        claude = ClaudeJson(ctx.config, CostLog(ctx.run.costs_path), ctx.run.id, claude_model(ctx))
+        claude = ClaudeJson(ctx.config, CostLog(ctx.run.costs_path), ctx.run.id, claude_model(ctx),
+                            length=ctx.length)  # fmt: skip
         attempts: list[ArcAttempt] = []
 
         def ask(text: str) -> tuple[ArcPlan, list[str]]:
@@ -158,8 +178,8 @@ class ArcStage(Stage):
             _, second = ask(arc_feedback_prompt(user, answer.parts, problems))
             if len(second) <= len(problems):
                 chosen = 1
-        write_json(ctx.run.path(ARC), ArcResult(model=claude.model, attempts=attempts,
-                                                chosen=chosen))  # fmt: skip
+        write_json(ctx.song.path(ARC), ArcResult(model=claude.model, attempts=attempts,
+                                                 chosen=chosen))  # fmt: skip
         final = attempts[chosen]
         if final.problems:
             ctx.say("[yellow]  Claude's arc still has problems; `arrange` will use the "
@@ -177,12 +197,13 @@ class ArrangeStage(Stage):
     # melody references, the ending (plan version 2); 4 (M7.1): a passage played alone
     # keeps a bed ("break", music until its last phrase)
     version: ClassVar[int] = 4
+    scope: ClassVar[Literal["run", "song"]] = "song"
 
     def plan(self, ctx: Context) -> StagePlan:
-        preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
-        inputs: dict[str, Path] = {"clips": ctx.run.path(CLIPS), "melody": ctx.run.path(MELODY)}
+        preset = length_preset(ctx)
+        inputs: dict[str, Path] = {"clips": ctx.song.path(CLIPS), "melody": ctx.song.path(MELODY)}
         if ctx.run.manifest.options.refine_arc:
-            inputs["arc"] = ctx.run.path(ARC)
+            inputs["arc"] = ctx.song.path(ARC)
         params = {
             "arc": preset.arc,
             "section_roles": {k: v.model_dump() for k, v in preset.section_roles.items()},
@@ -190,10 +211,19 @@ class ArrangeStage(Stage):
             "ending": preset.ending,
             "layer_roles": preset.melody.layer_roles,
         }
-        return StagePlan(inputs, params, [ARRANGEMENT])
+        waits: dict[str, Path] = {}
+        if preset.song_seconds is not None:  # (the summary's request stays as it was)
+            params["song_seconds"] = list(preset.song_seconds)
+            params["mix_ending"] = [preset.mix.ring_out_s, preset.mix.alone_ring_s]
+            params["fit"] = FIT_VERSION
+        anchor = anchor_song(ctx)
+        if anchor is not None:  # its chords: only what this length takes from it counts
+            waits["anchor arrangement"] = anchor.path(ARRANGEMENT)
+            params["anchor_chords"] = anchor_chords(ctx)
+        return StagePlan(inputs, params, [ARRANGEMENT], waits_for=waits)
 
     def run(self, ctx: Context, plan: StagePlan) -> StageResult:
-        preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
+        preset = length_preset(ctx)
         clip_set, clips = _clips(ctx)
         if not clips:
             raise StageError("No clips to arrange (all were dropped).")
@@ -216,15 +246,28 @@ class ArrangeStage(Stage):
             elif proposal is not None:
                 parts, source, notes = proposal.parts, "claude", proposal.notes or notes
                 ending = proposal.ending
+        if preset.song_seconds is not None:
+            before = song_seconds(parts, clips, melody.bpm, preset, ending or preset.ending)
+            parts, warning = fit_parts(parts, clips, melody.bpm, preset, preset.song_seconds,
+                                       ending or preset.ending)  # fmt: skip
+            after = song_seconds(parts, clips, melody.bpm, preset, ending or preset.ending)
+            ctx.say(f"  fitted to {preset.song_seconds[0]:g}-{preset.song_seconds[1]:g} s: "
+                    f"{before:.0f} s -> {after:.0f} s with the ending")  # fmt: skip
+            if warning:
+                warnings.append(warning)
+        chords = plan.params.get("anchor_chords")
+        if chords:
+            ctx.say(f"  music sections take the chords of {anchor_song(ctx).length} "  # type: ignore[union-attr]
+                    "(the run's anchor)")  # fmt: skip
         arrangement = build_arrangement(parts, clips, melody, preset, arc_source=source,
-                                        notes=notes, warnings=warnings,
-                                        ending=ending)  # fmt: skip
+                                        notes=notes, warnings=warnings, ending=ending,
+                                        anchor_chords=chords)  # fmt: skip
         problems = validate_arrangement(arrangement, {c.id: c for c in clips})
         if problems:  # a bug, not a user error: the builder made an invalid arrangement
             raise StageError("invalid arrangement: " + "; ".join(problems))
         for warning in warnings:
             ctx.say(f"[yellow]  {escape(warning)}[/]")
-        write_json(ctx.run.path(ARRANGEMENT), arrangement)
+        write_json(ctx.song.path(ARRANGEMENT), arrangement)
         return StageResult(
             summary={
                 "sections": len(arrangement.sections),
@@ -241,15 +284,15 @@ class ArrangeStage(Stage):
 
 def show_arrangement(ctx: Context) -> None:
     """Print the arrangement's timeline (whether it was just built or cached)."""
-    path = ctx.run.path(ARRANGEMENT)
+    path = ctx.song.path(ARRANGEMENT)
     if not path.exists():
         return
     arrangement = Arrangement.model_validate_json(path.read_text(encoding="utf-8"))
     texts: dict[str, str] = {}
-    if ctx.run.path(CLIPS).exists():
+    if ctx.song.path(CLIPS).exists():
         texts = {c.id: c.text for c in _clips(ctx)[0].clips}
     minutes, seconds = divmod(round(arrangement.total_seconds), 60)
-    table = Table(title=f"Arrangement · {arrangement.key}, {arrangement.bpm:g} BPM, "
+    table = Table(title=f"Arrangement · {ctx.length} · {arrangement.key}, {arrangement.bpm:g} BPM, "
                         f"{arrangement.total_bars} bars, {minutes}:{seconds:02d} "
                         f"(arc from the {arrangement.arc_source})")  # fmt: skip
     for column in ("", "Bar", "Bars", "Time", "Role", "Energy", "Clip / melody layer"):
@@ -266,7 +309,7 @@ def show_arrangement(ctx: Context) -> None:
     if arrangement.notes:
         ctx.console.print(f"Notes: {escape(arrangement.notes)}")
     kept = [s.clip_id for s in arrangement.sections if s.clip_id]
-    if ctx.run.path(CLIPS).exists():
+    if ctx.song.path(CLIPS).exists():
         kept = [c.id for c in _clips(ctx)[1]]
     for warning in arrangement_warnings(arrangement, kept):
         ctx.console.print(f"[yellow]{escape(warning)}[/]")

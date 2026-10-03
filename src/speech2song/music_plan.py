@@ -22,6 +22,13 @@ its drop as the model composed it). Each chunk also gets its role's negative sty
 song's development words, an ending chunk of its own, and, around the quotes, a
 conditioning reference to a quote's rendered melody. Plan version 1 arrangements get
 exactly the M5 plan, so their takes stay valid.
+
+M8: a length that isn't the run's anchor is conditioned on the anchor's chosen take,
+through the take's stored song (the docs: a stored song's slice can condition a new
+song, at most 30 s; "the first chunk influences the generation of all subsequent
+chunks"). Every chunk is conditioned on the anchor's chunk of the same role (a role's
+last chunk on the anchor's last, the others in turn; the middle 30 s of a longer one),
+so a quiet bed follows the anchor's bed and a drop its drop.
 """
 
 import itertools
@@ -29,7 +36,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from speech2song.arrangement import bar_seconds, music_bars
+from speech2song.arrangement import bar_seconds, chord_cycle, music_bars
 from speech2song.config import SPEECH_ROLE, Preset
 from speech2song.models import Arrangement, Section
 
@@ -50,6 +57,17 @@ MAX_CHORD_NAMES = 8
 # cuts the music on the song's last bar line and the mix rings out the chord there.
 ENDING_TAIL_MS = 20_000
 TAIL_STYLES = ["slowly fading out"]
+
+
+@dataclass(frozen=True)
+class AnchorRef:
+    """The take a length's music is conditioned on: the anchor's chosen take (its stored
+    song) and where each role's chunks sit in it (music time, ms)."""
+
+    length: str
+    take: int
+    song_id: str
+    spans: dict[str, list[tuple[int, int]]]
 
 
 @dataclass
@@ -174,14 +192,6 @@ def shape_styles(section: Section) -> list[str]:
     return []
 
 
-def _cycle_of(names: list[str]) -> list[str]:
-    """The shortest repeating pattern in a chord sequence (Gb Ab Bbm Gb Ab Bbm -> 3)."""
-    for period in range(1, len(names) + 1):
-        if all(names[i] == names[i % period] for i in range(len(names))):
-            return names[:period]
-    return names
-
-
 def chord_styles(sections: Sequence[Section]) -> list[str]:
     """The chords of a chunk's sections, as words (undocumented: the M7 probe checks
     whether the model follows them). Repeats collapse; beds ask for slow changes."""
@@ -192,7 +202,7 @@ def chord_styles(sections: Sequence[Section]) -> list[str]:
                 names.append(name)
     if not names:
         return []
-    cycle = _cycle_of(names)[:MAX_CHORD_NAMES]
+    cycle = chord_cycle(names)[:MAX_CHORD_NAMES]
     if len(cycle) == 1:
         return [f"harmony resting on {cycle[0]}"]
     if all(s.role == SPEECH_ROLE for s in sections):
@@ -204,6 +214,35 @@ def chunk_mains(arrangement: Arrangement, layout: Sequence[ChunkLayout]) -> list
     """The section whose styles each chunk gets: its first one with music of its own."""
     by_id = {section.id: section for section in arrangement.sections}
     return [next(by_id[s] for s in chunk.sections if not by_id[s].silent) for chunk in layout]
+
+
+def anchor_spans(anchor: Arrangement) -> dict[str, list[tuple[int, int]]]:
+    """Where each role's sections sit in the anchor's music (ms), in song order;
+    neighbouring sections of a role (a passage's beds) count once, as in a plan's chunks.
+    Sections a plan folds into a neighbour (under 3 s) count too, so every role the
+    anchor has can be matched."""
+    spans: dict[str, list[tuple[int, int]]] = {}
+    previous: str | None = None
+    for section, start, end in section_bounds_ms(anchor):
+        if section.silent or section.rest or end <= start:
+            continue
+        runs = spans.setdefault(section.role, [])
+        if previous == section.role and runs and runs[-1][1] == start:
+            runs[-1] = (runs[-1][0], end)
+        else:
+            runs.append((start, end))
+        previous = section.role
+    return spans
+
+
+def anchor_range(spans: list[tuple[int, int]], number: int, count: int) -> tuple[int, int]:
+    """The slice of the anchor to condition the `number`-th of `count` chunks of a role
+    on: the anchor's last for the last, the others in turn; at most 30 s (the middle)."""
+    start, end = spans[-1] if number == count else spans[min(number, len(spans)) - 1]
+    if end - start > MAX_REFERENCE_MS:
+        start += (end - start - MAX_REFERENCE_MS) // 2
+        end = start + MAX_REFERENCE_MS
+    return start, end
 
 
 def plan_references(arrangement: Arrangement) -> list[str]:
@@ -240,6 +279,8 @@ def build_plan(
     reference_ms: int = MAX_REFERENCE_MS,
     condition_strength: str = "low",
     melody_ranges: dict[str, tuple[int, int]] | None = None,
+    anchor: AnchorRef | None = None,
+    anchor_strength: str = "low",
 ) -> tuple[dict, list[ChunkLayout]]:
     """({"chunks": [...]}, the chunk layout). Styles and shapes come from the arrangement's
     sections (hand edits count); the first chunk adds the preset's global styles. Every
@@ -247,12 +288,14 @@ def build_plan(
 
     `reference_song_id` (M5 plans) conditions the first chunk on the melody reference.
     `melody_ranges` (M7 plans: clip -> range of its melody in the uploaded file) condition
-    each chunk whose section names a `melody_ref`."""
+    each chunk whose section names a `melody_ref`. `anchor` (M8: another length of the
+    run, its chosen take) conditions every chunk on the anchor's chunk of its role."""
     layout = layout_chunks(arrangement)
     by_id = {section.id: section for section in arrangement.sections}
+    mains = chunk_mains(arrangement, layout)
+    roles = [main.role for main in mains]
     chunks = []
-    for index, (chunk, main) in enumerate(zip(layout, chunk_mains(arrangement, layout),
-                                              strict=True)):  # fmt: skip
+    for index, (chunk, main) in enumerate(zip(layout, mains, strict=True)):
         sections = [by_id[s] for s in chunk.sections]
         positive, negative = _chunk_styles(arrangement, preset, main, sections, index == 0)
         item: dict = {
@@ -268,6 +311,13 @@ def build_plan(
                 "range": {"start_ms": 0, "end_ms": min(reference_ms, MAX_REFERENCE_MS)},
             }
             item["condition_strength"] = condition_strength
+        elif anchor is not None and anchor.spans.get(main.role):
+            number = roles[: index + 1].count(main.role)
+            start, end = anchor_range(anchor.spans[main.role], number, roles.count(main.role))
+            item["conditioning_ref"] = {
+                "song_id": anchor.song_id, "range": {"start_ms": start, "end_ms": end},
+            }  # fmt: skip
+            item["condition_strength"] = anchor_strength
         elif melody_ranges and main.melody_ref in melody_ranges:
             start, end = melody_ranges[main.melody_ref]
             item["conditioning_ref"] = {

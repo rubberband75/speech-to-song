@@ -20,6 +20,13 @@ a progression that fits the nearby speech melody, and a role's first and last
 occurrence get styles of their own. The ending is realized by the plan and the mix
 (the music model fades out at the end of any generation, whatever it is asked): a song
 ending on a held chord or a stop comes home to the tonic in its last bar.
+
+M8 lengths: a length's arc and bars come from the preset (`Preset.for_length`); an arc
+entry may give its part's bars ("drop 16"). A length with a time window (`short`:
+61-75 s) has its music sections stretched or shortened (0.5-2x, whole bars) until the
+song and its ending fit. A length that isn't the run's anchor plays the anchor's chords
+in its music sections (a role's first and last occurrence take the anchor's first and
+last), so the versions share their harmony.
 """
 
 import itertools
@@ -33,7 +40,7 @@ from typing import Literal
 import numpy as np
 
 from speech2song.audio.theory import Key, section_progression
-from speech2song.config import SPEECH_ROLE, Preset
+from speech2song.config import SPEECH_ROLE, Preset, arc_entry
 from speech2song.llm.claude import load_prompt
 from speech2song.models import ArcPart, Arrangement, Clip, Ending, Melody, Section
 
@@ -50,6 +57,10 @@ VOICE_WORDS = re.compile(r"\b(vocals?|vocalists?|voices?|sing|singing|singers?|s
                          r"choirs?|choral|chants?|chanting|spoken|speech|narrat\w*|raps?|"
                          r"rapping|humming|whisper\w*)\b", re.IGNORECASE)  # fmt: skip
 SONG_TAIL_S = 2.0  # the mix runs this long past the last bar, so tails ring out
+END_MARGIN_S = 0.5  # the mix's file ends this long after the ending has died away
+FIT_STEPS = (0.5, 1.0, 1.5, 2.0)  # a music part's bars may be scaled by these to fit a window
+FIT_CENTER_WEIGHT = 0.01  # per bar away from the window's middle (only breaks ties)
+FIT_VERSION = 2  # 2: louder sections are shortened last and lengthened first
 RISE_STEP = 0.25  # a rising section with nothing louder ahead climbs this much
 ENERGY_BLOCKS = " ▁▂▃▄▅▆▇█"
 
@@ -158,17 +169,116 @@ def used_slots(groups: int, slots: int) -> list[int]:
 
 def default_parts(preset: Preset, clips: Sequence[ClipInfo]) -> list[ArcPart]:
     """The preset's arc with the clips shared out over its speech_bed slots."""
-    slot_positions = [i for i, role in enumerate(preset.arc) if role == SPEECH_ROLE]
+    entries = [arc_entry(entry) for entry in preset.arc]
+    slot_positions = [i for i, (role, _) in enumerate(entries) if role == SPEECH_ROLE]
     groups = group_clips(clips, len(slot_positions))
     chosen = used_slots(len(groups), len(slot_positions))
     group_at = {slot_positions[s]: group for s, group in zip(chosen, groups, strict=True)}
     parts = []
-    for position, role in enumerate(preset.arc):
+    for position, (role, bars) in enumerate(entries):
         if role != SPEECH_ROLE:
-            parts.append(ArcPart(role=role, bars=preset.role_bars(role)))
+            parts.append(ArcPart(role=role, bars=bars or preset.role_bars(role)))
         elif position in group_at:
             parts.append(ArcPart(role=role, clips=[c.id for c in group_at[position]]))
     return parts
+
+
+def ending_seconds(preset: Preset, ending: Ending) -> float:
+    """How long the mix's ending lasts after the last bar: a held chord's ring, a stop's
+    short ring, or the moment after a fade (see the mix stage)."""
+    if ending == "held_chord":
+        return preset.mix.ring_out_s + END_MARGIN_S
+    if ending == "stop":
+        return preset.mix.alone_ring_s + END_MARGIN_S
+    return END_MARGIN_S
+
+
+def song_seconds(parts: Sequence[ArcPart], clips: Sequence[ClipInfo], bpm: float,
+                 preset: Preset, ending: Ending) -> float:  # fmt: skip
+    """How long a song of these parts lasts, with its ending."""
+    return _bars(parts, clips, bpm, preset) * bar_seconds(bpm) + ending_seconds(preset, ending)
+
+
+def _bed_bars(part: ArcPart, clips: dict[str, ClipInfo], bpm: float, preset: Preset) -> int:
+    speech = preset.speech_interaction
+    return sum(bed_bars(clips[c], bpm, speech.tail_beats, speech.part_pause_beats,
+                        speech.lead_in_beats if n == 0 else 0.0)
+               for n, c in enumerate(part.clips))  # fmt: skip
+
+
+def _bars(parts: Sequence[ArcPart], clips: Sequence[ClipInfo], bpm: float, preset: Preset) -> int:
+    by_id = {clip.id: clip for clip in clips}
+    return sum(_bed_bars(p, by_id, bpm, preset) if p.role == SPEECH_ROLE else p.bars
+               for p in parts)  # fmt: skip
+
+
+def bar_options(bars: int) -> list[int]:
+    """The lengths a music part may take when fitting a song: 0.5-2x its own, in bars."""
+    return sorted({b for f in FIT_STEPS if 1 <= (b := max(1, round(bars * f))) <= MAX_PART_BARS})
+
+
+def fit_cost(bars: int, own: int, energy: float) -> float:
+    """How much a part changes when it takes `bars` instead of its own, in octaves of
+    length, weighted by its energy: a drop (the payoff) is shortened last and lengthened
+    first, an intro or outro the other way round."""
+    change = math.log2(bars / own)
+    return abs(change) * 2 ** (2 * (energy if change < 0 else 1 - energy))
+
+
+def fit_parts(
+    parts: Sequence[ArcPart],
+    clips: Sequence[ClipInfo],
+    bpm: float,
+    preset: Preset,
+    window: tuple[float, float],
+    ending: Ending,
+) -> tuple[list[ArcPart], str | None]:
+    """The parts with their music sections lengthened or shortened (each to 0.5-2x its
+    own bars, see `bar_options`) so the song, with its ending, lasts between `window`
+    seconds: changing as little as possible (see `fit_cost`), the middle of the window
+    breaking ties. Speech passages and silent sections keep their bars. Returns the
+    parts and a warning when no choice fits."""
+    bar = bar_seconds(bpm)
+    by_id = {clip.id: clip for clip in clips}
+    fixed, flexible = 0, []
+    for index, part in enumerate(parts):
+        if part.role == SPEECH_ROLE:
+            fixed += _bed_bars(part, by_id, bpm, preset)
+        elif preset.section_roles[part.role].silent:
+            fixed += part.bars
+        else:
+            flexible.append(index)
+    tail = ending_seconds(preset, ending)
+    low = math.ceil((window[0] - tail) / bar - 1e-9) - fixed  # music bars wanted
+    high = math.floor((window[1] - tail) / bar + 1e-9) - fixed
+    middle = (sum(window) / 2 - tail) / bar - fixed
+    best: dict[int, tuple[float, list[int]]] = {0: (0.0, [])}  # music bars -> cost, choice
+    for index in flexible:
+        own = parts[index].bars
+        energy = preset.section_roles[parts[index].role].energy
+        grown: dict[int, tuple[float, list[int]]] = {}
+        for total, (cost, choice) in best.items():
+            for bars in bar_options(own):
+                option = (cost + fit_cost(bars, own, energy), [*choice, bars])
+                if total + bars not in grown or option[0] < grown[total + bars][0] - 1e-12:
+                    grown[total + bars] = option
+        best = grown
+
+    def score(total: int) -> tuple[int, float]:
+        miss = max(low - total, total - high, 0)
+        return miss, best[total][0] + FIT_CENTER_WEIGHT * abs(total - middle)
+
+    total = min(best, key=score)
+    fitted = list(parts)
+    for index, bars in zip(flexible, best[total][1], strict=True):
+        fitted[index] = parts[index].model_copy(update={"bars": bars})
+    seconds = (fixed + total) * bar + tail
+    warning = None
+    if score(total)[0]:
+        warning = (f"the song lasts {seconds:.0f} s with its ending, outside the "
+                   f"{window[0]:g}-{window[1]:g} s asked for (its quotes need "
+                   f"{fixed * bar:.0f} s)")  # fmt: skip
+    return fitted, warning
 
 
 def check_parts(parts: Sequence[ArcPart], clips: Sequence[ClipInfo], preset: Preset) -> list[str]:
@@ -261,6 +371,32 @@ def _cycle(chords: list[str], bars: int) -> list[str]:
     return [chords[i % len(chords)] for i in range(bars)]
 
 
+def chord_cycle(names: Sequence[str]) -> list[str]:
+    """The shortest repeating pattern in a chord sequence (Gb Ab Bbm Gb Ab Bbm -> 3)."""
+    for period in range(1, len(names) + 1):
+        if all(names[i] == names[i % period] for i in range(len(names))):
+            return list(names[:period])
+    return list(names)
+
+
+def anchor_progressions(anchor: Arrangement) -> dict[str, list[list[str]]]:
+    """Each music role's chords in the anchor's arrangement, per occurrence, as the
+    cycle they repeat (leaving out a last chord that only lands on the tonic: an
+    outro's, or the song's last music)."""
+    music = [i for i, s in enumerate(anchor.sections) if not s.rest and not s.silent]
+    last = music[-1] if music else None
+    found: dict[str, list[list[str]]] = {}
+    for index in music:
+        section = anchor.sections[index]
+        if section.clip_id is not None or not section.chords:
+            continue
+        chords = list(section.chords)
+        if (section.role == "outro" or index == last) and len(chords) > 1:
+            chords = chords[:-1]
+        found.setdefault(section.role, []).append(chord_cycle(chords))
+    return found
+
+
 def _pitch_weights(melody: Melody, clip_id: str | None) -> np.ndarray:
     """How long each pitch class sounds in a clip's melody (else the main phrase's)."""
     phrases = {phrase.clip_id: phrase for phrase in melody.clips}
@@ -292,6 +428,7 @@ def build_arrangement(
     notes: str | None = None,
     warnings: Sequence[str] = (),
     ending: Ending | None = None,
+    anchor_chords: dict[str, list[list[str]]] | None = None,
 ) -> Arrangement:
     """Sections on the bar grid (an M7 arrangement, plan version 2).
 
@@ -306,7 +443,9 @@ def build_arrangement(
     holds steady and lands on the tonic in its last bar, where the mix rings it out.
     When the song closes on a passage, the music runs on into it (an outro before it
     holds instead of falling). Sections in `melody.layer_roles` note the clip heard
-    last, for the melody layer."""
+    last, for the melody layer. With `anchor_chords` (see `anchor_progressions`), a
+    role's sections cycle the anchor's chords instead: its last occurrence takes the
+    anchor's last, the others the anchor's in turn."""
     bpm = melody.bpm
     speech = preset.speech_interaction
     tail, pause = speech.tail_beats, speech.part_pause_beats
@@ -341,6 +480,14 @@ def build_arrangement(
         bar += bars
 
     def chords_for(role: str, bars: int) -> list[str]:
+        shared = (anchor_chords or {}).get(role)
+        if shared:  # the anchor's chords: a role's last occurrence takes its last
+            number, count = seen[role], music_roles.count(role)
+            names = _cycle(shared[-1] if number == count else shared[min(number, len(shared)) - 1],
+                           bars)  # fmt: skip
+            if role == "outro" and bars >= 2:  # a closing section lands home
+                names[-1] = _tonic_chord(melody)
+            return names
         found = section_progression(role, key, bars, _pitch_weights(melody, last_heard),
                                     last_progression.get(role))  # fmt: skip
         if found is None:
@@ -629,6 +776,19 @@ def render_parts(parts: Sequence[ArcPart]) -> str:
     return "\n".join(lines)
 
 
+SUMMARY_SONG_LENGTH = "between about 3 and 6 minutes, longer when there is more speech"
+
+
+def song_length_text(preset: Preset) -> str:
+    """How long the arc prompt asks the song to be (the summary's words are as before)."""
+    if preset.song_seconds is None:
+        return SUMMARY_SONG_LENGTH
+    low, high = preset.song_seconds
+    if high <= 150:
+        return f"between about {low:g} and {high:g} seconds, its ending included"
+    return f"between about {low / 60:g} and {high / 60:g} minutes"
+
+
 def build_arc_prompt(
     preset: Preset, clips: Sequence[ClipInfo], bpm: float, notes: str | None
 ) -> tuple[str, str]:
@@ -665,6 +825,7 @@ def build_arc_prompt(
         max_alone=MAX_ALONE,
         max_styles=MAX_PART_STYLES,
         ending=preset.ending,
+        song_length=song_length_text(preset),
     )
     return system, rendered
 

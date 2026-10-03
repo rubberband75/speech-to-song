@@ -35,7 +35,7 @@ from speech2song.costs import SpendEstimate
 from speech2song.llm.claude import request_digest
 from speech2song.manifest import write_json
 from speech2song.models import Arrangement, TakeMeta
-from speech2song.music_plan import grid_ms, tail_ms
+from speech2song.music_plan import AnchorRef, grid_ms, tail_ms
 
 STUB_VERSION = 1  # bump when the sound changes
 BASE_SEED = 1234
@@ -195,7 +195,11 @@ class StubBackend:
     paid = False
 
     def request(
-        self, arrangement: Arrangement, preset: Preset, melody: MelodyFiles
+        self,
+        arrangement: Arrangement,
+        preset: Preset,
+        melody: MelodyFiles,
+        anchor: AnchorRef | None = None,  # the stub plays no conditioning
     ) -> dict[str, Any]:
         """Sections in music time: a passage played alone has no music (the take stage
         splices it open)."""

@@ -11,7 +11,7 @@ import numpy as np
 import soundfile as sf
 
 from speech2song.audio.synth import build_midi, normalize_peak, render_array, write_wav
-from speech2song.manifest import Run
+from speech2song.manifest import Song
 from speech2song.models import Melody
 
 LISTEN_DIR = "04_listen"
@@ -32,13 +32,14 @@ def _mix(parts: list[tuple[np.ndarray, int, float]], length: int) -> np.ndarray:
     return out
 
 
-def write_listening_set(run: Run, soundfont: Path) -> list[Path]:
-    melody = Melody.model_validate_json(run.path("04_melody.json").read_text())
-    out_dir = run.path(LISTEN_DIR)
+def write_listening_set(song: Song, soundfont: Path) -> list[Path]:
+    """The listening set for one length of a run, in its 04_listen/."""
+    melody = Melody.model_validate_json(song.path("04_melody.json").read_text())
+    out_dir = song.path(LISTEN_DIR)
     out_dir.mkdir(exist_ok=True)
     written = []
     for clip in melody.clips:
-        speech, rate = sf.read(str(run.path(clip.file)), dtype="float32", always_2d=True)
+        speech, rate = sf.read(str(song.path(clip.file)), dtype="float32", always_2d=True)
         speech = _stereo(speech)
         one_loop = build_midi([clip], bpm=melody.bpm, instrument_name=melody.instrument,
                               loops=1, tail_s=0.5)  # fmt: skip

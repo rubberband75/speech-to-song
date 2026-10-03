@@ -65,7 +65,7 @@ Rules:
   already in their bars)
 - at most $max_alone passages are played alone, and each holds a single quote
 - use only the roles listed above
-- keep the whole song between about 3 and 6 minutes, longer when there is more speech
+- keep the whole song $song_length
 
 Then give `ending`, how the music ends after its last section: "held_chord" (it comes
 home and its last chord is held and rings away; the preset's default is $ending), "fade"

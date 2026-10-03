@@ -58,20 +58,22 @@ def test_whole_pipeline_keeps_speech_exact(
 
     result = cli("run", "--run", "latest", "--yes")
     assert result.exit_code == 0, result.output
-    assert "Listen to:" in result.output
+    assert "Listen to (summary):" in result.output
 
     clean, rate = sf.read(str(run.path("01_clean.wav")), dtype="float32", always_2d=True)
-    clip_set = ClipSet.model_validate_json(run.path("03_clips.json").read_text())
+    clip_set = ClipSet.model_validate_json(run.song().path("03_clips.json").read_text())
     fade = round(clip_set.fade_ms / 1000 * rate)
     clips = {}
     for clip in clip_set.clips:  # the cut clips: the source times the fade envelope
-        data, _ = sf.read(str(run.path(clip.file)), dtype="float32", always_2d=True)
+        data, _ = sf.read(str(run.song().path(clip.file)), dtype="float32", always_2d=True)
         expected = fade_edges(clean[clip.start_sample : clip.end_sample], fade)
         assert np.array_equal(data, expected)
         clips[clip.id] = data
 
-    report = MixReport.model_validate_json(run.path("07_mix/mix.json").read_text())
-    speech, _ = sf.read(str(run.path("07_mix/stems/speech.wav")), dtype="float32", always_2d=True)
+    report = MixReport.model_validate_json(run.song().path("07_mix/mix.json").read_text())
+    speech, _ = sf.read(
+        str(run.song().path("07_mix/stems/speech.wav")), dtype="float32", always_2d=True
+    )
     assert sorted(p.clip_id for p in report.clips) == sorted(clips)
     for placed in report.clips:  # ...and the speech stem holds exactly those samples
         assert np.array_equal(speech[placed.start_sample : placed.end_sample],
@@ -91,7 +93,7 @@ def test_whole_pipeline_keeps_speech_exact(
 
     # A passage played alone (a hand edit): its bed runs until its last phrase, which
     # lands in silence; the take still fits (the plan doesn't change), so only the mix runs.
-    path = run.path("05_arrangement.json")
+    path = run.song().path("05_arrangement.json")
     original = path.read_text()
     arrangement = Arrangement.model_validate_json(original)
     bed = [s for s in arrangement.sections if s.clip_id][1]
@@ -100,14 +102,16 @@ def test_whole_pipeline_keeps_speech_exact(
     result = cli("mix", "--run", "latest")
     assert result.exit_code == 0, result.output
     assert "the music drops out at" in result.output
-    report = MixReport.model_validate_json(run.path("07_mix/mix.json").read_text())
+    report = MixReport.model_validate_json(run.song().path("07_mix/mix.json").read_text())
     (item,) = report.breaks
     assert item["sections"] == [bed.id] and item["back_s"] > item["stop_s"]
-    speech, _ = sf.read(str(run.path("07_mix/stems/speech.wav")), dtype="float32", always_2d=True)
+    speech, _ = sf.read(
+        str(run.song().path("07_mix/stems/speech.wav")), dtype="float32", always_2d=True
+    )
     for placed in report.clips:
         assert np.array_equal(speech[placed.start_sample : placed.end_sample],
                               clips[placed.clip_id])  # fmt: skip
-    music, sr = sf.read(str(run.path("07_mix/stems/music.wav")), dtype="float32")
+    music, sr = sf.read(str(run.song().path("07_mix/stems/music.wav")), dtype="float32")
     start = round(bed.start_bar * 4 * 60 / arrangement.bpm * sr)
     stop, back = round(item["stop_s"] * sr), round(item["back_s"] * sr)
     assert np.abs(music[start : stop - sr // 10]).max() > 1e-3  # the bed under the words
@@ -127,13 +131,15 @@ def test_whole_pipeline_keeps_speech_exact(
     result = cli("run", "--run", "latest", "--yes")
     assert result.exit_code == 0, result.output
     assert "silence spliced in" in result.output and "stops for the passages" in result.output
-    report = MixReport.model_validate_json(run.path("07_mix/mix.json").read_text())
+    report = MixReport.model_validate_json(run.song().path("07_mix/mix.json").read_text())
     assert report.alone == [bed.id]
-    speech, _ = sf.read(str(run.path("07_mix/stems/speech.wav")), dtype="float32", always_2d=True)
+    speech, _ = sf.read(
+        str(run.song().path("07_mix/stems/speech.wav")), dtype="float32", always_2d=True
+    )
     for placed in report.clips:
         assert np.array_equal(speech[placed.start_sample : placed.end_sample],
                               clips[placed.clip_id])  # fmt: skip
-    music, sr = sf.read(str(run.path("07_mix/stems/music.wav")), dtype="float32")
+    music, sr = sf.read(str(run.song().path("07_mix/stems/music.wav")), dtype="float32")
     start = round(bed.start_bar * 4 * 60 / arrangement.bpm * sr)
     words = next(p for p in report.clips if p.section_id == bed.id)
     alone = music[start + round(2.6 * sr) : words.end_sample - sr // 2]  # after the ring

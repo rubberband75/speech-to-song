@@ -1,4 +1,9 @@
-"""Run directories: run IDs, manifest I/O, atomic writes, file hashing and per-run logs."""
+"""Run directories: run IDs, manifest I/O, atomic writes, file hashing and per-run logs.
+
+A run holds one talk and songs of several lengths (M8). The talk's files (source audio,
+transcript) sit at the run root; each length's files sit in <run>/<length>/, and every
+path inside them (clip files, takes) is relative to that folder.
+"""
 
 import hashlib
 import json
@@ -16,12 +21,28 @@ from typing import Any
 from pydantic import BaseModel
 
 from speech2song import __version__
+from speech2song.config import SUMMARY
 from speech2song.errors import RunNotFoundError
-from speech2song.models import FileRef, HashMemo, Manifest, RunOptions
+from speech2song.models import (
+    FileRef,
+    HashMemo,
+    Manifest,
+    Melody,
+    RunOptions,
+    SharedMusic,
+    SongOptions,
+    SongState,
+    StageRecord,
+)
 
 MANIFEST_NAME = "manifest.json"
 COSTS_NAME = "costs.json"
 LOG_NAME = "log.txt"
+# Before M8 a run held one song at its root; it becomes the run's summary length.
+SONG_STAGES = ("select", "clips", "melody", "arc", "arrange", "generate", "take", "mix")
+SONG_FILE_PREFIXES = ("03_", "04_", "05_", "06_", "07_")
+SONG_DIRS = ("clips",)
+SONG_OPTIONS = ("clips", "take")
 
 log = logging.getLogger(__name__)
 
@@ -100,12 +121,92 @@ def resolve_run_dir(runs_dir: Path, ref: str | None) -> Path:
     raise RunNotFoundError(f"{ref!r} matches several runs: {names}. Use a longer prefix.")
 
 
+def migrate_v1(root: Path, data: dict[str, Any]) -> dict[str, Any]:
+    """A schema 1 manifest (one song at the run root) as schema 2: the song becomes the
+    run's summary length. Its files move into summary/ unchanged (the paths inside them
+    are relative to the song's folder, so they stay valid), and so do its stage records
+    and options; the hash memo follows the moved files (same inode and mtime)."""
+    song_dir = root / SUMMARY
+    memo = data.setdefault("hash_memo", {})
+    for item in sorted(root.iterdir()):
+        if not (item.name.startswith(SONG_FILE_PREFIXES) or item.name in SONG_DIRS):
+            continue
+        target = song_dir / item.name
+        if target.exists():  # left by an interrupted move: never overwrite
+            continue
+        song_dir.mkdir(exist_ok=True)
+        folder = item.is_dir()
+        files = [p for p in item.rglob("*") if p.is_file()] if folder else [item]
+        keys = {p: str(p.resolve()) for p in files}
+        item.rename(target)
+        for path, key in keys.items():
+            if key in memo:
+                moved = target / path.relative_to(item) if folder else target
+                memo[str(moved.resolve())] = memo.pop(key)
+    stages = data.setdefault("stages", {})
+    song_stages = {name: stages.pop(name) for name in list(stages) if name in SONG_STAGES}
+    options = data.setdefault("options", {})
+    song_options = {k: options.pop(k) for k in SONG_OPTIONS if k in options}
+    song_options = {k: v for k, v in song_options.items() if v is not None}
+    if song_stages or song_options or song_dir.exists():
+        data.setdefault("songs", {})[SUMMARY] = {"options": song_options, "stages": song_stages}
+    data["schema_version"] = 2
+    data["length"] = SUMMARY
+    return data
+
+
+def shared_from_melody(anchor: str, melody: Melody) -> SharedMusic:
+    return SharedMusic(anchor=anchor, bpm=melody.bpm, key=melody.key, tonic=melody.tonic,
+                       mode=melody.mode, key_source=melody.key_source,
+                       key_confidence=melody.key_confidence,
+                       tuning_offset=melody.tuning_offset,
+                       octave_shift=melody.octave_shift)  # fmt: skip
+
+
+class Song:
+    """One length of a run: its folder (<run>/<length>/) and its state in the manifest."""
+
+    def __init__(self, run: "Run", length: str) -> None:
+        self.run = run
+        self.length = length
+
+    @property
+    def root(self) -> Path:
+        return self.run.root / self.length
+
+    def path(self, rel: str) -> Path:
+        return self.root / rel
+
+    @property
+    def state(self) -> SongState:
+        """The length's state, created when first written to."""
+        return self.run.manifest.songs.setdefault(self.length, SongState())
+
+    @property
+    def stages(self) -> dict[str, StageRecord]:
+        """The length's stage records (read only: empty for a length not made yet)."""
+        state = self.run.manifest.songs.get(self.length)
+        return state.stages if state is not None else {}
+
+    @property
+    def options(self) -> SongOptions:
+        state = self.run.manifest.songs.get(self.length)
+        return state.options if state is not None else SongOptions()
+
+    def set_options(self, **changes: Any) -> None:
+        """Apply sticky choices (None means 'keep')."""
+        updates = {key: value for key, value in changes.items() if value is not None}
+        if updates:
+            self.state.options = self.state.options.model_copy(update=updates)
+
+
 class Run:
     """A run directory plus its manifest. Mutate `manifest`, then call `save()`."""
 
     def __init__(self, root: Path, manifest: Manifest) -> None:
         self.root = root
         self.manifest = manifest
+        self.migrated = False  # opened from a schema 1 manifest and moved to summary/
 
     @property
     def id(self) -> str:
@@ -118,6 +219,15 @@ class Run:
     def path(self, rel: str) -> Path:
         return self.root / rel
 
+    def song(self, length: str | None = None) -> Song:
+        """A length of this run (default: the one commands act on)."""
+        return Song(self, length or self.manifest.length)
+
+    def made_lengths(self) -> list[str]:
+        """Lengths that have stages or a folder, in the order they were first made."""
+        return [name for name, state in self.manifest.songs.items()
+                if state.stages or (self.root / name).is_dir()]  # fmt: skip
+
     @classmethod
     def create(
         cls,
@@ -129,6 +239,7 @@ class Run:
         options: RunOptions | None = None,
         settings: dict[str, Any] | None = None,
         now: datetime | None = None,
+        length: str = SUMMARY,
     ) -> "Run":
         now = now or datetime.now().astimezone()
         base_id = make_run_id(input_path, now)
@@ -145,6 +256,7 @@ class Run:
             input=FileRef(path=str(input_path.resolve()), sha256="", size=0),
             preset=preset,
             options=options or RunOptions(),
+            length=length,
             settings=settings or {},
         )
         run = cls(root, manifest)
@@ -157,9 +269,23 @@ class Run:
 
     @classmethod
     def open(cls, runs_dir: Path, ref: str | None = None) -> "Run":
+        """Open a run. A run from before M8 is moved to the M8 layout first: its song
+        becomes the summary length, which then also anchors the run's other lengths."""
         root = resolve_run_dir(runs_dir, ref)
-        manifest = Manifest.model_validate_json((root / MANIFEST_NAME).read_text(encoding="utf-8"))
-        return cls(root, manifest)
+        data = json.loads((root / MANIFEST_NAME).read_text(encoding="utf-8"))
+        migrated = data.get("schema_version", 1) < 2
+        if migrated:
+            data = migrate_v1(root, data)
+        run = cls(root, Manifest.model_validate(data))
+        if migrated:
+            run.migrated = SUMMARY in run.manifest.songs  # it had a song, now the summary
+            melody = run.song(SUMMARY).path("04_melody.json")
+            if melody.is_file():
+                run.manifest.shared = shared_from_melody(
+                    SUMMARY, Melody.model_validate_json(melody.read_text(encoding="utf-8"))
+                )
+            run.save()
+        return run
 
     def save(self) -> None:
         memo = self.manifest.hash_memo

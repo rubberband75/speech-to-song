@@ -33,7 +33,7 @@ def _prepare(cli: Cli, talk: Talk, install: Callable, picks: list | None = None)
 
 
 def _arrangement(talk: Talk) -> Arrangement:
-    return Arrangement.model_validate_json(talk[0].path("05_arrangement.json").read_text())
+    return Arrangement.model_validate_json(talk[0].song().path("05_arrangement.json").read_text())
 
 
 def _ran(output: str) -> list[str]:
@@ -65,17 +65,17 @@ def test_arrange_generate_mix(cli: Cli, talk: Talk, install: Callable, short_son
 
     result = cli("generate")
     assert result.exit_code == 0, result.output
-    assert run.path("06_music/take_001.wav").exists()
-    assert not run.path("06_music/take_002.wav").exists()  # music_takes: 1
+    assert run.song().path("06_music/take_001.wav").exists()
+    assert not run.song().path("06_music/take_002.wav").exists()  # music_takes: 1
 
     result = cli("mix")
     assert result.exit_code == 0, result.output
-    assert "Listen to:" in result.output
-    selected = sf.info(str(run.path("06_music/selected.wav")))
+    assert "Listen to (summary):" in result.output
+    selected = sf.info(str(run.song().path("06_music/selected.wav")))
     assert selected.duration == pytest.approx(arrangement.total_seconds + 2.0, abs=1e-3)
-    report = MixReport.model_validate_json(run.path("07_mix/mix.json").read_text())
+    report = MixReport.model_validate_json(run.song().path("07_mix/mix.json").read_text())
     assert report.melody_layer == "off"  # the preset's default: no MIDI in the song
-    assert not run.path("07_mix/stems/melody_layer.wav").exists()
+    assert not run.song().path("07_mix/stems/melody_layer.wav").exists()
     gaps = [s.id for s in arrangement.sections if s.silent]
     assert gaps and report.lifted == gaps  # lifted into the drop, not muted
     assert report.ending == "held_chord"
@@ -88,29 +88,33 @@ def test_arrange_generate_mix(cli: Cli, talk: Talk, install: Callable, short_son
         s.id for s in arrangement.sections]  # fmt: skip
     assert report.integrated_lufs == pytest.approx(-14.0, abs=0.2)
     assert report.true_peak_dbtp <= -1.0
-    ffmpeg = measure_loudness(run.path("07_mix/master.wav"))
+    ffmpeg = measure_loudness(run.song().path("07_mix/master.wav"))
     assert ffmpeg["integrated_lufs"] == pytest.approx(-14.0, abs=0.3)
     assert ffmpeg["true_peak_dbtp"] <= -0.9  # ffmpeg's own true-peak meter agrees
-    assert sf.info(str(run.path("07_mix/master.wav"))).subtype == "PCM_24"
-    assert run.path("07_mix/master.mp3").stat().st_size > 10_000
-    speech, _ = sf.read(str(run.path("07_mix/stems/speech.wav")), dtype="float32", always_2d=True)
-    clip_set = ClipSet.model_validate_json(run.path("03_clips.json").read_text())
+    assert sf.info(str(run.song().path("07_mix/master.wav"))).subtype == "PCM_24"
+    assert run.song().path("07_mix/master.mp3").stat().st_size > 10_000
+    speech, _ = sf.read(
+        str(run.song().path("07_mix/stems/speech.wav")), dtype="float32", always_2d=True
+    )
+    clip_set = ClipSet.model_validate_json(run.song().path("03_clips.json").read_text())
     files = {c.id: c.file for c in clip_set.clips}
     for placed in report.clips:
-        clip, _ = sf.read(str(run.path(files[placed.clip_id])), dtype="float32", always_2d=True)
+        clip, _ = sf.read(
+            str(run.song().path(files[placed.clip_id])), dtype="float32", always_2d=True
+        )
         assert np.array_equal(speech[placed.start_sample : placed.end_sample], clip)
 
     # Everything is cached now; the melody layer is a mix setting only.
     assert _m4(cli) == []
     result = cli("mix", "--melody-layer", "replay")
     assert _ran(result.output) == ["mix"]
-    layer, _ = sf.read(str(run.path("07_mix/stems/melody_layer.wav")), dtype="float32")
+    layer, _ = sf.read(str(run.song().path("07_mix/stems/melody_layer.wav")), dtype="float32")
     assert np.abs(layer).max() > 0
     assert _m4(cli, "--melody-layer", "all") == ["mix"]
-    report = MixReport.model_validate_json(run.path("07_mix/mix.json").read_text())
+    report = MixReport.model_validate_json(run.song().path("07_mix/mix.json").read_text())
     assert report.melody_layer == "all"
     result = cli("mix", "--melody-layer", "off")
-    assert not run.path("07_mix/stems/melody_layer.wav").exists()
+    assert not run.song().path("07_mix/stems/melody_layer.wav").exists()
     assert "melody layer off" in result.output
 
 
@@ -120,7 +124,7 @@ def test_generate_reruns_only_when_the_music_request_changes(
     run = talk[0]
     _prepare(cli, talk, install, TWO_CLIPS)
     assert _m4(cli) == ["arrange", "generate", "take", "mix"]
-    path = run.path("05_arrangement.json")
+    path = run.song().path("05_arrangement.json")
 
     data = json.loads(path.read_text())
     data["sections"][0]["melody_phrase"] = "c2"  # a melody-layer choice: not in the request
@@ -154,7 +158,7 @@ def test_refine_arc_with_claude(cli: Cli, talk: Talk, install: Callable, short_s
     dry = cli("arrange", "--refine-arc", "--dry-run")
     assert dry.exit_code == 0, dry.output
     assert "refine the arc" in dry.output and "Nothing was executed" in dry.output
-    assert not run.path("05_arc.json").exists()
+    assert not run.song().path("05_arc.json").exists()
 
     fake = install(response(_arc_answer(GOOD_ARC), input_tokens=2000, output_tokens=900))
     result = cli("arrange", "--yes")  # --refine-arc stuck to the run
@@ -192,7 +196,7 @@ def test_refine_arc_retries_then_falls_back_to_the_preset(
     assert result.exit_code == 0, result.output
     assert "asking once more" in result.output
     assert "Your previous answer had these problems" in fake.requests[1]["messages"][0]["content"]
-    saved = ArcResult.model_validate_json(run.path("05_arc.json").read_text())
+    saved = ArcResult.model_validate_json(run.song().path("05_arc.json").read_text())
     assert len(saved.attempts) == 2 and all(a.problems for a in saved.attempts)
     arrangement = _arrangement(talk)
     assert arrangement.arc_source == "preset"
@@ -207,7 +211,7 @@ def test_refine_arc_needs_confirmation(
     result = cli("arrange", "--refine-arc")
     assert result.exit_code == 1
     assert "--yes" in result.output
-    assert not talk[0].path("05_arc.json").exists()
+    assert not talk[0].song().path("05_arc.json").exists()
 
 
 def test_arc_edits_keep_the_paid_selection(

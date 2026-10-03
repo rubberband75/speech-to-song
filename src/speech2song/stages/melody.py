@@ -6,11 +6,16 @@ fits the clips. Then rhythm quantizing, chords per bar, MIDI, a short rendered r
 (two loops of the main phrase), and every quote's own melody rendered into one file
 (04_quote_melodies.wav, indexed by 04_quote_melodies.json) for the music generator to be
 conditioned on.
+
+M8: the first length of a run whose melody is made is its anchor. Its tempo, key, the
+speaker's tuning offset and the melody's octave are kept in the manifest (`shared`), and
+the run's other lengths use them instead of finding their own, so all lengths of a talk
+share them (and a quote in two lengths gets the same notes and chords).
 """
 
 import math
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 import numpy as np
 import soundfile as sf
@@ -30,6 +35,7 @@ from speech2song.audio.theory import (
     PITCH_CLASS,
     Key,
     TimedPitch,
+    alignment_cost,
     choose_chords,
     estimate_tuning,
     grid_beats,
@@ -43,7 +49,7 @@ from speech2song.audio.theory import (
 )
 from speech2song.config import Preset, load_preset
 from speech2song.errors import S2SError, StageError
-from speech2song.manifest import write_json
+from speech2song.manifest import Song, shared_from_melody, write_json
 from speech2song.models import (
     BarChord,
     Clip,
@@ -52,6 +58,7 @@ from speech2song.models import (
     Melody,
     MelodyNote,
     QuoteMelodies,
+    SharedMusic,
     Transcript,
 )
 from speech2song.pipeline import Context, Stage, StagePlan, StageResult
@@ -130,25 +137,33 @@ def build_melody(
     stats: dict[str, tuple[float, float | None]],
     preset: Preset,
     key_override: str | None,
+    shared: SharedMusic | None = None,
 ) -> Melody:
-    """Everything after pitch tracking (pure): key, snapping, tempo, rhythm, chords."""
+    """Everything after pitch tracking (pure): key, snapping, tempo, rhythm, chords.
+    With `shared` (the run's anchor length's), its tuning offset, key, octave and tempo
+    are used instead of being found from these clips (`--key` still wins)."""
     all_segments = [s for c in clips for s in segments[c.id]]
     raw = [s.pitch for s in all_segments]
     weights = [s.end - s.start for s in all_segments]
-    tuning = estimate_tuning(raw, weights)
+    tuning = estimate_tuning(raw, weights) if shared is None else shared.tuning_offset
     tuned = [p - tuning for p in raw]
-    key, key_source, confidence = resolve_key(preset, key_override, tuned, weights)
+    if shared is None or key_override:
+        key, key_source, confidence = resolve_key(preset, key_override, tuned, weights)
+    else:
+        key, key_source, confidence = (Key(shared.tonic, shared.mode), shared.key_source,
+                                       shared.key_confidence)  # fmt: skip
     strength = preset.melody.scale_snap_strength
-    shift, placed = place_octaves([snap_to_scale(p, key, strength) for p in tuned])
+    snapped = [snap_to_scale(p, key, strength) for p in tuned]
+    shift, placed = place_octaves(snapped, shift=shared.octave_shift if shared else None)
 
     grid = grid_beats(preset.melody.quantize_grid)
-    bpm, cost = search_tempo(
-        preset.tempo.bpm,
-        preset.tempo.tolerance_bpm,
-        [c.duration_s for c in clips],
-        [s.start for s in all_segments],
-        grid,
-    )
+    durations = [c.duration_s for c in clips]
+    onsets = [s.start for s in all_segments]
+    if shared is None:
+        bpm, cost = search_tempo(preset.tempo.bpm, preset.tempo.tolerance_bpm, durations,
+                                 onsets, grid)  # fmt: skip
+    else:
+        bpm, cost = shared.bpm, alignment_cost(shared.bpm, durations, onsets, grid)
     beat = 60.0 / bpm
     pitch_of = dict(zip(map(id, all_segments), placed, strict=True))
     melodies = []
@@ -247,18 +262,32 @@ def render_quote_melodies(
     return normalize_peak(np.concatenate(blocks), PEAK_DB), index
 
 
+def shared_music(ctx: Context) -> SharedMusic | None:
+    """The tempo, key and octave this length takes from the run's anchor (None for the
+    anchor itself, or before any length's melody was made)."""
+    shared = ctx.run.manifest.shared
+    return shared if shared is not None and shared.anchor != ctx.length else None
+
+
+def anchor_song(ctx: Context) -> Song | None:
+    """The run's anchor length, when the context's length is another one."""
+    shared = shared_music(ctx)
+    return ctx.run.song(shared.anchor) if shared is not None else None
+
+
 class MelodyStage(Stage):
     name: ClassVar[str] = "melody"
     version: ClassVar[int] = 5  # 4: whole-number tempos; 5 (M7): each quote's melody rendered
+    scope: ClassVar[Literal["run", "song"]] = "song"
 
     def plan(self, ctx: Context) -> StagePlan:
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
-        clips_path = ctx.run.path(CLIPS)
+        clips_path = ctx.song.path(CLIPS)
         inputs: dict[str, Path] = {"clips": clips_path, "transcript": ctx.run.path(TRANSCRIPT)}
         if clips_path.exists():  # the clip files themselves are inputs too
             clip_set = ClipSet.model_validate_json(clips_path.read_text(encoding="utf-8"))
             for clip in kept_clips(clip_set):
-                inputs[f"clip {clip.id}"] = ctx.run.path(clip.file)
+                inputs[f"clip {clip.id}"] = ctx.song.path(clip.file)
         params = {
             # The melody-layer fields only matter to the mix.
             "melody": preset.melody.model_dump(exclude={"layer", "layer_roles"}),
@@ -268,6 +297,9 @@ class MelodyStage(Stage):
             "soundfont": str(ctx.config.soundfont) if ctx.config.soundfont else "auto",
             "analysis": ANALYSIS_VERSION,
         }
+        shared = shared_music(ctx)
+        if shared is not None:  # (the anchor's own request stays as it was before M8)
+            params["shared"] = shared.model_dump()
         return StagePlan(inputs, params,
                          [MELODY, MELODY_MIDI, REFERENCE, QUOTE_MELODIES, QUOTE_INDEX])  # fmt: skip
 
@@ -283,7 +315,7 @@ class MelodyStage(Stage):
         segments: dict[str, list[Segment]] = {}
         stats: dict[str, tuple[float, float | None]] = {}
         for clip in clips:
-            audio, rate = sf.read(str(ctx.run.path(clip.file)), dtype="float32", always_2d=True)
+            audio, rate = sf.read(str(ctx.song.path(clip.file)), dtype="float32", always_2d=True)
             track = track_pitch(audio.mean(axis=1), rate)
             segments[clip.id] = segment_notes(track, clip_words(clip, transcript))
             voiced = np.isfinite(track.midi)
@@ -294,21 +326,25 @@ class MelodyStage(Stage):
         if not any(segments.values()):
             raise StageError("No pitched speech found in the clips.")
 
-        melody = build_melody(clips, segments, stats, preset, ctx.run.manifest.options.key)
-        write_json(ctx.run.path(MELODY), melody)
+        shared = shared_music(ctx)
+        melody = build_melody(clips, segments, stats, preset, ctx.run.manifest.options.key,
+                              shared)  # fmt: skip
+        write_json(ctx.song.path(MELODY), melody)
+        if shared is None:  # the run's anchor: its tempo, key and octave are the run's
+            ctx.run.manifest.shared = shared_from_melody(ctx.length, melody)
         loops = melody.loop_phrase_count
         full = build_midi(melody.clips, bpm=melody.bpm, instrument_name=melody.instrument,
                           loops=loops)  # fmt: skip
-        write_midi(full, ctx.run.path(MELODY_MIDI))
+        write_midi(full, ctx.song.path(MELODY_MIDI))
         main = next(c for c in melody.clips if c.clip_id == melody.main_clip)
         reference = build_midi([main], bpm=melody.bpm, instrument_name=melody.instrument,
                                loops=REFERENCE_LOOPS)  # fmt: skip
-        seconds = render(reference, ctx.run.path(REFERENCE), soundfont)
+        seconds = render(reference, ctx.song.path(REFERENCE), soundfont)
         rate = clip_set.sample_rate
         quotes, index = render_quote_melodies(melody, soundfont, rate)
-        write_wav(ctx.run.path(QUOTE_MELODIES), quotes, rate)
+        write_wav(ctx.song.path(QUOTE_MELODIES), quotes, rate)
         write_json(
-            ctx.run.path(QUOTE_INDEX),
+            ctx.song.path(QUOTE_INDEX),
             QuoteMelodies(
                 file=QUOTE_MELODIES, sample_rate=rate, instrument=melody.instrument, clips=index
             ),
@@ -319,6 +355,8 @@ class MelodyStage(Stage):
             f"  key {melody.key} ({melody.key_source}{confidence}), tuning offset "
             f"{melody.tuning_offset:+.2f} st, octave shift {melody.octave_shift:+d} st"
         )
+        if shared is not None:
+            ctx.say(f"  tempo, key and octave shared with {shared.anchor} (the run's anchor)")
         ctx.say(f"  tempo {melody.bpm:g} BPM (grid misalignment {melody.tempo_cost:.3f})")
         for clip in melody.clips:
             chords = " ".join(c.name for c in clip.chords)

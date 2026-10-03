@@ -56,6 +56,8 @@ elevenlabs:                       # Eleven Music API (needs ELEVENLABS_API_KEY i
   context_adherence: high         # low | medium | high: how closely chunks follow neighbours
   melody_reference: false         # condition the song on 04_melody_reference.wav (paid upload)
   condition_strength: low         # low | medium | high | xhigh (with melody_reference)
+  anchor_conditioning: true       # a run's other lengths follow its anchor's chosen take
+  anchor_strength: low            # low | medium | high | xhigh (nothing is uploaded)
 
 # Prices change. Claude list prices (as of 2026-09-25) and the Eleven Music API rate
 # ($0.15/minute, as of 2026-10-01) are built in; entries here override them.

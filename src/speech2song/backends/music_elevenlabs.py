@@ -41,6 +41,7 @@ from speech2song.models import Arrangement, CostEntry, TakeMeta
 from speech2song.music_plan import (
     MAX_REFERENCE_MS,
     MELODY_SONG,
+    AnchorRef,
     build_plan,
     check_inpaint_plan,
     check_plan,
@@ -113,20 +114,28 @@ class ElevenLabsBackend:
     paid = True
 
     def __init__(self, config: AppConfig, cost_log: CostLog | None = None,
-                 run_id: str = "", stage: str = "generate") -> None:  # fmt: skip
+                 run_id: str = "", stage: str = "generate",
+                 length: str | None = None) -> None:  # fmt: skip
         self.config = config
         self.cost_log = cost_log
         self.run_id = run_id
         self.stage = stage
+        self.length = length  # the song length the calls are for (logged with their cost)
         self._client: Any = None
 
     # --- request and estimate (pure, no network) ---------------------------------------
 
     def request(
-        self, arrangement: Arrangement, preset: Preset, melody: MelodyFiles
+        self,
+        arrangement: Arrangement,
+        preset: Preset,
+        melody: MelodyFiles,
+        anchor: AnchorRef | None = None,
     ) -> dict[str, Any]:
         settings = self.config.elevenlabs
         reference = upload = None
+        if arrangement.plan_version < 2 or not settings.anchor_conditioning:
+            anchor = None
         if arrangement.plan_version < 2:  # M5: the main phrase conditions the first chunk
             if settings.melody_reference and melody.reference is not None:
                 reference = {"path": str(melody.reference),
@@ -138,6 +147,7 @@ class ElevenLabsBackend:
             reference_song_id="<uploaded melody reference>" if reference else None,
             condition_strength=settings.condition_strength,
             melody_ranges={k: tuple(v) for k, v in upload["ranges"].items()} if upload else None,
+            anchor=anchor, anchor_strength=settings.anchor_strength,
         )  # fmt: skip
         request = {
             "backend": self.name,
@@ -150,6 +160,9 @@ class ElevenLabsBackend:
         }
         if upload:  # only M7 requests carry the key, so M5 requests keep their digest
             request["melody_upload"] = upload
+        if anchor is not None:  # (likewise: only a length conditioned on its anchor)
+            request["anchor"] = {"length": anchor.length, "take": anchor.take,
+                                 "song_id": anchor.song_id}  # fmt: skip
         return request
 
     def estimate(self, request: dict[str, Any], takes: int) -> list[SpendEstimate]:
@@ -206,6 +219,7 @@ class ElevenLabsBackend:
                     ts=datetime.now().astimezone(), run_id=self.run_id, stage=self.stage,
                     service="elevenlabs", operation=operation, model=model, units=units,
                     usd=round(usd or 0.0, 6), estimated=True, request_id=ref, note=note,
+                    length=self.length,
                     price_ref=(f"pricing.elevenlabs.{PRICE_ITEM} (as of {price.as_of})"
                                if price else None),
                 )
@@ -394,7 +408,8 @@ class ElevenLabsBackend:
                 usd=round(usd or 0.0, 6), song_id=response.song_id, request_sha256=digest,
                 grid_ms=request["grid_ms"],
                 params={"output_format": output_format, "reference_song_id": song_id,
-                        "filename": getattr(response, "filename", None)},
+                        "filename": getattr(response, "filename", None),
+                        **({"anchor": request["anchor"]} if request.get("anchor") else {})},
             )  # fmt: skip
             write_json(out_dir / f"take_{number:03d}.meta.json", meta)
             say(f"  take {number}: song {response.song_id}, ${usd or 0:.2f} (est.)")

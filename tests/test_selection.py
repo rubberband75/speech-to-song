@@ -6,7 +6,7 @@ import pytest
 
 from speech2song.config import load_preset
 from speech2song.errors import StageError
-from speech2song.models import ClipSelection, ClipTargets, RequiredQuote, RunOptions, SelectedClip
+from speech2song.models import ClipSelection, ClipTargets, RequiredQuote, SelectedClip
 from speech2song.selection import (
     SELECTION_SCHEMA,
     build_prompt,
@@ -58,9 +58,9 @@ def _selection(*clips: SelectedClip, order: list[str] | None = None) -> ClipSele
 
 def test_targets_come_from_the_preset_with_cli_override() -> None:
     preset = load_preset("cinematic_future_bass", PRESETS_DIR)
-    default = clip_targets(preset, RunOptions())
+    default = clip_targets(preset)
     assert (default.count, default.count_range, default.longest) == (8, (6, 10), 40)
-    exact = clip_targets(preset, RunOptions(clips=5))
+    exact = clip_targets(preset, 5)
     assert (exact.count, exact.count_range) == (5, (5, 5))  # --clips N means exactly N
 
 

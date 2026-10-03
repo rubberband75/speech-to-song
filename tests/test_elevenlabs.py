@@ -430,12 +430,14 @@ def test_generate_with_elevenlabs(cli: Cli, talk: Talk, eleven: Callable) -> Non
     assert call["request_options"]["max_retries"] == 0
     assert "output_format" not in call  # "auto": the API's choice
     assert check_plan(call["composition_plan"]) == []
-    meta = TakeMeta.model_validate_json(run.path("06_music/take_001.meta.json").read_text())
+    meta = TakeMeta.model_validate_json(run.song().path("06_music/take_001.meta.json").read_text())
     assert (meta.backend, meta.song_id, meta.file) == ("elevenlabs", "song_1",
                                                        "06_music/take_001.mp3")  # fmt: skip
     assert meta.sample_rate == 48000 and meta.channels == 2
     assert meta.grid_ms == [c["duration_ms"] for c in call["composition_plan"]["chunks"]]
-    assert json.loads(run.path("06_music/take_001.response.json").read_text())["song_metadata"]
+    assert json.loads(run.song().path("06_music/take_001.response.json").read_text())[
+        "song_metadata"
+    ]
     entries = [e for e in CostLog(run.costs_path).read() if e.service == "elevenlabs"]
     minutes = sum(c["duration_ms"] for c in call["composition_plan"]["chunks"]) / 60_000
     # nothing is uploaded: melody conditioning is off unless the config turns it on
@@ -449,11 +451,13 @@ def test_generate_with_elevenlabs(cli: Cli, talk: Talk, eleven: Callable) -> Non
 
     result = cli("mix")  # picks a take (free), then mixes
     assert result.exit_code == 0, result.output
-    choice = TakeChoice.model_validate_json(run.path("06_music/analysis.json").read_text())
+    choice = TakeChoice.model_validate_json(run.song().path("06_music/analysis.json").read_text())
     assert choice.reason == "best score" and len(choice.takes) == 2
     assert all(a.current for a in choice.takes)
-    selected = sf.info(str(run.path("06_music/selected.wav")))
-    arrangement = Arrangement.model_validate_json(run.path("05_arrangement.json").read_text())
+    selected = sf.info(str(run.song().path("06_music/selected.wav")))
+    arrangement = Arrangement.model_validate_json(
+        run.song().path("05_arrangement.json").read_text()
+    )
     assert selected.samplerate == 44100
     assert selected.duration == pytest.approx(arrangement.total_seconds + 2.0, abs=1e-3)
     gaps = {s.id for s in arrangement.sections if s.silent}
@@ -489,16 +493,16 @@ def test_takes_of_an_older_request_stay_while_they_fit(
     run = talk[0]
     fake = eleven()
     assert cli("generate", "--music-backend", "elevenlabs", "--yes").exit_code == 0
-    _edit_styles(run.path("05_arrangement.json"))  # new music, same timing
+    _edit_styles(run.song().path("05_arrangement.json"))  # new music, same timing
     result = cli("generate", "--yes")
     assert result.exit_code == 0, result.output
     assert len(fake.compose_calls) == 4
     assert "take 3: composing" in result.output and "take 4: composing" in result.output
     assert {m.take for m in _metas(run)} == {1, 2, 3, 4}
-    assert not (run.path("06_music") / "archive").exists()
+    assert not (run.song().path("06_music") / "archive").exists()
 
     assert cli("mix").exit_code == 0
-    choice = TakeChoice.model_validate_json(run.path("06_music/analysis.json").read_text())
+    choice = TakeChoice.model_validate_json(run.song().path("06_music/analysis.json").read_text())
     assert [(a.take, a.current) for a in choice.takes] == [
         (1, False), (2, False), (3, True), (4, True)]  # fmt: skip
     assert choice.chosen in (3, 4)  # the newest music by default
@@ -511,7 +515,7 @@ def test_takes_of_an_older_request_stay_while_they_fit(
     assert "generate: cached" in result.output and "take 1 is still the one mixed" not in (
         result.output)  # fmt: skip
     assert "using take" in cli("mix", "--take", "auto").output
-    choice = TakeChoice.model_validate_json(run.path("06_music/analysis.json").read_text())
+    choice = TakeChoice.model_validate_json(run.song().path("06_music/analysis.json").read_text())
     assert choice.chosen in (3, 4) and choice.reason == "best score"
     assert cli("mix", "--take", "7").exit_code == 1
     assert "take 7 is not available" in cli("mix", "--take", "7").output
@@ -533,7 +537,7 @@ def test_takes_that_no_longer_fit_are_archived(
     assert result.exit_code == 0, result.output
     assert len(fake.compose_calls) == 4
     assert {m.take for m in _metas(run)} == {3, 4}  # numbers are never reused
-    archived = list((run.path("06_music") / "archive").iterdir())
+    archived = list((run.song().path("06_music") / "archive").iterdir())
     assert len(archived) == 1
     assert sorted(p.name for p in archived[0].iterdir()) == [
         "take_001.meta.json", "take_001.mp3", "take_001.response.json",
@@ -543,7 +547,7 @@ def test_takes_that_no_longer_fit_are_archived(
 
 def _metas(run: Run) -> list[TakeMeta]:
     return [TakeMeta.model_validate_json(p.read_text())
-            for p in sorted(run.path("06_music").glob("take_*.meta.json"))]  # fmt: skip
+            for p in sorted(run.song().path("06_music").glob("take_*.meta.json"))]  # fmt: skip
 
 
 def test_copyright_rejection_is_explained(cli: Cli, talk: Talk, eleven: Callable) -> None:
@@ -558,7 +562,7 @@ def test_copyright_rejection_is_explained(cli: Cli, talk: Talk, eleven: Callable
     result = cli("generate", "--music-backend", "elevenlabs", "--yes")
     assert result.exit_code == 1
     assert "rejected the plan (bad_composition_plan" in result.output
-    saved = json.loads(run.path("06_music/plan_suggestion.json").read_text())
+    saved = json.loads(run.song().path("06_music/plan_suggestion.json").read_text())
     assert saved["suggestion"] == suggestion
     paid = [e.operation for e in CostLog(run.costs_path).read() if e.service == "elevenlabs"]
     assert paid == []  # no take
@@ -612,7 +616,7 @@ def test_force_adds_fresh_takes(cli: Cli, talk: Talk, eleven: Callable) -> None:
     assert [(m.take, m.song_id) for m in _metas(run)] == [
         (1, "song_1"), (2, "song_2"), (3, "song_3"), (4, "song_4")]  # fmt: skip
     assert cli("mix").exit_code == 0
-    choice = TakeChoice.model_validate_json(run.path("06_music/analysis.json").read_text())
+    choice = TakeChoice.model_validate_json(run.song().path("06_music/analysis.json").read_text())
     assert len(choice.takes) == 4 and all(a.current for a in choice.takes)  # same request
 
 
@@ -621,8 +625,10 @@ def test_regenerate_one_section(cli: Cli, talk: Talk, eleven: Callable) -> None:
     fake = eleven()
     assert cli("generate", "--music-backend", "elevenlabs", "--yes").exit_code == 0
     assert cli("mix").exit_code == 0
-    chosen = TakeChoice.model_validate_json(run.path("06_music/analysis.json").read_text())
-    arrangement = Arrangement.model_validate_json(run.path("05_arrangement.json").read_text())
+    chosen = TakeChoice.model_validate_json(run.song().path("06_music/analysis.json").read_text())
+    arrangement = Arrangement.model_validate_json(
+        run.song().path("05_arrangement.json").read_text()
+    )
     drop = next(s for s in arrangement.sections if s.role == "drop")
 
     dry = cli("regenerate", "--section", drop.id, "--dry-run")
@@ -640,7 +646,7 @@ def test_regenerate_one_section(cli: Cli, talk: Talk, eleven: Callable) -> None:
     assert all(c["song_id"] == original for c in kept)
     assert kept[0]["range"]["start_ms"] == 0
     meta = TakeMeta.model_validate_json(
-        run.path(f"06_music/take_{chosen.chosen:03d}.meta.json").read_text())  # fmt: skip
+        run.song().path(f"06_music/take_{chosen.chosen:03d}.meta.json").read_text())  # fmt: skip
     assert meta.file == f"06_music/take_{chosen.chosen:03d}_v2.mp3"
     assert meta.song_id == "song_3"
     assert meta.params["history"][0]["song_id"] == original
@@ -656,7 +662,7 @@ def test_regenerate_one_section(cli: Cli, talk: Talk, eleven: Callable) -> None:
 
     result = cli("regenerate", "--undo")  # free: back to the first version
     assert result.exit_code == 0, result.output
-    path = run.path(f"06_music/take_{chosen.chosen:03d}.meta.json")
+    path = run.song().path(f"06_music/take_{chosen.chosen:03d}.meta.json")
     meta = TakeMeta.model_validate_json(path.read_text())
     assert meta.file == f"06_music/take_{chosen.chosen:03d}.mp3" and meta.song_id == original
     assert meta.params["history"] == [] and meta.params["undone"][0]["section"] == drop.id
@@ -665,7 +671,7 @@ def test_regenerate_one_section(cli: Cli, talk: Talk, eleven: Callable) -> None:
     assert cli("regenerate", "--section", drop.id, "--yes").exit_code == 0
     meta = TakeMeta.model_validate_json(path.read_text())
     assert meta.file == f"06_music/take_{chosen.chosen:03d}_v3.mp3"  # v2 stays on disk
-    assert run.path(f"06_music/take_{chosen.chosen:03d}_v2.mp3").exists()
+    assert run.song().path(f"06_music/take_{chosen.chosen:03d}_v2.mp3").exists()
 
 
 def test_regenerate_a_range_of_an_older_take(cli: Cli, talk: Talk, eleven: Callable) -> None:
@@ -676,8 +682,10 @@ def test_regenerate_a_range_of_an_older_take(cli: Cli, talk: Talk, eleven: Calla
     fake = eleven()
     assert cli("generate", "--music-backend", "elevenlabs", "--yes").exit_code == 0
     assert cli("mix", "--take", "1").exit_code == 0
-    _edit_styles(run.path("05_arrangement.json"))
-    arrangement = Arrangement.model_validate_json(run.path("05_arrangement.json").read_text())
+    _edit_styles(run.song().path("05_arrangement.json"))
+    arrangement = Arrangement.model_validate_json(
+        run.song().path("05_arrangement.json").read_text()
+    )
     roles = [s.role for s in arrangement.sections]
     ids = [s.id for s in arrangement.sections]
     first, last = ids[roles.index("build")], ids[roles.index("drop")]
@@ -688,7 +696,7 @@ def test_regenerate_a_range_of_an_older_take(cli: Cli, talk: Talk, eleven: Calla
                  if "song_id" not in c]  # fmt: skip
     assert [c["text"] for c in generated] == ["[Build]", "[Drop]"]
     assert {c["context_adherence"] for c in generated} == {"medium"}
-    meta = TakeMeta.model_validate_json(run.path("06_music/take_001.meta.json").read_text())
+    meta = TakeMeta.model_validate_json(run.song().path("06_music/take_001.meta.json").read_text())
     assert meta.params["edits"][0]["section"] == f"{first}-{last}"
     assert "using take 1 (requested)" in result.output
 

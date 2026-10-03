@@ -20,6 +20,7 @@ from speech2song.config import AppConfig, Preset
 from speech2song.costs import CostLog, SpendEstimate
 from speech2song.errors import S2SError
 from speech2song.models import Arrangement, QuoteMelodies, RunOptions, TakeMeta
+from speech2song.music_plan import AnchorRef
 
 
 @dataclass
@@ -42,9 +43,14 @@ class MusicBackend(Protocol):
     paid: bool
 
     def request(
-        self, arrangement: Arrangement, preset: Preset, melody: MelodyFiles
+        self,
+        arrangement: Arrangement,
+        preset: Preset,
+        melody: MelodyFiles,
+        anchor: AnchorRef | None = None,
     ) -> dict[str, Any]:
-        """Everything the backend would send or use to generate (JSON-serializable)."""
+        """Everything the backend would send or use to generate (JSON-serializable).
+        `anchor`: another length's take to condition the music on (M8)."""
         ...
 
     def estimate(self, request: dict[str, Any], takes: int) -> list[SpendEstimate]: ...
@@ -109,7 +115,11 @@ def backend_name(config: AppConfig, options: RunOptions) -> str:
 
 
 def make_backend(
-    config: AppConfig, options: RunOptions, cost_log: CostLog | None = None, run_id: str = ""
+    config: AppConfig,
+    options: RunOptions,
+    cost_log: CostLog | None = None,
+    run_id: str = "",
+    length: str | None = None,
 ) -> MusicBackend:
     name = backend_name(config, options)
     if name == "stub":
@@ -119,5 +129,5 @@ def make_backend(
     if name == "elevenlabs":
         from speech2song.backends.music_elevenlabs import ElevenLabsBackend
 
-        return ElevenLabsBackend(config, cost_log, run_id)
+        return ElevenLabsBackend(config, cost_log, run_id, length=length)
     raise S2SError(f"Unknown music backend {name!r} (use stub or elevenlabs).")

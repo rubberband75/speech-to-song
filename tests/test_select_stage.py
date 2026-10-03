@@ -22,7 +22,7 @@ FADE = round(0.015 * SR)
 
 
 def _clip_set(run: Run) -> ClipSet:
-    return ClipSet.model_validate_json(run.path("03_clips.json").read_text())
+    return ClipSet.model_validate_json(run.song().path("03_clips.json").read_text())
 
 
 def test_dry_run_estimates_without_calling(cli: Cli, talk, install) -> None:
@@ -33,7 +33,7 @@ def test_dry_run_estimates_without_calling(cli: Cli, talk, install) -> None:
     assert "select up to 10 clips (8 sentences)" in result.output
     assert "Dry run total, worst case" in result.output
     assert fake.requests == []
-    assert not run.path("03_selection.json").exists()
+    assert not run.song().path("03_selection.json").exists()
     assert json.loads(run.costs_path.read_text()) == []
 
 
@@ -56,7 +56,9 @@ def test_select_cuts_sample_exact_clips_in_the_pauses(cli: Cli, talk, install) -
     assert entry["usd"] == pytest.approx(0.007)
     assert "Spend this command: $0.0070" in result.output
 
-    selection = SelectionResult.model_validate_json(run.path("03_selection.json").read_text())
+    selection = SelectionResult.model_validate_json(
+        run.song().path("03_selection.json").read_text()
+    )
     assert (len(selection.attempts), selection.chosen) == (1, 0)
     clip_set = _clip_set(run)
     assert [c.id for c in clip_set.clips] == ["c1", "c2", "c3", "c4", "c5"]
@@ -70,7 +72,7 @@ def test_select_cuts_sample_exact_clips_in_the_pauses(cli: Cli, talk, install) -
         # Fades land in the pause: no speech within the fade at either edge.
         assert np.abs(stereo[clip.start_sample : clip.start_sample + FADE]).max() < 1e-4
         assert np.abs(stereo[clip.end_sample - FADE : clip.end_sample]).max() < 1e-4
-        data, rate = sf.read(str(run.path(clip.file)), dtype="float32", always_2d=True)
+        data, rate = sf.read(str(run.song().path(clip.file)), dtype="float32", always_2d=True)
         assert rate == SR and len(data) == clip.end_sample - clip.start_sample
         source = stereo[clip.start_sample : clip.end_sample]
         np.testing.assert_array_equal(data[FADE:-FADE], source[FADE:-FADE])  # sample-exact
@@ -111,7 +113,9 @@ def test_invalid_answer_gets_one_retry_with_feedback(cli: Cli, talk, install) ->
     retry_prompt = fake.requests[1]["messages"][0]["content"]
     assert "Your previous answer had these problems" in retry_prompt
     assert "which read" in retry_prompt
-    selection = SelectionResult.model_validate_json(run.path("03_selection.json").read_text())
+    selection = SelectionResult.model_validate_json(
+        run.song().path("03_selection.json").read_text()
+    )
     assert len(selection.attempts) == 2 and selection.attempts[0].problems
     assert selection.chosen == 1
     assert len(_clip_set(run).clips) == 5
@@ -124,7 +128,7 @@ def test_refusal_fails_the_stage_but_logs_the_cost(cli: Cli, talk, install) -> N
     result = cli("select", "--yes")
     assert result.exit_code == 1
     assert "declined" in result.output
-    assert Run.open(run.root.parent, run.id).manifest.stages["select"].status == "failed"
+    assert Run.open(run.root.parent, run.id).song().stages["select"].status == "failed"
     assert len(json.loads(run.costs_path.read_text())) == 1
 
 
@@ -133,7 +137,7 @@ def test_interactive_review_is_saved_and_survives_reruns(cli: Cli, talk, install
     install(response(clip_answer(talk[1])))
     result = cli("select", "--yes", "--interactive-review", input="drop c2\nmove c1 1\nsave\n")
     assert result.exit_code == 0, result.output
-    review = ClipReview.model_validate_json(run.path("03_review.json").read_text())
+    review = ClipReview.model_validate_json(run.song().path("03_review.json").read_text())
     assert review.order == ["c1", "c5", "c4", "c3"] and review.dropped == ["c2"]
     clip_set = _clip_set(run)
     assert clip_set.order == review.order and clip_set.dropped == ["c2"]
@@ -147,7 +151,7 @@ def test_review_quit_saves_nothing(cli: Cli, talk, install) -> None:
     result = cli("select", "--yes", "--interactive-review", input="drop c1\nquit\n")
     assert result.exit_code == 0, result.output
     assert "without saving" in result.output
-    assert not talk[0].path("03_review.json").exists()
+    assert not talk[0].song().path("03_review.json").exists()
 
 
 def test_costs_command_lists_the_call(cli: Cli, talk, install) -> None:
@@ -183,7 +187,7 @@ def test_long_quotes_are_cut_into_parts_at_their_pauses(
     pause = silences[2]  # between sentences 2 and 3
     assert pause[0] <= first.end_s <= second.start_s <= pause[1]
     for clip in (first, second):
-        data, _ = sf.read(str(run.path(clip.file)), dtype="float32", always_2d=True)
+        data, _ = sf.read(str(run.song().path(clip.file)), dtype="float32", always_2d=True)
         source = stereo[clip.start_sample : clip.end_sample]
         np.testing.assert_array_equal(data[FADE:-FADE], source[FADE:-FADE])  # sample-exact
     assert "(part 1 of 2)" in result.output

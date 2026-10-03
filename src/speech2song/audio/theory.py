@@ -126,13 +126,16 @@ def place_octaves(
     *,
     center: tuple[int, int] = (60, 72),
     span: tuple[int, int] = (55, 84),
+    shift: int | None = None,
 ) -> tuple[int, list[float]]:
-    """Shift the whole melody by octaves so its median lands in `center`, then fold any
-    note outside `span` back by octaves. Returns (overall shift, pitches)."""
+    """Shift the whole melody by octaves so its median lands in `center` (or by `shift`,
+    e.g. the shift another set of phrases of the same speaker took), then fold any note
+    outside `span` back by octaves. Returns (overall shift, pitches)."""
     if not len(pitches):
-        return 0, []
-    median = float(np.median(pitches))
-    shift = 12 * math.ceil((center[0] - median) / 12)
+        return shift or 0, []
+    if shift is None:
+        median = float(np.median(pitches))
+        shift = 12 * math.ceil((center[0] - median) / 12)
     shifted = [p + shift for p in pitches]
     folded = []
     for p in shifted:

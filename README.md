@@ -7,10 +7,11 @@ sample-exactly from the source.
 
 `docs/SPEC.md` is the source of truth; accepted changes are logged in `docs/DECISIONS.md`.
 
-**Status:** M5 done; next M6–M9 (mix polish, song form, song lengths; see `docs/SPEC.md`
+**Status:** M8 (song lengths) done; next M9 (the whole talk as a song; see `docs/SPEC.md`
 section 11). The whole pipeline runs: ingest, voice isolation, transcription,
 alignment, clip selection, the speech melody, arrangement, the backing track (Eleven Music,
-or the free `stub` placeholder), take analysis, section regeneration and the mix.
+or the free `stub` placeholder), take analysis, section regeneration and the mix, for
+songs of three lengths per talk.
 
 ## Install
 
@@ -52,10 +53,16 @@ speech2song run inputs/talk.mp3 --transcript inputs/talk.txt      # every step
 speech2song run "https://www.churchofjesuschrist.org/study/general-conference/2016/04/opposition-in-all-things?lang=eng"   # a talk's page
 speech2song run "https://speeches.byu.edu/talks/dallin-h-oaks/timing/" --model claude-opus-5-5 --refine-arc --music-backend elevenlabs   # the paid song in one go
 speech2song run --run latest --stop-after arrange   # resume; stop to check the arrangement
+speech2song run --run latest --length short          # a one-minute version of the same talk
+speech2song run URL --length highlights,short        # two lengths; one Claude call picks both
+speech2song mix --length highlights --take 2         # per-length commands take --length
 ```
 
-- Each run lives in `runs/<run_id>/` (`manifest.json`, `costs.json`, `log.txt`, numbered
-  artifacts). Commands act on the latest run unless given `--run ID` (or a unique prefix).
+- Each run lives in `runs/<run_id>/` (`manifest.json`, `costs.json`, `log.txt`, the
+  talk's audio and transcript), with one folder per song length (`summary/`, `short/`,
+  `highlights/`) holding that song's numbered artifacts. Commands act on the latest run
+  unless given `--run ID` (or a unique prefix), and on the run's length unless given
+  `--length`.
 - Stages are skipped when their inputs and settings are unchanged; `--force` re-runs them.
 - `--isolate-voice` (on `ingest`/`run`) writes `01_clean.wav` from demucs-isolated vocals;
   later stages analyse and cut clips from it instead of the original. It takes roughly 1.5x
@@ -64,6 +71,42 @@ speech2song run --run latest --stop-after arrange   # resume; stop to check the 
   the run, so later commands don't silently re-run expensive stages.
 - Settings: copy `config.example.yaml` to `config.yaml` (gitignored). API keys go in `.env`
   (see `.env.example`), never in config files.
+
+### Song lengths
+
+A talk can become songs of three lengths, each in its own folder of the run:
+
+- `short`: 2–4 quotes in a one-drop form (intro, a passage, build, drop, the closing
+  passage, outro), fitted to 61–75 s.
+- `highlights`: 3–7 key quotes with two drops, 2–3.5 minutes.
+- `summary`: about 6–10 quotes that retell the whole talk, 4–6 minutes (the default, and
+  what every run made before lengths became).
+
+`--length` on `run` and `select` takes one length or several, comma-separated; the other
+song commands take one. It sticks to the run (the last one given). The forms, bars,
+quote targets and time windows live in the preset's `lengths:` block (`summary` is the
+preset itself). A length with a window has its music sections lengthened or shortened
+(0.5–2x, in whole bars) until the song and its ending's ring fit.
+
+Lengths of one run belong together:
+
+- **Quotes.** Lengths asked for in one command are chosen in one Claude call (the first
+  length's `03_selection.json` holds it; the others copy their part, free). A length
+  chosen later is shown the quotes the other lengths already play, and keeps the
+  strongest of them; a kept quote keeps its ID, and is cut and harmonized the same way.
+- **Tempo, key and chords.** The first length whose melody is made is the run's
+  *anchor*: its tempo, key, the speaker's tuning offset and the melody's octave are kept
+  in the manifest (`shared`) and used by the other lengths, whose music sections also
+  play the anchor's chords (a role's first and last occurrence take the anchor's first
+  and last).
+- **Sound.** With ElevenLabs, every chunk of another length's composition plan is
+  conditioned on the anchor's chosen take, on its section of the same role (at most 30 s,
+  `elevenlabs.anchor_strength` low), through the take's stored song: nothing is uploaded.
+  A length's music waits for the anchor's take to be chosen (`mix` on the anchor), and
+  remembers the take it was made with (`anchor_take`), so choosing another anchor take
+  later doesn't ask for its music again.
+
+`status` shows every length's stages, and `costs` the spend per length.
 
 ### Clips
 
@@ -263,7 +306,8 @@ from the ASR. `transcribe` prints both lists so you can check them.
 
 ## Spending
 
-Paid calls: `select` (Claude, about $0.05 per 13-minute talk), the optional
+Paid calls: `select` (Claude, about $0.05 per 13-minute talk; one call for all the
+lengths a command asks for), the optional
 `arrange --refine-arc` (Claude), and with `--music-backend elevenlabs`, `generate` and
 `regenerate` (Eleven Music). Everything else is local and free.
 Every paid step estimates its cost first, supports `--dry-run` (no calls), asks before

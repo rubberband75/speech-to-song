@@ -9,6 +9,11 @@ A stage can also wait for files it does not hash (`StagePlan.waits_for`). It the
 digest of what it takes from them into its params instead, so edits elsewhere in those
 files don't invalidate it. Paid stages use this to repeat a call only when the request
 itself changes.
+
+A stage belongs to the run (the talk: ingest to align) or to one length of it (`scope`
+"song": selection to mix). A song stage's outputs and record live with its length
+(<run>/<length>/ and the manifest's `songs`), and its output paths are relative to the
+length's folder.
 """
 
 import hashlib
@@ -16,7 +21,7 @@ import json
 import logging
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -26,10 +31,10 @@ from rich.console import Console
 from rich.markup import escape
 from rich.text import Text
 
-from speech2song.config import AppConfig
+from speech2song.config import SUMMARY, AppConfig
 from speech2song.costs import CostLog, SpendEstimate, confirm_spend, render_estimates
 from speech2song.errors import StageError
-from speech2song.manifest import Run
+from speech2song.manifest import Run, Song
 from speech2song.models import FileRef, StageRecord
 
 log = logging.getLogger(__name__)
@@ -41,7 +46,7 @@ class StagePlan:
 
     inputs: dict[str, Path]
     params: dict[str, Any]
-    outputs: list[str]  # run-relative paths
+    outputs: list[str]  # relative to the stage's folder (the run's, or the length's)
     waits_for: dict[str, Path] = field(default_factory=dict)  # must exist; not hashed
 
 
@@ -60,17 +65,32 @@ class Context:
     dry_run: bool = False
     yes: bool = False
     estimates: list[SpendEstimate] = field(default_factory=list)  # collected by dry runs
+    length: str = SUMMARY  # the length song stages work on
+    # The lengths this command makes, in order: one Claude call chooses the quotes of
+    # all of them that still need some (see the select stage), and records here which
+    # length's call chose each of the others.
+    batch: list[str] = field(default_factory=list)
+    chosen_with: dict[str, str] = field(default_factory=dict)
 
     def say(self, message: str) -> None:
         """Print for the user and mirror into the run log."""
         self.console.print(message)
         log.info(Text.from_markup(message).plain)
 
+    @property
+    def song(self) -> Song:
+        return self.run.song(self.length)
+
+    def for_length(self, length: str) -> "Context":
+        """The same command working on another length (estimates are shared)."""
+        return replace(self, length=length)
+
 
 class Stage(ABC):
     name: ClassVar[str]
     version: ClassVar[int] = 1  # bump when output-affecting logic changes
     paid: ClassVar[bool] = False
+    scope: ClassVar[Literal["run", "song"]] = "run"  # the talk's stage, or a length's
 
     @abstractmethod
     def plan(self, ctx: Context) -> StagePlan: ...
@@ -114,6 +134,21 @@ class Check:
     missing_inputs: list[str] = field(default_factory=list)
 
 
+def stage_dir(stage: Stage, ctx: Context) -> Path:
+    """Where a stage's outputs live: the run's folder, or its length's."""
+    return ctx.song.root if stage.scope == "song" else ctx.run.root
+
+
+def stage_record(stage: Stage, ctx: Context) -> StageRecord | None:
+    records = ctx.song.stages if stage.scope == "song" else ctx.run.manifest.stages
+    return records.get(stage.name)
+
+
+def _store_record(stage: Stage, ctx: Context, record: StageRecord) -> None:
+    records = ctx.song.state.stages if stage.scope == "song" else ctx.run.manifest.stages
+    records[stage.name] = record
+
+
 def check(stage: Stage, ctx: Context) -> Check:
     """Evaluate a stage's cache state (hashes its inputs, memoized)."""
     plan = stage.plan(ctx)
@@ -122,7 +157,8 @@ def check(stage: Stage, ctx: Context) -> Check:
         return Check(State.BLOCKED, plan, missing_inputs=missing)
     refs = {key: ctx.run.file_ref(path) for key, path in plan.inputs.items()}
     fp = fingerprint(stage.name, stage.version, {k: r.sha256 for k, r in refs.items()}, plan.params)
-    record = ctx.run.manifest.stages.get(stage.name)
+    record = stage_record(stage, ctx)
+    base = stage_dir(stage, ctx)
     if record is None:
         state = State.NOT_RUN
     elif record.status == "failed":
@@ -131,7 +167,7 @@ def check(stage: Stage, ctx: Context) -> Check:
         state = State.INTERRUPTED
     elif record.fingerprint != fp:
         state = State.STALE
-    elif not all(ctx.run.path(out).exists() for out in record.outputs):
+    elif not all((base / out).exists() for out in record.outputs):
         state = State.MISSING_OUTPUTS
     else:
         state = State.COMPLETE
@@ -157,6 +193,9 @@ def fmt_bytes(size: int) -> str:
 def _dry_run_estimate(stage: Stage, ctx: Context, plan: StagePlan) -> None:
     if stage.is_paid(ctx):
         estimates = stage.estimate(ctx, plan)
+        if not estimates:
+            ctx.say(f"    (paid: {stage.name} is estimated once the steps before it have run)")
+            return
         render_estimates(ctx.console, estimates)
         ctx.estimates.extend(estimates)
 
@@ -173,7 +212,7 @@ def execute(stage: Stage, ctx: Context) -> Outcome:
         raise StageError(f"{stage.name}: missing inputs: {', '.join(chk.missing_inputs)}")
     if chk.state is State.COMPLETE and not ctx.force:
         ctx.say(f"[green]✓[/] {stage.name}: cached (inputs unchanged)")
-        return Outcome(stage.name, "cached", run.manifest.stages[stage.name])
+        return Outcome(stage.name, "cached", stage_record(stage, ctx))
 
     reason = "forced" if chk.state is State.COMPLETE else chk.state.value
     if ctx.dry_run:
@@ -195,18 +234,19 @@ def execute(stage: Stage, ctx: Context) -> Outcome:
         params=chk.plan.params,
         started_at=datetime.now().astimezone(),
     )
-    run.manifest.stages[stage.name] = record
+    _store_record(stage, ctx, record)
     run.save()
+    base = stage_dir(stage, ctx)
     costs = CostLog(run.costs_path)
     spent_before = costs.totals()["total"]
     t0 = time.monotonic()
     try:
         result = stage.run(ctx, chk.plan)
         outputs = result.outputs if result.outputs is not None else chk.plan.outputs
-        missing = [out for out in outputs if not run.path(out).exists()]
+        missing = [out for out in outputs if not (base / out).exists()]
         if missing:
             raise StageError(f"{stage.name} did not produce: {', '.join(missing)}")
-        record.outputs = {out: run.file_ref(run.path(out)) for out in outputs}
+        record.outputs = {out: run.file_ref(base / out) for out in outputs}
     except BaseException as exc:
         record.status = "failed"
         record.error = f"{type(exc).__name__}: {exc}"

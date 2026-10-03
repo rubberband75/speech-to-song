@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import typer
 from rich.console import Console
@@ -24,12 +24,12 @@ from rich.text import Text
 from speech2song import __version__
 from speech2song.audio.io import probe
 from speech2song.backends.music_base import backend_name
-from speech2song.config import AppConfig, list_presets, load_config, load_preset
+from speech2song.config import LENGTHS, SUMMARY, AppConfig, list_presets, load_config, load_preset
 from speech2song.costs import CostLog, fmt_units, render_estimates
 from speech2song.errors import S2SError
 from speech2song.manifest import Run
 from speech2song.models import ClipSet, RunOptions
-from speech2song.pipeline import Context, Stage, check, execute
+from speech2song.pipeline import Context, Stage, check, execute, stage_record
 from speech2song.review import run_review
 from speech2song.selection import clip_targets, estimate_input_tokens_from_duration
 from speech2song.sources import Talk, describe_talk, fetch_talk, is_url, talk_paths
@@ -70,11 +70,12 @@ class Step:
     stages: Callable[[RunOptions], list[Stage]] | None  # None: not implemented yet
     # Why the step can't run with these settings yet (None: it can).
     unavailable: Callable[[AppConfig, RunOptions], str | None] = lambda config, options: None
+    scope: Literal["run", "song"] = "song"  # the talk's step, or each length's
 
 
 STEPS: list[Step] = [
-    Step("ingest", "M1", lambda o: [IngestStage(), IsolateStage()]),
-    Step("transcribe", "M1", lambda o: [AsrStage(), AlignStage()]),
+    Step("ingest", "M1", lambda o: [IngestStage(), IsolateStage()], scope="run"),
+    Step("transcribe", "M1", lambda o: [AsrStage(), AlignStage()], scope="run"),
     Step("select", "M2", lambda o: [SelectStage(), ClipsStage()]),
     Step("melody", "M3", lambda o: [MelodyStage()]),
     Step("arrange", "M4", _arrange_stages),
@@ -207,22 +208,76 @@ RunRef = Annotated[
     typer.Option("--run", help="Run ID, unique ID prefix, path, or 'latest' (default)."),
 ]
 Force = Annotated[bool, typer.Option("--force", help="Re-run stages even if cached.")]
+LengthOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--length",
+        help="Song length: short, highlights or summary (sticks to the run; default the run's).",
+    ),
+]
+LengthsOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--length",
+        help="Song length (short, highlights or summary), or several, comma-separated: made "
+        "in that order, their quotes chosen in one Claude call. Sticks to the run (the last "
+        "one given); default the run's, else summary.",
+    ),
+]
+
+
+def _parse_lengths(value: str | None) -> list[str] | None:
+    """`--length` as a list (None when not given)."""
+    if value is None:
+        return None
+    lengths = list(dict.fromkeys(part.strip() for part in value.split(",") if part.strip()))
+    unknown = [length for length in lengths if length not in LENGTHS]
+    if unknown or not lengths:
+        raise S2SError(f"--length {value}: use {', '.join(LENGTHS)} (comma-separated for "
+                       "several)")  # fmt: skip
+    return lengths
+
+
+def _set_lengths(
+    env: Env, run: Run, lengths: list[str] | None, *, single: bool = False
+) -> list[str]:
+    """Apply `--length` (checked against the run's preset) and return the lengths the
+    command makes; without it, the run's length."""
+    if lengths is None:
+        return [run.manifest.length]
+    if single and len(lengths) > 1:
+        raise S2SError("This command works on one length at a time.")
+    preset = load_preset(run.manifest.preset, env.config.presets_dir)
+    for length in lengths:
+        preset.for_length(length)  # fails early when the preset has no such length
+    run.manifest.length = lengths[-1]
+    return lengths
 
 
 def _open_run(env: Env, ref: str | None) -> Run:
     run = Run.open(env.config.runs_dir, ref)
     shown = "latest run" if ref in (None, "latest") else "run"
     env.console.print(f"Using {shown} [bold]{escape(run.id)}[/] ({escape(str(run.root))})")
+    if run.migrated:
+        env.console.print("  (made before song lengths: its song is now the run's summary "
+                          f"length, in {escape(str(run.root / SUMMARY))}/)")  # fmt: skip
     return run
 
 
 def _create_run(
-    env: Env, input_ref: str, transcript: Path | None, preset: str | None, options: RunOptions
+    env: Env,
+    input_ref: str,
+    transcript: Path | None,
+    preset: str | None,
+    options: RunOptions,
+    lengths: list[str] | None = None,
 ) -> Run:
     """A new run for a file, or for a talk's URL (its audio and transcript are saved in
     the downloads folder first; --transcript still wins)."""
     preset_name = preset or env.config.default_preset
-    load_preset(preset_name, env.config.presets_dir)  # fail early on a bad preset
+    preset_obj = load_preset(preset_name, env.config.presets_dir)  # fail early on a bad preset
+    for length in lengths or []:
+        preset_obj.for_length(length)
     source_url = input_ref if is_url(input_ref) else None
     if source_url is not None:
         input_path, transcript = _download_input(env, source_url, transcript)
@@ -239,6 +294,7 @@ def _create_run(
         transcript=transcript,
         options=options,
         settings=env.config.snapshot(),
+        length=(lengths or [SUMMARY])[-1],
     )
     if source_url is not None:
         run.manifest.source_url = source_url
@@ -301,28 +357,60 @@ def _set_quotes(run: Run, quotes: Path | None) -> None:
         run.manifest.quotes = run.file_ref(quotes)
 
 
-def _context(env: Env, run: Run, *, force: bool = False, dry_run: bool = False, yes: bool = False):
-    return Context(run, env.config, env.console, force=force, dry_run=dry_run, yes=yes)
+def _context(
+    env: Env,
+    run: Run,
+    *,
+    force: bool = False,
+    dry_run: bool = False,
+    yes: bool = False,
+    lengths: list[str] | None = None,
+) -> Context:
+    lengths = lengths or [run.manifest.length]
+    return Context(run, env.config, env.console, force=force, dry_run=dry_run, yes=yes,
+                   length=lengths[0], batch=list(lengths))  # fmt: skip
 
 
 Hook = Callable[[Context], None]
 
 
+def _run_step(ctx: Context, step: Step, hooks: dict[str, Hook] | None) -> bool:
+    """Execute one step's stages, then its hook. False if it can't run yet."""
+    if step.stages is None:
+        ctx.say(f"[yellow]Stopping before `{step.name}`: planned for {step.milestone}.[/]")
+        return False
+    reason = step.unavailable(ctx.config, ctx.run.manifest.options)
+    if reason:
+        ctx.say(f"[yellow]Stopping before `{step.name}`: {escape(reason)}.[/]")
+        return False
+    for stage in step.stages(ctx.run.manifest.options):
+        execute(stage, ctx)
+    if hooks and step.name in hooks:
+        hooks[step.name](ctx)
+    return True
+
+
 def _run_steps(ctx: Context, steps: list[Step], hooks: dict[str, Hook] | None = None) -> bool:
-    """Execute steps in order, calling a step's hook after it. Returns False if it
-    stopped at an unimplemented step."""
+    """Execute steps in order: the talk's steps once, then the steps of each length of
+    `ctx.batch` (the quotes of every length first, so one call chooses them together;
+    then each length on to its mix, the first made being the run's anchor). Calls a
+    step's hook after it. Returns False if it stopped at a step that can't run."""
+    song_steps = [step for step in steps if step.scope == "song"]
     for step in steps:
-        if step.stages is None:
-            ctx.say(f"[yellow]Stopping before `{step.name}`: planned for {step.milestone}.[/]")
+        if step.scope == "run" and not _run_step(ctx, step, hooks):
             return False
-        reason = step.unavailable(ctx.config, ctx.run.manifest.options)
-        if reason:
-            ctx.say(f"[yellow]Stopping before `{step.name}`: {escape(reason)}.[/]")
-            return False
-        for stage in step.stages(ctx.run.manifest.options):
-            execute(stage, ctx)
-        if hooks and step.name in hooks:
-            hooks[step.name](ctx)
+    lengths = ctx.batch or [ctx.length]
+    if len(lengths) > 1 and song_steps and song_steps[0].name == "select":
+        for length in lengths:
+            if not _run_step(ctx.for_length(length), song_steps[0], hooks):
+                return False
+        song_steps = song_steps[1:]
+    for length in lengths:
+        if len(lengths) > 1 and song_steps:
+            ctx.say(f"[bold]── {length} ──[/]")
+        for step in song_steps:
+            if not _run_step(ctx.for_length(length), step, hooks):
+                return False
     _dry_run_total(ctx)
     return True
 
@@ -349,18 +437,20 @@ def _ask_review() -> str:
         return "quit"
 
 
-def _review_hook(env: Env, run: Run) -> Hook:
+def _review_hook(env: Env) -> Hook:
     """After `select`: let the user drop, reorder and audition clips, then re-cut."""
 
     def hook(ctx: Context) -> None:
         if ctx.dry_run:
             return
-        clip_set = ClipSet.model_validate_json(run.path(CLIPS).read_text(encoding="utf-8"))
+        song = ctx.song
+        clip_set = ClipSet.model_validate_json(song.path(CLIPS).read_text(encoding="utf-8"))
+        env.console.print(f"Review the clips of {ctx.length}:")
         state = run_review(
             env.console,
             clip_set,
             ask=_ask_review,
-            preview=lambda clip_id: write_preview(run, clip_set, clip_id),
+            preview=lambda clip_id: write_preview(song, clip_set, clip_id),
         )
         if state is None:
             env.console.print("Review closed without saving.")
@@ -379,12 +469,12 @@ def _arrangement_hook(ctx: Context) -> None:
 
 def _mix_hook(ctx: Context) -> None:
     """After `mix`: where to listen."""
-    if ctx.dry_run or not ctx.run.path(MASTER_WAV).exists():
+    if ctx.dry_run or not ctx.song.path(MASTER_WAV).exists():
         return
-    ctx.console.print("Listen to:")
+    ctx.console.print(f"Listen to ({ctx.length}):")
     for rel in (MASTER_WAV, MASTER_MP3, "07_mix/stems/", MIX_REPORT):
-        ctx.console.print(f"  {escape(str(ctx.run.path(rel)))}")
-    if not ctx.run.path(MELODY_STEM).exists():
+        ctx.console.print(f"  {escape(str(ctx.song.path(rel)))}")
+    if not ctx.song.path(MELODY_STEM).exists():
         ctx.console.print("  (melody layer off)")
 
 
@@ -405,6 +495,7 @@ def _run_step_command(
     dry_run: bool = False,
     yes: bool = False,
     hooks: dict[str, Hook] | None = None,
+    lengths: list[str] | None = None,
 ) -> None:
     step = STEP_BY_NAME[step_name]
     if step.stages is None:
@@ -420,7 +511,8 @@ def _run_step_command(
     before = CostLog(run.costs_path).totals()["total"]
     hooks = {**STANDARD_HOOKS, **(hooks or {})}
     with run.logging_to_file(logging.DEBUG if env.verbose else logging.INFO):
-        _run_steps(_context(env, run, force=force, dry_run=dry_run, yes=yes), [step], hooks)
+        context = _context(env, run, force=force, dry_run=dry_run, yes=yes, lengths=lengths)
+        _run_steps(context, [step], hooks)
     _spend_line(env, run, before)
 
 
@@ -437,6 +529,7 @@ def run_cmd(
     ] = None,
     quotes: Annotated[Path | None, typer.Option(help=QUOTES_HELP)] = None,
     preset: Annotated[str | None, typer.Option(help="Preset name (default from config).")] = None,
+    length: LengthsOpt = None,
     isolate_voice: Annotated[
         bool | None, typer.Option("--isolate-voice/--no-isolate-voice", help="Use demucs.")
     ] = None,
@@ -463,15 +556,17 @@ def run_cmd(
     force: Force = False,
     run_ref: RunRef = None,
 ) -> None:
-    """Run the whole pipeline (or resume a run with --run)."""
+    """Run the whole pipeline (or resume a run with --run), for one or more song lengths."""
     env = _env(ctx)
     if input_ref is not None and run_ref is not None:
         raise S2SError("Pass INPUT to start a new run, or --run to resume one, not both.")
+    lengths = _parse_lengths(length)
+    if clips is not None and lengths is not None and len(lengths) > 1:
+        raise S2SError("--clips needs a single --length.")
     last = STEPS.index(STEP_BY_NAME[stop_after.value]) if stop_after else len(STEPS) - 1
     steps = STEPS[: last + 1]
     options = {
         "isolate_voice": isolate_voice,
-        "clips": clips,
         "music_backend": music_backend.value if music_backend else None,
         "claude_model": model,
         "refine_arc": refine_arc,
@@ -483,28 +578,33 @@ def run_cmd(
         _set_preset(env, run, preset)
         _set_transcript(run, transcript)
         _set_quotes(run, quotes)
+        lengths = _set_lengths(env, run, lengths)
     elif dry_run:
         if quotes is not None:
             from speech2song.text.quotes import parse_quotes
 
             env.console.print(f"{len(parse_quotes(quotes))} required quote(s) in {quotes}")
         _dry_run_new_input(env, input_ref, preset, clips, steps, RunOptions(
-            **{k: v for k, v in options.items() if v is not None}))  # fmt: skip
+            **{k: v for k, v in options.items() if v is not None}),
+            lengths or [SUMMARY])  # fmt: skip
         return
     else:
         initial = RunOptions(**{k: v for k, v in options.items() if v is not None})
-        run = _create_run(env, input_ref, transcript, preset, initial)
+        run = _create_run(env, input_ref, transcript, preset, initial, lengths)
         _set_quotes(run, quotes)
+        lengths = lengths or [SUMMARY]
+    if clips is not None:
+        run.song(lengths[0]).set_options(clips=clips)
     run.manifest.settings = env.config.snapshot()
     run.save()
     before = CostLog(run.costs_path).totals()["total"]
     with run.logging_to_file(logging.DEBUG if env.verbose else logging.INFO):
-        context = _context(env, run, force=force, dry_run=dry_run, yes=yes)
+        context = _context(env, run, force=force, dry_run=dry_run, yes=yes, lengths=lengths)
         if dry_run:
             env.console.print("Dry run: nothing will be executed.")
         hooks = dict(STANDARD_HOOKS)
         if interactive_review:
-            hooks["select"] = _review_hook(env, run)
+            hooks["select"] = _review_hook(env)
         _run_steps(context, steps, hooks)
     _spend_line(env, run, before)
 
@@ -516,6 +616,7 @@ def _dry_run_new_input(
     clips: int | None,
     steps: list[Step],
     options: RunOptions,
+    lengths: list[str],
 ) -> None:
     """Estimate a new run's spend from the input's duration (ffprobe only, no stages).
     A URL input is looked up (its page only); nothing is downloaded."""
@@ -531,27 +632,28 @@ def _dry_run_new_input(
         if not input_path.is_file():
             raise S2SError(f"Input file not found: {input_path}")
         env.console.print(f"Dry run: would create a new run for {escape(str(input_path))}")
-    env.console.print(f"and run: {names}.")
+    env.console.print(f"and run: {names} ({', '.join(lengths)}).")
     if not any(step.name == "select" for step in steps):
         env.console.print("No paid calls before the steps you asked for. Nothing was executed.")
         return
     preset_obj = load_preset(preset or env.config.default_preset, env.config.presets_dir)
-    targets = clip_targets(preset_obj, RunOptions(clips=clips))
+    count = sum(clip_targets(preset_obj.for_length(length), clips).count_range[1]
+                for length in lengths)  # fmt: skip
     if not input_path.is_file():
         env.console.print("[yellow]The audio isn't downloaded yet; assuming a 15-minute talk.[/]")
         seconds = 900.0
     else:
         seconds = _probe_seconds(env, input_path)
     model = options.claude_model or env.config.claude_model
-    estimates = select_estimates(
-        env.config,
-        model,
-        estimate_input_tokens_from_duration(seconds),
-        targets.count_range[1],
-        f"estimated from {seconds / 60:.0f} min of audio",
-    )
+    basis = f"estimated from {seconds / 60:.0f} min of audio"
+    if len(lengths) > 1:
+        basis += f"; for {', '.join(lengths)} in one call"
+    versions = 0 if lengths == [SUMMARY] else len(lengths)
+    tokens = estimate_input_tokens_from_duration(seconds)
+    estimates = select_estimates(env.config, model, tokens, count, basis, versions)
     if options.refine_arc and any(step.name == "arrange" for step in steps):
-        estimates += arc_estimates(env.config, model)
+        for _ in lengths:
+            estimates += arc_estimates(env.config, model)
     render_estimates(env.console, estimates)
     total = sum(e.usd or 0.0 for e in estimates)
     music = backend_name(env.config, options)
@@ -641,6 +743,7 @@ def select(
         bool, typer.Option("--no-quotes", help="Stop requiring the quotes file.")
     ] = False,
     model: Annotated[str | None, typer.Option(help="Claude model for this run.")] = None,
+    length: LengthsOpt = None,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Show the estimated cost; call nothing.")
     ] = False,
@@ -651,17 +754,24 @@ def select(
     force: Force = False,
     run_ref: RunRef = None,
 ) -> None:
-    """Ask Claude for the best lines, then cut them as sample-exact clips."""
+    """Ask Claude for the best lines (for one or more lengths, in one call), then cut them
+    as sample-exact clips."""
     env = _env(ctx)
     if quotes is not None and no_quotes:
         raise S2SError("Use either --quotes or --no-quotes.")
     run = _open_run(env, run_ref)
-    _update_options(run, clips=clips, claude_model=model)
+    lengths = _set_lengths(env, run, _parse_lengths(length))
+    if clips is not None:
+        if len(lengths) > 1:
+            raise S2SError("--clips needs a single --length.")
+        run.song(lengths[0]).set_options(clips=clips)
+    _update_options(run, claude_model=model)
     _set_quotes(run, quotes)
     if no_quotes:
         run.manifest.quotes = None
-    hooks = {"select": _review_hook(env, run)} if interactive_review else None
-    _run_step_command(env, run, "select", force=force, dry_run=dry_run, yes=yes, hooks=hooks)
+    hooks = {"select": _review_hook(env)} if interactive_review else None
+    _run_step_command(env, run, "select", force=force, dry_run=dry_run, yes=yes, hooks=hooks,
+                      lengths=lengths)  # fmt: skip
 
 
 @app.command()
@@ -671,12 +781,14 @@ def melody(
     key: Annotated[
         str | None, typer.Option(help="Use this key instead of detecting one, e.g. 'D minor'.")
     ] = None,
+    length: LengthOpt = None,
     force: Force = False,
     run_ref: RunRef = None,
 ) -> None:
     """Turn the clips' speech pitch into a melody, MIDI and a short audio reference."""
     env = _env(ctx)
     run = _open_run(env, run_ref)
+    lengths = _set_lengths(env, run, _parse_lengths(length), single=True)
     if key is not None:
         from speech2song.audio.theory import parse_key
 
@@ -685,7 +797,7 @@ def melody(
         except ValueError as exc:
             raise S2SError(str(exc)) from exc
     _update_options(run, key=key)
-    _run_step_command(env, run, "melody", force=force)
+    _run_step_command(env, run, "melody", force=force, lengths=lengths)
 
 
 @app.command()
@@ -697,6 +809,7 @@ def arrange(
         typer.Option("--refine-arc/--no-refine-arc", help="Ask Claude to refine the arc (paid)."),
     ] = None,
     model: Annotated[str | None, typer.Option(help="Claude model for this run.")] = None,
+    length: LengthOpt = None,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Show the estimated cost; call nothing.")
     ] = False,
@@ -707,8 +820,10 @@ def arrange(
     """Lay the clips and sections out on the bar grid and print the timeline."""
     env = _env(ctx)
     run = _open_run(env, run_ref)
+    lengths = _set_lengths(env, run, _parse_lengths(length), single=True)
     _update_options(run, refine_arc=refine_arc, claude_model=model)
-    _run_step_command(env, run, "arrange", force=force, dry_run=dry_run, yes=yes)
+    _run_step_command(env, run, "arrange", force=force, dry_run=dry_run, yes=yes,
+                      lengths=lengths)  # fmt: skip
 
 
 @app.command()
@@ -729,6 +844,7 @@ def generate(
             "config's music_takes, 2); ones already made for it are reused.",
         ),
     ] = None,
+    length: LengthOpt = None,
     force: Force = False,
     run_ref: RunRef = None,
 ) -> None:
@@ -737,17 +853,20 @@ def generate(
     if takes is not None:
         env = replace(env, config=env.config.model_copy(update={"music_takes": takes}))
     run = _open_run(env, run_ref)
+    lengths = _set_lengths(env, run, _parse_lengths(length), single=True)
     _update_options(run, music_backend=music_backend.value if music_backend else None)
-    _run_step_command(env, run, "generate", force=force, dry_run=dry_run, yes=yes)
+    _run_step_command(env, run, "generate", force=force, dry_run=dry_run, yes=yes,
+                      lengths=lengths)  # fmt: skip
 
 
-def _set_take(run: Run, take: str | None) -> None:
-    """`--take N` pins a take to the run; `--take auto` goes back to the best score."""
+def _set_take(run: Run, length: str, take: str | None) -> None:
+    """`--take N` pins a take to the length; `--take auto` goes back to the best score."""
     if take is None:
         return
     if take != "auto" and not (take.isdigit() and int(take) >= 1):
         raise S2SError(f"--take {take}: give a take number (1, 2, ...) or 'auto'")
-    run.manifest.options = run.manifest.options.model_copy(
+    song = run.song(length)
+    song.state.options = song.options.model_copy(
         update={"take": None if take == "auto" else int(take)}
     )
 
@@ -764,6 +883,7 @@ def mix(
         ),
     ] = None,
     melody_layer: Annotated[MelodyLayerMode | None, typer.Option(help=MELODY_LAYER_HELP)] = None,
+    length: LengthOpt = None,
     force: Force = False,
     run_ref: RunRef = None,
 ) -> None:
@@ -771,9 +891,10 @@ def mix(
     loudness. Free."""
     env = _env(ctx)
     run = _open_run(env, run_ref)
-    _set_take(run, take)
+    lengths = _set_lengths(env, run, _parse_lengths(length), single=True)
+    _set_take(run, lengths[0], take)
     _update_options(run, melody_layer=melody_layer.value if melody_layer else None)
-    _run_step_command(env, run, "mix", force=force)
+    _run_step_command(env, run, "mix", force=force, lengths=lengths)
 
 
 @app.command()
@@ -805,6 +926,7 @@ def regenerate(
         bool, typer.Option("--dry-run", help="Show the plan and cost; call nothing.")
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Don't ask before paid calls.")] = False,
+    length: LengthOpt = None,
     run_ref: RunRef = None,
 ) -> None:
     """Regenerate sections of the current ElevenLabs take, keeping the rest (paid)."""
@@ -814,16 +936,17 @@ def regenerate(
         raise S2SError("Give --section (to regenerate) or --undo (to go back), not both.")
     env = _env(ctx)
     run = _open_run(env, run_ref)
+    lengths = _set_lengths(env, run, _parse_lengths(length), single=True)
     before = CostLog(run.costs_path).totals()["total"]
     with run.logging_to_file(logging.DEBUG if env.verbose else logging.INFO):
-        context = _context(env, run, dry_run=dry_run, yes=yes)
+        context = _context(env, run, dry_run=dry_run, yes=yes, lengths=lengths)
         if undo:
             updated = None if dry_run else undo_regeneration(context)
         else:
             updated = regenerate_sections(context, section or [], note,
                                           adherence.value if adherence else None)  # fmt: skip
         if updated is not None:
-            _update_options(run, take=updated.take)  # mix this version from now on
+            run.song(lengths[0]).set_options(take=updated.take)  # mix this version from now on
             run.save()
             _run_steps(context, [STEP_BY_NAME["mix"]], dict(STANDARD_HOOKS))
     _spend_line(env, run, before)
@@ -844,18 +967,23 @@ def costs(ctx: typer.Context, run_ref: RunRef = None) -> None:
         env.console.print("No paid calls recorded for this run. Spend: $0.0000")
         return
     table = Table(title=f"Paid calls · {run.id}")
-    for column in ("Time", "Stage", "Service", "Model", "Units", "USD"):
+    for column in ("Time", "Length", "Stage", "Service", "Model", "Units", "USD"):
         table.add_column(column)
+    by_length: dict[str, float] = {}
     for entry in entries:
         units = ", ".join(f"{k}={fmt_units(v)}" for k, v in entry.units.items())
         usd = f"${entry.usd:.4f}" + (" (est.)" if entry.estimated else "")
-        table.add_row(
-            f"{entry.ts:%Y-%m-%d %H:%M}", entry.stage, entry.service, entry.model, units, usd
-        )
+        length = entry.length or SUMMARY  # calls made before M8 were for the run's one song
+        by_length[length] = by_length.get(length, 0.0) + entry.usd
+        table.add_row(f"{entry.ts:%Y-%m-%d %H:%M}", length, entry.stage, entry.service,
+                      entry.model, units, usd)  # fmt: skip
     env.console.print(table)
     totals = log_.totals()
     parts = [f"{service} ${usd:.4f}" for service, usd in totals.items() if service != "total"]
     env.console.print(f"Total: [bold]${totals['total']:.4f}[/] ({', '.join(parts)})")
+    if len(by_length) > 1:
+        shown = ", ".join(f"{name} ${usd:.4f}" for name, usd in by_length.items())
+        env.console.print(f"By length: {shown}")
 
 
 @app.command()
@@ -872,27 +1000,36 @@ def status(ctx: typer.Context, run_ref: RunRef = None) -> None:
     env.console.print(f"Transcript: {escape(transcript)} · preset: {manifest.preset}")
     if manifest.quotes:
         env.console.print(f"Required quotes: {escape(manifest.quotes.path)}")
+    lengths = run.made_lengths()
+    if manifest.length not in lengths:
+        lengths.append(manifest.length)
+    anchor = manifest.shared.anchor if manifest.shared else None
+    shown = [f"{name} (anchor)" if name == anchor else name for name in lengths]
+    env.console.print(f"Lengths: {', '.join(shown)} · commands act on {manifest.length} "
+                      "unless given --length")  # fmt: skip
     table = Table()
-    for column in ("Step", "Stage", "State", "Finished", "Took"):
+    for column in ("Length", "Step", "Stage", "State", "Finished", "Took"):
         table.add_column(column)
-    context = _context(env, run)
+    base = _context(env, run)
     for step in STEPS:
-        if step.stages is None:
-            table.add_row(step.name, "-", f"planned for {step.milestone}", "", "")
-            continue
-        reason = step.unavailable(env.config, manifest.options)
-        if reason:
-            table.add_row(step.name, "-", reason, "", "")
-            continue
-        for stage in step.stages(manifest.options):
-            state = check(stage, context).state
-            record = manifest.stages.get(stage.name)
-            finished = took = ""
-            if record is not None and record.finished_at is not None:
-                finished = f"{record.finished_at:%Y-%m-%d %H:%M}"
-            if record is not None and record.elapsed_s is not None:
-                took = f"{record.elapsed_s:.1f} s"
-            table.add_row(step.name, stage.name, state.value, finished, took)
+        for length in lengths if step.scope == "song" else ["-"]:
+            context = base.for_length(length) if step.scope == "song" else base
+            if step.stages is None:
+                table.add_row(length, step.name, "-", f"planned for {step.milestone}", "", "")
+                continue
+            reason = step.unavailable(env.config, manifest.options)
+            if reason:
+                table.add_row(length, step.name, "-", reason, "", "")
+                continue
+            for stage in step.stages(manifest.options):
+                state = check(stage, context).state
+                record = stage_record(stage, context)
+                finished = took = ""
+                if record is not None and record.finished_at is not None:
+                    finished = f"{record.finished_at:%Y-%m-%d %H:%M}"
+                if record is not None and record.elapsed_s is not None:
+                    took = f"{record.elapsed_s:.1f} s"
+                table.add_row(length, step.name, stage.name, state.value, finished, took)
     run.save()  # keeps freshly computed hashes in the memo
     env.console.print(table)
     env.console.print(f"Spend so far: ${CostLog(run.costs_path).totals()['total']:.4f}")

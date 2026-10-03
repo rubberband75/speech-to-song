@@ -82,25 +82,25 @@ def test_melody_step_end_to_end(cli: Cli, talk: Talk, install: Callable) -> None
     _select(cli, talk, install)
     result = cli("melody")
     assert result.exit_code == 0, result.output
-    melody = Melody.model_validate_json(run.path("04_melody.json").read_text())
+    melody = Melody.model_validate_json(run.song().path("04_melody.json").read_text())
     assert [c.clip_id for c in melody.clips] == ["c5", "c4", "c3", "c2", "c1"]  # play order
     assert all(c.notes for c in melody.clips)
     assert melody.loop_phrase_count == 3
 
-    midi = pretty_midi.PrettyMIDI(str(run.path("04_melody.mid")))
+    midi = pretty_midi.PrettyMIDI(str(run.song().path("04_melody.mid")))
     assert midi.get_tempo_changes()[1][0] == pytest.approx(melody.bpm, abs=0.01)  # MIDI: whole µs
     melody_track = next(i for i in midi.instruments if i.name == "melody")
     assert len(melody_track.notes) == 3 * sum(len(c.notes) for c in melody.clips)
     assert melody_track.program == 0  # soft piano
 
     main = next(c for c in melody.clips if c.clip_id == melody.main_clip)
-    info = sf.info(str(run.path("04_melody_reference.wav")))
+    info = sf.info(str(run.song().path("04_melody_reference.wav")))
     expected = 2 * main.bars * 4 * 60 / melody.bpm + 1.5
     assert info.duration == pytest.approx(expected, abs=0.05)
 
     # Every quote's own melody, looped to at least 8 s, one after another (M7 conditioning).
-    index = QuoteMelodies.model_validate_json(run.path("04_quote_melodies.json").read_text())
-    quotes = sf.info(str(run.path(index.file)))
+    index = QuoteMelodies.model_validate_json(run.song().path("04_quote_melodies.json").read_text())
+    quotes = sf.info(str(run.song().path(index.file)))
     assert list(index.clips) == [c.clip_id for c in melody.clips]
     edges = [edge for span in index.clips.values() for edge in span]
     assert edges == sorted(edges) and edges[-1] <= quotes.duration * 1000 + 1
@@ -114,7 +114,7 @@ def test_melody_step_end_to_end(cli: Cli, talk: Talk, install: Callable) -> None
     assert "melody: cached" in cli("melody").output
     changed = cli("melody", "--key", "f#m")
     assert "melody (stale)" in changed.output
-    melody = Melody.model_validate_json(run.path("04_melody.json").read_text())
+    melody = Melody.model_validate_json(run.song().path("04_melody.json").read_text())
     assert (melody.key, melody.key_source) == ("F# minor", "override")
 
 
@@ -145,11 +145,11 @@ def test_listening_set(cli: Cli, talk: Talk, install: Callable) -> None:
     run = talk[0]
     _select(cli, talk, install)
     cli("melody")
-    paths = write_listening_set(run, find_soundfont(None))
+    paths = write_listening_set(run.song(), find_soundfont(None))
     assert len(paths) == 4 * 5
-    melody = Melody.model_validate_json(run.path("04_melody.json").read_text())
+    melody = Melody.model_validate_json(run.song().path("04_melody.json").read_text())
     clip = melody.clips[0]
-    speech = sf.info(str(run.path(clip.file)))
-    illusion = sf.info(str(run.path(f"04_listen/{clip.clip_id}_4_illusion.wav")))
+    speech = sf.info(str(run.song().path(clip.file)))
+    illusion = sf.info(str(run.song().path(f"04_listen/{clip.clip_id}_4_illusion.wav")))
     phrase = clip.bars * 4 * 60 / melody.bpm
     assert illusion.duration >= 3 * phrase + speech.duration - 0.01

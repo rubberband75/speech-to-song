@@ -99,11 +99,13 @@ def _attempts(response: Any, requested: str) -> list[_Attempt]:
 
 
 class ClaudeJson:
-    def __init__(self, config: AppConfig, cost_log: CostLog, run_id: str, model: str) -> None:
+    def __init__(self, config: AppConfig, cost_log: CostLog, run_id: str, model: str,
+                 length: str | None = None) -> None:  # fmt: skip
         self.config = config
         self.cost_log = cost_log
         self.run_id = run_id
         self.model = model
+        self.length = length  # the song length the calls are for (logged with their cost)
         self._client: Any = None
 
     def _get_client(self) -> Any:
@@ -220,6 +222,7 @@ class ClaudeJson:
                 price_ref=f"pricing.anthropic.{served} (as of {price.as_of})" if price else None,
                 request_id=getattr(response, "_request_id", None) or getattr(response, "id", None),
                 note="; ".join(notes) or None,
+                length=self.length,
             )
         )
         log.info("Claude %s: %d in / %d out tokens, $%.4f", served, input_tokens, output_tokens,

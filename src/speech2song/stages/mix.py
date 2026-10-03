@@ -195,27 +195,30 @@ class MixStage(Stage):
     # ring-out only where the music would stop abruptly; 8 (M7.1): a passage played
     # alone loses its music only for its last phrase, quiet sections can be lifted more
     version: ClassVar[int] = 8
+    scope: ClassVar[Literal["run", "song"]] = "song"
 
     def plan(self, ctx: Context) -> StagePlan:
         preset = load_preset(ctx.run.manifest.preset, ctx.config.presets_dir)
         mode = melody_layer_mode(ctx)
         inputs: dict[str, Path] = {
-            "arrangement": ctx.run.path(ARRANGEMENT),
-            "music": ctx.run.path(SELECTED),
-            "clips": ctx.run.path(CLIPS),
+            "arrangement": ctx.song.path(ARRANGEMENT),
+            "music": ctx.song.path(SELECTED),
+            "clips": ctx.song.path(CLIPS),
             "transcript": ctx.run.path(TRANSCRIPT),  # word timings for the speech guard
         }
         if mode != "off":
-            inputs["melody"] = ctx.run.path(MELODY)
-        if ctx.run.path(CLIPS).exists():  # the clip files the mix plays are inputs too
-            clip_set = ClipSet.model_validate_json(ctx.run.path(CLIPS).read_text())
+            inputs["melody"] = ctx.song.path(MELODY)
+        if ctx.song.path(CLIPS).exists():  # the clip files the mix plays are inputs too
+            clip_set = ClipSet.model_validate_json(ctx.song.path(CLIPS).read_text())
             playing = {clip.id for clip in kept_clips(clip_set)}
-            if ctx.run.path(ARRANGEMENT).exists():
-                arrangement = Arrangement.model_validate_json(ctx.run.path(ARRANGEMENT).read_text())
+            if ctx.song.path(ARRANGEMENT).exists():
+                arrangement = Arrangement.model_validate_json(
+                    ctx.song.path(ARRANGEMENT).read_text()
+                )
                 playing |= {s.clip_id for s in arrangement.sections if s.clip_id}
             for clip in clip_set.clips:
                 if clip.id in playing:
-                    inputs[f"clip {clip.id}"] = ctx.run.path(clip.file)
+                    inputs[f"clip {clip.id}"] = ctx.song.path(clip.file)
         params = {
             "mix": preset.mix.model_dump(),
             "melody_layer": mode,
@@ -245,7 +248,7 @@ class MixStage(Stage):
             raise StageError(f"{SELECTED} doesn't match the arrangement; re-run `generate`")
         audio = {}
         for clip_id in {s.clip_id for s in arrangement.sections if s.clip_id}:
-            block, _ = sf.read(str(ctx.run.path(clips[clip_id].file)), dtype="float32",
+            block, _ = sf.read(str(ctx.song.path(clips[clip_id].file)), dtype="float32",
                                always_2d=True)  # fmt: skip
             audio[clip_id] = block
         placed = place_clips(arrangement, {k: c.file for k, c in clips.items()},
@@ -386,22 +389,22 @@ class MixStage(Stage):
         mastered = master(music_bus + layer_bus + bus.dry + bus.wet, sr, spec.target_lufs,
                           CEILING_DBTP)  # fmt: skip
 
-        stems = ctx.run.path(SPEECH_STEM).parent
+        stems = ctx.song.path(SPEECH_STEM).parent
         stems.mkdir(parents=True, exist_ok=True)
-        write_wav(ctx.run.path(SPEECH_STEM), dry, sr)
-        write_wav(ctx.run.path(MUSIC_STEM), music_bus, sr)
+        write_wav(ctx.song.path(SPEECH_STEM), dry, sr)
+        write_wav(ctx.song.path(MUSIC_STEM), music_bus, sr)
         if mode != "off":
-            write_wav(ctx.run.path(MELODY_STEM), layer_bus, sr)
+            write_wav(ctx.song.path(MELODY_STEM), layer_bus, sr)
         else:
-            ctx.run.path(MELODY_STEM).unlink(missing_ok=True)
-        master_wav = ctx.run.path(MASTER_WAV)
+            ctx.song.path(MELODY_STEM).unlink(missing_ok=True)
+        master_wav = ctx.song.path(MASTER_WAV)
         tmp = temp_path_for(master_wav)
         try:
             sf.write(str(tmp), mastered.audio, sr, subtype="PCM_24")
             tmp.replace(master_wav)
         finally:
             tmp.unlink(missing_ok=True)
-        write_mp3(master_wav, ctx.run.path(MASTER_MP3))
+        write_mp3(master_wav, ctx.song.path(MASTER_MP3))
 
         if mastered.lufs is None:
             raise StageError("the mix is silent")
@@ -425,7 +428,7 @@ class MixStage(Stage):
             guard_dips=[{"start_s": round(a, 3), "end_s": round(b, 3), "db": round(d, 2)}
                         for a, b, d in dips(guard, sr)],
         )  # fmt: skip
-        write_json(ctx.run.path(MIX_REPORT), report)
+        write_json(ctx.song.path(MIX_REPORT), report)
         for warning in warnings:
             ctx.say(f"[yellow]  {warning}[/]")
         changed = [f"{level.section_id} {level.gain_db:+.1f} dB" for level in levels

@@ -65,6 +65,20 @@ class KeySpec(_Strict):
 SPEECH_ROLE = "speech_bed"  # the role a clip plays under
 DEFAULT_SECTION_BARS = 8
 
+# Song lengths (M8). Each length of a run is its own song, in its own folder. `summary` is
+# the preset itself (its arc, bars and clip targets); the others are set in its `lengths`.
+SUMMARY = "summary"
+LENGTHS = ("short", "highlights", SUMMARY)
+SUMMARY_DESCRIPTION = "four to six minutes, enough lines to retell the whole talk"
+
+
+def arc_entry(entry: str) -> tuple[str, int | None]:
+    """An arc entry: a role, optionally with this part's bars ("drop 16")."""
+    words = entry.split()
+    if len(words) == 2 and words[1].isdigit():
+        return words[0], int(words[1])
+    return entry.strip(), None
+
 
 class SectionRole(_Strict):
     energy: float = Field(ge=0, le=1)
@@ -192,6 +206,29 @@ class ClipsSpec(_Strict):
         return self
 
 
+class LengthSpec(_Strict):
+    """A song length other than `summary` (the preset itself): its form, its quote
+    targets and how long the song should be. `summary` may only give a description."""
+
+    # What this version of the song is for, shown to Claude when it chooses the quotes.
+    description: str = ""
+    # The song's length in seconds (min, max), counting the ending's ring; the
+    # arrangement fits its music sections to it.
+    seconds: tuple[float, float] | None = None
+    # The form (None: the preset's arc). An entry may give its part's bars ("drop 16").
+    arc: list[str] | None = None
+    # Usual bars per role in this length (else the role's own).
+    bars: dict[str, int] = {}
+    # Changes to the preset's clip targets (count, max_seconds, total_speech_seconds, ...).
+    clips: dict[str, float] = {}
+
+    @model_validator(mode="after")
+    def _check_seconds(self) -> "LengthSpec":
+        if self.seconds is not None and not 0 < self.seconds[0] < self.seconds[1]:
+            raise ValueError("seconds must be (min, max) with 0 < min < max")
+        return self
+
+
 class Preset(_Strict):
     name: str
     description: str
@@ -209,6 +246,12 @@ class Preset(_Strict):
     mix: MixSpec = MixSpec()
     melody: MelodySpec = MelodySpec()
     clips: ClipsSpec = ClipsSpec()
+    # The song's length in seconds (min, max), counting the ending's ring, which the
+    # arrangement fits its music sections to (None: as long as the arc makes it). Set by
+    # `for_length` from a length's `seconds`.
+    song_seconds: tuple[float, float] | None = None
+    # The other song lengths (see LengthSpec); `summary` is the preset itself.
+    lengths: dict[str, LengthSpec] = {}
 
     @model_validator(mode="after")
     def _check_roles(self) -> "Preset":
@@ -218,19 +261,76 @@ class Preset(_Strict):
             raise ValueError("section_roles.speech_bed.bars is not allowed: beds fit their clip")
         if self.section_roles[SPEECH_ROLE].silent:
             raise ValueError("section_roles.speech_bed.silent is not allowed: beds carry music")
-        if SPEECH_ROLE not in self.arc:
-            raise ValueError("arc must contain at least one speech_bed")
-        unknown = sorted({role for role in self.arc if role not in self.section_roles})
-        if unknown:
-            raise ValueError(f"arc uses roles missing from section_roles: {unknown}")
+        self._check_arc(self.arc, "arc")
         unknown = sorted(set(self.melody.layer_roles) - set(self.section_roles))
         if unknown:
             raise ValueError(f"melody.layer_roles uses roles missing from section_roles: {unknown}")
         return self
 
+    def _check_arc(self, arc: list[str], where: str) -> None:
+        entries = [arc_entry(entry) for entry in arc]
+        if SPEECH_ROLE not in [role for role, _ in entries]:
+            raise ValueError(f"{where} must contain at least one speech_bed")
+        unknown = sorted({role for role, _ in entries if role not in self.section_roles})
+        if unknown:
+            raise ValueError(f"{where} uses roles missing from section_roles: {unknown}")
+        for role, bars in entries:
+            if bars is not None and (role == SPEECH_ROLE or not 1 <= bars <= 64):
+                raise ValueError(f"{where}: '{role} {bars}' must be a music role with 1-64 bars")
+
+    @model_validator(mode="after")
+    def _check_lengths(self) -> "Preset":
+        for name, spec in self.lengths.items():
+            where = f"lengths.{name}"
+            if name not in LENGTHS:
+                raise ValueError(f"{where}: unknown length (use {', '.join(LENGTHS)})")
+            if name == SUMMARY:
+                if spec.model_dump(exclude={"description"}) != LengthSpec().model_dump(
+                    exclude={"description"}
+                ):
+                    raise ValueError(f"{where} may only give a description: the summary is "
+                                     "the preset's own arc, bars and clips")  # fmt: skip
+                continue
+            if spec.arc is not None:
+                self._check_arc(spec.arc, f"{where}.arc")
+            for role, bars in spec.bars.items():
+                if role not in self.section_roles or role == SPEECH_ROLE:
+                    raise ValueError(f"{where}.bars: {role!r} is not a music role")
+                if not 1 <= bars <= 64:
+                    raise ValueError(f"{where}.bars.{role} must be 1-64")
+            unknown = sorted(set(spec.clips) - set(ClipsSpec.model_fields))
+            if unknown:
+                raise ValueError(f"{where}.clips: unknown keys {unknown}")
+            ClipsSpec.model_validate({**self.clips.model_dump(), **spec.clips})
+        return self
+
     def role_bars(self, role: str) -> int:
         bars = self.section_roles[role].bars
         return DEFAULT_SECTION_BARS if bars is None else bars
+
+    def for_length(self, length: str) -> "Preset":
+        """The preset as a song of `length`: that length's arc, bars, clip targets and
+        song length. `summary` is the preset itself."""
+        if length == SUMMARY:
+            return self
+        spec = self.lengths.get(length)
+        if spec is None:
+            known = ", ".join([*(n for n in LENGTHS if n in self.lengths), SUMMARY])
+            raise ConfigError(f"Preset {self.name!r} has no {length!r} length (it has: {known}). "
+                              f"Add `lengths: {length}:` to presets/{self.name}.yaml.")  # fmt: skip
+        roles = {
+            name: role.model_copy(update={"bars": spec.bars[name]}) if name in spec.bars else role
+            for name, role in self.section_roles.items()
+        }
+        clips = ClipsSpec.model_validate({**self.clips.model_dump(), **spec.clips})
+        return self.model_copy(update={"arc": spec.arc or self.arc, "section_roles": roles,
+                                       "clips": clips, "song_seconds": spec.seconds})  # fmt: skip
+
+    def length_description(self, length: str) -> str:
+        spec = self.lengths.get(length)
+        if spec is not None and spec.description:
+            return " ".join(spec.description.split())
+        return SUMMARY_DESCRIPTION if length == SUMMARY else length
 
     def digest(self) -> str:
         """Content hash, used in stage params so preset edits invalidate dependent stages."""
@@ -392,6 +492,12 @@ class ElevenLabsConfig(_Strict):
     # correlation at chance), but the rendered piano's sound came through.
     melody_conditioning: bool = False
     condition_strength: Literal["low", "medium", "high", "xhigh"] = "low"
+    # M8: a run's other lengths are conditioned on its anchor (the first length made):
+    # each chunk on the matching section of the anchor's chosen take, through the take's
+    # stored song (at most 30 s per reference; nothing is uploaded), so the versions
+    # sound like one song.
+    anchor_conditioning: bool = True
+    anchor_strength: Literal["low", "medium", "high", "xhigh"] = "low"
 
     @model_validator(mode="after")
     def _check_format(self) -> "ElevenLabsConfig":

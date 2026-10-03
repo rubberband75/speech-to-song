@@ -108,6 +108,24 @@ clips:
   total_speech_seconds: 150
   part_seconds: 15                  # longer quotes play in parts, with music between
 
+# Song lengths. `summary` is everything above (about 8 quotes, 4-6 minutes); the others
+# have their own form, bars and quote targets. `seconds` is how long the song should last,
+# its ending's ring included: its music sections are lengthened or shortened (0.5-2x, in
+# whole bars) to fit. An arc entry may give its part's bars ("drop 16").
+lengths:
+  short:
+    description: about a minute with one drop, the talk's heart in two to four short lines, usually an opening line and a closing line
+    seconds: [61, 75]
+    arc: [intro, speech_bed, build, gap, drop, speech_bed, outro]
+    bars: {intro: 4, build: 4, drop: 8, outro: 4}
+    clips: {count: 3, count_tolerance: 1, max_seconds: 12, long_max_seconds: 15, total_speech_seconds: 25}
+  highlights:
+    description: two to three and a half minutes with two drops, the talk's key moments from its opening premise to its conclusion
+    seconds: [120, 210]
+    arc: [intro, speech_bed, build, gap, drop, speech_bed, build 8, gap, drop 16, speech_bed, outro]
+    bars: {intro: 4, build: 4, drop: 8, outro: 4}
+    clips: {count: 5, count_tolerance: 2, max_seconds: 15, long_max_seconds: 25, total_speech_seconds: 90}
+
 # How the arrangement reacts to speech
 speech_interaction:
   music_recedes_during_clips: true
